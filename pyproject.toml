@@ -1,0 +1,21 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.11", "numpy"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "AgentMemory"
+version = "0.0.1"
+description = "Memory-aware components"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.scikit-build]
+build.verbose = true
+
+[tool.scikit-build.wheel]
+packages = [
+  "AgentMemory",
+  "AgentMemory.backend",
+  "AgentMemory.M3",
+  "AgentMemory.M3.wrapper",
+]
