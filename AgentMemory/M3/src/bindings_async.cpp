@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "m3_async.h"
+#include "m3_multi_level.h"
 
 namespace py = pybind11;
 using namespace m3;
@@ -18,6 +19,135 @@ PYBIND11_MODULE(_m3_async, m) {
         .value("IP",     Metric::IP)
         .value("COSINE", Metric::COSINE)
         .export_values();
+
+    // ----- MultiLevelConfig -----
+    py::class_<MultiLevelConfig>(m, "MultiLevelConfig")
+        .def(py::init<>())
+        .def_readwrite("l0_nlist", &MultiLevelConfig::l0_nlist)
+        .def_readwrite("l1_nlist", &MultiLevelConfig::l1_nlist)
+        .def_readwrite("l2_nlist", &MultiLevelConfig::l2_nlist)
+        .def_readwrite("l0_new_cluster_threshold", &MultiLevelConfig::l0_new_cluster_threshold)
+        .def_readwrite("search_threshold", &MultiLevelConfig::search_threshold)
+        .def_readwrite("l0_merge_threshold", &MultiLevelConfig::l0_merge_threshold)
+        .def_readwrite("l0_max_nlist", &MultiLevelConfig::l0_max_nlist);
+
+    // ----- MultiLevelIndex -----
+    py::class_<MultiLevelIndex>(m, "MultiLevelIndex")
+        .def(py::init([](int dim,
+                         Metric metric,
+                         bool normalized,
+                         const MultiLevelConfig& cfg) {
+                 return new MultiLevelIndex(dim, metric, normalized, cfg);
+             }),
+             py::arg("dim"),
+             py::arg("metric"),
+             py::arg("normalized") = true,
+             py::arg("config") = MultiLevelConfig())
+        .def("set_l0_centroids",
+             [](MultiLevelIndex& idx, py::array_t<float, py::array::c_style> centroids) {
+                 auto buf = centroids.request();
+                 if (buf.ndim != 2) {
+                     throw std::runtime_error("centroids must be 2D [nlist, dim]");
+                 }
+                 if (buf.shape[1] != idx.dim()) {
+                     throw std::runtime_error("centroids dim mismatch");
+                 }
+                 std::vector<float> c;
+                 c.assign((float*)buf.ptr, (float*)buf.ptr + buf.size);
+                 py::gil_scoped_release _g;
+                 idx.set_l0_centroids(c);
+             })
+        .def("set_l1_centroids",
+             [](MultiLevelIndex& idx, py::array_t<float, py::array::c_style> centroids) {
+                 auto buf = centroids.request();
+                 if (buf.ndim != 2) throw std::runtime_error("centroids must be 2D [nlist, dim]");
+                 if (buf.shape[1] != idx.dim()) throw std::runtime_error("centroids dim mismatch");
+                 std::vector<float> c;
+                 c.assign((float*)buf.ptr, (float*)buf.ptr + buf.size);
+                 py::gil_scoped_release _g;
+                 idx.set_l1_centroids(c);
+             })
+        .def("set_l2_centroids",
+             [](MultiLevelIndex& idx, py::array_t<float, py::array::c_style> centroids) {
+                 auto buf = centroids.request();
+                 if (buf.ndim != 2) throw std::runtime_error("centroids must be 2D [nlist, dim]");
+                 if (buf.shape[1] != idx.dim()) throw std::runtime_error("centroids dim mismatch");
+                 std::vector<float> c;
+                 c.assign((float*)buf.ptr, (float*)buf.ptr + buf.size);
+                 py::gil_scoped_release _g;
+                 idx.set_l2_centroids(c);
+             })
+        .def("insert",
+             [](MultiLevelIndex& idx,
+                py::array_t<int64_t, py::array::c_style> ids,
+                py::array_t<float,   py::array::c_style> vecs) {
+                 auto idb = ids.request();
+                 auto vb  = vecs.request();
+                 if (idb.ndim != 1) throw std::runtime_error("ids must be 1D [N]");
+                 if (vb.ndim != 2)  throw std::runtime_error("vectors must be 2D [N, D]");
+                 if (idb.shape[0] != vb.shape[0]) throw std::runtime_error("ids.size != vectors.N");
+                 if (vb.shape[1] != idx.dim()) throw std::runtime_error("vectors dim mismatch");
+                 py::gil_scoped_release _g;
+                 idx.insert((const DocId*)idb.ptr, (const float*)vb.ptr, (size_t)idb.shape[0]);
+             })
+        .def("update",
+             [](MultiLevelIndex& idx,
+                py::array_t<int64_t, py::array::c_style> ids,
+                py::array_t<float,   py::array::c_style> vecs,
+                bool insert_if_absent) {
+                 auto idb = ids.request();
+                 auto vb  = vecs.request();
+                 if (idb.ndim != 1) throw std::runtime_error("ids must be 1D [N]");
+                 if (vb.ndim != 2)  throw std::runtime_error("vectors must be 2D [N, D]");
+                 if (idb.shape[0] != vb.shape[0]) throw std::runtime_error("ids.size != vectors.N");
+                 if (vb.shape[1] != idx.dim()) throw std::runtime_error("vectors dim mismatch");
+                 py::gil_scoped_release _g;
+                 idx.update((const DocId*)idb.ptr, (const float*)vb.ptr, (size_t)idb.shape[0],
+                            insert_if_absent);
+             },
+             py::arg("ids"),
+             py::arg("vectors"),
+             py::arg("insert_if_absent") = false)
+        .def("erase",
+             [](MultiLevelIndex& idx,
+                py::array_t<int64_t, py::array::c_style> ids) {
+                 auto idb = ids.request();
+                 if (idb.ndim != 1) throw std::runtime_error("ids must be 1D [N]");
+                 py::gil_scoped_release _g;
+                 idx.erase((const DocId*)idb.ptr, (size_t)idb.shape[0]);
+             })
+        .def("search",
+             [](const MultiLevelIndex& idx,
+                py::array_t<float, py::array::c_style> queries,
+                int k,
+                int nprobe) {
+                 auto buf = queries.request();
+                 if (buf.ndim != 2) throw std::runtime_error("queries must be 2D [Q, D]");
+                 if (buf.shape[1] != idx.dim()) throw std::runtime_error("query dim mismatch");
+                 std::vector<std::vector<DocId>> out_ids;
+                 std::vector<std::vector<float>> out_scores;
+                 {
+                     py::gil_scoped_release _g;
+                     idx.search((const float*)buf.ptr,
+                                (size_t)buf.shape[0],
+                                k,
+                                nprobe,
+                                out_ids,
+                                out_scores);
+                 }
+                 return py::make_tuple(out_ids, out_scores);
+             },
+             py::arg("queries"),
+             py::arg("k"),
+             py::arg("nprobe") = -1)
+        .def("maintenance_pass",
+             [](MultiLevelIndex& idx) {
+                 py::gil_scoped_release _g;
+                 idx.maintenance_pass();
+             })
+        .def("dim", &MultiLevelIndex::dim)
+        .def("metric", &MultiLevelIndex::metric)
+        .def("normalized", &MultiLevelIndex::normalized);
 
     // ----- AsyncEngine -----
     py::class_<AsyncEngine>(m, "AsyncEngine")

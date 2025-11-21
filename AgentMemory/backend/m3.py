@@ -7,7 +7,35 @@ import numpy as np
 from .base import MemoryBackend
 from ..types import CollectionSpec, RunResult, BackendRequest, BackendOpType, SearchHit
 
-from AgentMemory.M3 import _m3_async as m3, rebuild_from_faiss  # pybind module + loader
+from AgentMemory.M3 import _m3_async as m3, rebuild_from_faiss, M3MultiLevelIndex  # pybind module + loader
+
+def _metric_enum(name: str):
+    s = (name or "").lower()
+    if s in ("l2", "euclidean"):
+        return m3.Metric.L2
+    if s in ("ip", "inner_product", "dot"):
+        return m3.Metric.IP
+    if s in ("cos", "cosine"):
+        return m3.Metric.COSINE
+    raise ValueError(f"Unsupported metric: {name!r}")
+
+
+def _as_f32_2d(arr, err: str):
+    if arr is None:
+        raise ValueError(err)
+    a = np.asarray(arr, dtype=np.float32, order="C")
+    if a.ndim != 2:
+        raise ValueError(err)
+    return a
+
+
+def _as_int64_1d(arr, err: str):
+    if arr is None:
+        raise ValueError(err)
+    a = np.asarray(arr, dtype=np.int64, order="C")
+    if a.ndim != 1:
+        raise ValueError(err)
+    return a
 
 
 class M3Backend(MemoryBackend):
@@ -66,7 +94,7 @@ class M3Backend(MemoryBackend):
             return
 
         dim = int(spec.dim)
-        metric = self._to_metric(getattr(spec, "metric", "l2"))
+        metric = _metric_enum(getattr(spec, "metric", "l2"))
         normalized = (metric == m3.Metric.COSINE)
 
         centroids = None
@@ -172,33 +200,121 @@ class M3Backend(MemoryBackend):
     # ---------- helpers ----------
 
     @staticmethod
-    def _to_metric(name: str):
-        s = (name or "").lower()
-        if s in ("l2", "euclidean"):
-            return m3.Metric.L2
-        if s in ("ip", "inner_product", "dot"):
-            return m3.Metric.IP
-        if s in ("cos", "cosine"):
-            return m3.Metric.COSINE
-        raise ValueError(f"Unsupported metric: {name!r}")
-
-    @staticmethod
     def _as_f32_2d(arr, err: str):
-        if arr is None:
-            raise ValueError(err)
-        a = np.asarray(arr, dtype=np.float32, order="C")
-        if a.ndim != 2:
-            raise ValueError(err)
-        return a
+        return _as_f32_2d(arr, err)
 
     @staticmethod
     def _as_int64_1d(arr, err: str):
-        if arr is None:
-            raise ValueError(err)
-        a = np.asarray(arr, dtype=np.int64, order="C")
-        if a.ndim != 1:
-            raise ValueError(err)
-        return a
+        return _as_int64_1d(arr, err)
+
+
+class M3MultiLevelBackend(MemoryBackend):
+    """
+    Simple synchronous backend backed by MultiLevelIndex (no async writers).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._indices: Dict[int, M3MultiLevelIndex] = {}
+
+    def close(self) -> None:
+        self._indices.clear()
+
+    def create_index(self, index_id: int, spec: CollectionSpec) -> None:
+        if index_id in self._indices:
+            return
+        dim = int(spec.dim)
+        metric = _metric_enum(getattr(spec, "metric", "l2"))
+        normalized = (metric == m3.Metric.COSINE)
+
+        params = getattr(spec, "params", {}) or {}
+        cfg_kwargs = {
+            "l0_nlist": int(params.get("l0_nlist", 1)),
+            "l1_nlist": int(params.get("l1_nlist", 1)),
+            "l2_nlist": int(params.get("l2_nlist", 1)),
+            "l0_new_cluster_threshold": float(params.get("l0_new_cluster_threshold", float("inf"))),
+            "search_threshold": float(params.get("search_threshold", float("inf"))),
+            "l0_merge_threshold": float(params.get("l0_merge_threshold", float("inf"))),
+            "l0_max_nlist": int(params.get("l0_max_nlist", 0)),
+        }
+        idx = M3MultiLevelIndex(dim=dim, metric=metric, normalized=normalized, **cfg_kwargs)
+
+        # seed L0 centroids if provided; else zero centroid
+        centroids = params.get("centroids")
+        if centroids is None:
+            centroids = np.zeros((cfg_kwargs["l0_nlist"], dim), dtype=np.float32)
+        centroids = np.ascontiguousarray(centroids, dtype=np.float32)
+        if centroids.ndim != 2 or centroids.shape[1] != dim:
+            raise ValueError("centroids must be [nlist, dim]")
+        idx.set_l0_centroids(centroids)
+
+        self._indices[index_id] = idx
+
+    def execute(self, ops: List[BackendRequest]) -> RunResult:
+        insert_cnt = 0
+        update_cnt = 0
+        delete_cnt = 0
+        search_payload: Dict[str, List[List[SearchHit]]] = {}
+
+        for op in ops:
+            idx_id = int(op.index_id)
+            if idx_id not in self._indices:
+                raise KeyError(f"M3MultiLevelBackend: index_id {idx_id} not found. Call create_index() first.")
+            idx = self._indices[idx_id]
+
+            if op.op == BackendOpType.INSERT:
+                ids = self._keys_to_int64(op.ext_ids, "INSERT requires 'ext_ids'")
+                vecs = _as_f32_2d(op.vectors, "INSERT requires 2D 'vectors'")
+                idx.insert(ids, vecs)
+                insert_cnt += len(ids)
+
+            elif op.op == BackendOpType.UPDATE:
+                ids = self._keys_to_int64(op.ext_ids, "UPDATE requires 'ext_ids'")
+                vecs = _as_f32_2d(op.vectors, "UPDATE requires 2D 'vectors'")
+                idx.update(ids, vecs, insert_if_absent=True)
+                update_cnt += len(ids)
+
+            elif op.op == BackendOpType.DELETE_IDS:
+                ids = self._keys_to_int64(op.ext_ids, "DELETE_IDS requires 'ext_ids'")
+                idx.erase(ids)
+                delete_cnt += len(ids)
+
+            elif op.op == BackendOpType.FLUSH:
+                # synchronous: nothing to do
+                continue
+
+            elif op.op == BackendOpType.SEARCH:
+                queries = _as_f32_2d(op.vectors, "SEARCH requires 2D 'vectors'")
+                k = int(op.k or 1)
+                nprobe = int(op.nprobe or 32)
+
+                out_ids, out_scores = idx.search(queries, k, nprobe)
+                rid = op.request_id or f"req-{len(search_payload)}"
+                hits_per_query: List[List[SearchHit]] = []
+                for ids_list, scores_list in zip(out_ids, out_scores):
+                    hits = [
+                        SearchHit(id=str(doc_id), score=float(score), metadata=None)
+                        for doc_id, score in zip(ids_list, scores_list)
+                    ]
+                    hits_per_query.append(hits)
+                search_payload[rid] = hits_per_query
+
+            else:
+                raise NotImplementedError(f"Unsupported op: {op.op}")
+
+        return RunResult(
+            upserted=insert_cnt,
+            updated=update_cnt,
+            deleted=delete_cnt,
+            searches=search_payload,
+        )
+
+    @staticmethod
+    def _keys_to_int64(keys, err: str):
+        return M3Backend._keys_to_int64(keys, err)
+
+    def rebuild_index_from_faiss(self, index_id: int, *, path: str, normalized: Optional[bool] = None) -> None:
+        raise NotImplementedError("M3MultiLevelBackend does not support rebuild_index_from_faiss yet")
 
     @staticmethod
     def _keys_to_int64(keys, err: str):
