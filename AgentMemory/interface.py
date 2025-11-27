@@ -8,6 +8,7 @@ import numpy as np
 
 from .types import CollectionSpec, MemoryItem, RunResult, Metric, BackendOpType, BackendRequest
 from .backend.quake import QuakeBackend
+from .backend.base import MemoryBackend
 from .encoder import MemoryEncoder, TransformerEncoder
 
 IndexHandle = Union[int, str]
@@ -29,7 +30,7 @@ class MemoryManagement:
     def __init__(
         self,
         *,
-        backend: str = "placeholder",
+        backend: Union[str, MemoryBackend] = "placeholder",
         encoder: Optional[MemoryEncoder] = None,
         model_name: str = "intfloat/e5-large-v2",
         precision: str = "fp32",
@@ -44,17 +45,24 @@ class MemoryManagement:
         auto_id_strategy: str = "sequential",   # "uuid" | "sequential"
     ) -> None:
         # Backend (default to placeholder)
-        if backend.lower() == "placeholder":
-            from .backend.placeholder import PlaceholderBackend
-            self.backend: MemoryBackend = PlaceholderBackend()
-        elif backend.lower() == "quake":
-            from .backend.quake import QuakeBackend
-            self.backend: MemoryBackend = QuakeBackend()
-        elif backend.lower() == "m3":
-            from .backend.m3 import M3Backend
-            self.backend: MemoryBackend = M3Backend()
+        if isinstance(backend, MemoryBackend):
+            self.backend: MemoryBackend = backend
         else:
-            raise ValueError(f"Unknown backend: {backend}")
+            name = backend.lower()
+            if name == "placeholder":
+                from .backend.placeholder import PlaceholderBackend
+                self.backend = PlaceholderBackend()
+            elif name == "quake":
+                from .backend.quake import QuakeBackend
+                self.backend = QuakeBackend()
+            elif name == "m3":
+                from .backend.m3 import M3Backend
+                self.backend = M3Backend()
+            elif name == "letta":
+                from .backend.letta import LettaBackend
+                self.backend = LettaBackend()
+            else:
+                raise ValueError(f"Unknown backend: {backend}")
 
         # Encoder
         self.encoder: MemoryEncoder = encoder or TransformerEncoder(
@@ -395,6 +403,7 @@ class MemoryManagement:
                         op=BackendOpType.SEARCH,
                         index_id=idx,
                         vectors=V,
+                        payloads=[q.data for q in queries],
                         k=k,
                         request_id=rid,
                         nprobe=nprobe or self._default_nprobe,
