@@ -61,6 +61,12 @@ class MemoryManagement:
             elif name == "letta":
                 from .backend.letta import LettaBackend
                 self.backend = LettaBackend()
+            elif name == "diskann":
+                from .backend.diskann import DiskANNBackend
+                self.backend = DiskANNBackend()
+            elif name == "diskann_cpp":
+                from .backend.diskann_cpp import DiskANNCppBackend
+                self.backend = DiskANNCppBackend()
             else:
                 raise ValueError(f"Unknown backend: {backend}")
 

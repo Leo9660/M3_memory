@@ -7,5 +7,4 @@ setuptools>=68
 transformers>=4.44
 wheel>=0.41
 letta-client==0.1.319
-asyncpg
-pgvector
+diskannpy
