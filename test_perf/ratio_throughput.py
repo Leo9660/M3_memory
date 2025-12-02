@@ -24,6 +24,7 @@ import csv
 import os
 import sys
 import time
+import torch
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
@@ -203,6 +204,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=123, help="Random seed for reproducibility.")
     parser.add_argument("--faiss-index", type=str, default=None, help="Optional Faiss IVF/flat index to rebuild before the run.")
     parser.add_argument("--faiss-normalized", action="store_true", help="Pass normalized=True to rebuild_index_from_faiss.")
+    parser.add_argument("--quake-index-dir", type=str, default=None, help="Optional path to a saved Quake index directory (backend must be quake).")
     parser.add_argument("--normalize", dest="normalize", action="store_true", help="L2-normalize vectors before sending to backend (default for synthetic).")
     parser.add_argument("--no-normalize", dest="normalize", action="store_false", help="Disable L2 normalization before sending to backend.")
     parser.add_argument("--encoder", choices=["transformer", "passthrough"], default="transformer", help="Encoder to use (transformer required for text datasets; passthrough only for synthetic).")
@@ -238,14 +240,38 @@ def main() -> None:
         queries = prepare_items("q", search_mat)
         ratio_state = (search_ratio, insert_ratio, queries)
 
+    build_start = time.perf_counter()
     index_id = mm.create_index(args.index, metric=metric)
+    print(f"[init] create_index done in {(time.perf_counter() - build_start)*1000:.1f} ms")
 
-    if args.faiss_index:
+    if args.quake_index_dir:
+        if args.backend != "quake":
+            raise ValueError("--quake-index-dir requires --backend quake")
+        quake_dir = Path(args.quake_index_dir).expanduser()
+        if not quake_dir.is_dir():
+            raise FileNotFoundError(f"Quake index dir not found: {quake_dir}")
+        print(f"[init] loading Quake index from {quake_dir}")
+        load_start = time.perf_counter()
+        quake_backend = mm.backend  # type: ignore
+        wrapper = quake_backend._indices[index_id]  # type: ignore[attr-defined]
+        wrapper.load(str(quake_dir), n_workers=0)
+        id_tensor = wrapper.index.get_ids()
+        id_list = [int(x) for x in torch.as_tensor(id_tensor).cpu().reshape(-1).tolist()]
+        quake_backend._ext2int[index_id] = {str(i): i for i in id_list}  # type: ignore[attr-defined]
+        quake_backend._int2ext[index_id] = {i: str(i) for i in id_list}  # type: ignore[attr-defined]
+        quake_backend._next_int_id[index_id] = max(id_list, default=-1) + 1  # type: ignore[attr-defined]
+        quake_backend._meta[index_id] = {str(i): None for i in id_list}  # type: ignore[attr-defined]
+        quake_backend._data[index_id] = {str(i): None for i in id_list}  # type: ignore[attr-defined]
+        quake_backend._built[index_id] = True  # type: ignore[attr-defined]
+        print(f"[init] quake load done in {(time.perf_counter() - load_start):.2f} s (ntotal={len(id_list)})")
+    elif args.faiss_index:
         faiss_path = Path(args.faiss_index).expanduser()
         if not faiss_path.is_file():
             raise FileNotFoundError(f"Faiss index not found: {faiss_path}")
         print(f"[init] rebuilding index from Faiss: {faiss_path}")
+        rebuild_start = time.perf_counter()
         mm.rebuild_index_from_faiss(index_id, path=str(faiss_path), normalized=args.faiss_normalized)
+        print(f"[init] rebuild_from_faiss done in {(time.perf_counter() - rebuild_start):.2f} s")
 
     queued_ops = 0
     run_idx = 1
