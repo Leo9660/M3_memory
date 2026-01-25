@@ -46,6 +46,11 @@ public:
     int  nearest_cluster(const float* vec) const;
     void nearest_clusters(const float* vecs, size_t n_rows, std::vector<int>& out) const;
 
+    //Helpers
+    // Returns pointer to vector data if found, nullptr otherwise
+    const float* cluster_get_vector(int cluster_id, DocId id) const;
+    // Returns live size (number of non-deleted vectors) of a cluster
+    size_t cluster_live_size(int cluster_id) const;
     // ---- Maintenance ----
     // Compact a single cluster (remove tombstones).
     void compact_cluster(int cluster_id);

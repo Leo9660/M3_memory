@@ -9,6 +9,7 @@
 #include <queue>
 #include <unordered_set>
 #include <cstring>   // memcpy, memset
+#include <mutex>
 
 namespace m3 {
 
@@ -271,6 +272,19 @@ void Cluster::search_into(const float* query, int k,
             worst_score = top_scores[worst_idx];
         }
     }
+}
+
+const float* Cluster::get_vector(DocId id) const {
+    std::shared_lock lk(mu_);
+    auto it = id2row_.find(id);
+    if (it == id2row_.end()) {
+        return nullptr;
+    }
+    uint32_t row = it->second;
+    if (row >= ids_.size() || !alive_[row]) {
+        return nullptr;
+    }
+    return row_ptr_(row);
 }
 
 void Cluster::compact() {

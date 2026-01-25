@@ -6,6 +6,7 @@
 #include <queue>
 #include <stdexcept>
 #include <utility>
+#include <mutex>
 
 namespace m3 {
 
@@ -261,6 +262,30 @@ void IVFIndex::nearest_clusters(const float* vecs, size_t n_rows, std::vector<in
         }
         out[i] = best_id;
     }
+}
+
+const float* IVFIndex::cluster_get_vector(int cluster_id, DocId id) const {
+    std::shared_ptr<Cluster> c;
+    {
+        std::shared_lock lk(topo_mu_);
+        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+            return nullptr;
+        }
+        c = clusters_[cluster_id];
+    }
+    return c->get_vector(id);
+}
+
+size_t IVFIndex::cluster_live_size(int cluster_id) const {
+    std::shared_ptr<Cluster> c;
+    {
+        std::shared_lock lk(topo_mu_);
+        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+            return 0;
+        }
+        c = clusters_[cluster_id];
+    }
+    return c->live_size();
 }
 
 void IVFIndex::compact_cluster(int cluster_id) {

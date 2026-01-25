@@ -53,6 +53,9 @@ class MemoryManagement:
         elif backend.lower() == "m3":
             from .backend.m3 import M3Backend
             self.backend: MemoryBackend = M3Backend()
+        elif backend.lower() == "amem":
+            from .backend.amem import AMemBackend
+            self.backend: MemoryBackend = AMemBackend()
         else:
             raise ValueError(f"Unknown backend: {backend}")
 
@@ -379,22 +382,26 @@ class MemoryManagement:
 
             elif kind == "delete_knn":
                 _, idx, queries, k = op
+                payloads = [q.data for q in queries]
                 backend_reqs.append(
                     BackendRequest(
                         op=BackendOpType.DELETE_KNN,
                         index_id=idx,
                         vectors=V,
+                        payloads=payloads,
                         k=k,
                     )
                 )
 
             elif kind == "search":
                 _, idx, queries, k, rid, nprobe = op
+                payloads = [q.data for q in queries]
                 backend_reqs.append(
                     BackendRequest(
                         op=BackendOpType.SEARCH,
                         index_id=idx,
                         vectors=V,
+                        payloads=payloads,
                         k=k,
                         request_id=rid,
                         nprobe=nprobe or self._default_nprobe,

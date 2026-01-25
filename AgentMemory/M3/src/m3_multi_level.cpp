@@ -161,7 +161,141 @@ void MultiLevelIndex::update(const DocId* ids, const float* vecs, size_t n_rows,
     if (!ids || !vecs || n_rows == 0) return;
     std::unique_lock lk(topo_mu_);
     ensure_layer_initialized_(l0_, cfg_.l0_nlist > 0 ? cfg_.l0_nlist : 1);
-    l0_.index->update_batch(/*cluster_id=*/0, ids, vecs, n_rows, insert_if_absent);
+    //_.index->update_batch(/*cluster_id=*/0, ids, vecs, n_rows, insert_if_absent);
+    
+    const size_t dim_sz = static_cast<size_t>(dim_);
+    const float threshold = cfg_.l0_new_cluster_threshold;
+    const float merge_threshold = cfg_.l0_merge_threshold;
+    const int max_nlist = cfg_.l0_max_nlist > 0 ? cfg_.l0_max_nlist
+                                                : std::max(cfg_.l0_nlist, 1);
+    
+    struct Pending {
+        std::vector<DocId> ids;
+        std::vector<float> vecs;
+        std::vector<float> sum;
+        size_t count = 0;
+    };
+
+    auto ensure_pending_size = [](std::vector<Pending>& v, int cid) {
+        if (cid < 0) return;
+        if ((size_t)(cid + 1) > v.size()) v.resize(static_cast<size_t>(cid + 1));
+    };
+    
+    std::unordered_map<size_t, Pending> pending;
+    //d::vector<Pending> pending(static_cast<size_t>(l0_.index->nlist()));
+    for (size_t i = 0; i < n_rows; ++i) {
+        const float* vptr = vecs + i * dim_sz;
+        size_t id = ids[i];
+        bool found = false;
+        int old_cid = -1;
+
+        // Search for existing ID in all clusters
+        for (int cid = 0; cid < l0_.index->nlist(); ++cid) {
+            const float* old_vec = l0_.index->cluster_get_vector(cid, id);
+            if (old_vec) {
+                old_cid = cid;
+                // Store OLD vector in removal pending (negative cluster ID)
+                Pending& p = pending[-(cid + 1)];  // Use -(cid+1) to avoid 0 collision
+                if (p.sum.empty()) p.sum.assign(dim_sz, 0.0f);
+                
+                p.ids.push_back(ids[i]);
+                // Copy OLD vector (not new vector!)
+                p.vecs.insert(p.vecs.end(), old_vec, old_vec + dim_sz);
+                for (size_t d = 0; d < dim_sz; ++d) p.sum[d] += old_vec[d];
+                ++p.count;
+                found = true;
+                break;
+            }
+        }
+        
+        // If not found and insert_if_absent=false, skip this ID
+        if (!found && !insert_if_absent) {
+            continue;
+        }
+
+        const size_t cur_nlist = l0_.centroids.empty() ? 0 : l0_.centroids.size() / dim_sz;
+        float best = std::numeric_limits<float>::infinity();
+        int best_cid = -1;
+        for (size_t cid = 0; cid < cur_nlist; ++cid) {
+            const float* c = l0_.centroids.data() + cid * dim_sz;
+            float s = unified_score(vptr, c, dim_, metric_, normalized_);
+            if (s < best) {
+                best = s;
+                best_cid = static_cast<int>(cid);
+            }
+        }
+
+        bool reuse_due_to_merge = (merge_threshold < std::numeric_limits<float>::infinity()) &&
+                                  (best_cid >= 0) && (best <= merge_threshold);
+
+        const bool under_cap = (int)cur_nlist < max_nlist;
+
+        if (!reuse_due_to_merge && (best_cid == -1 || best > threshold) && under_cap) {
+            std::vector<float> new_centroid(vptr, vptr + dim_sz);
+            int new_cid = l0_.index->add_cluster(new_centroid);
+            l0_.centroids.insert(l0_.centroids.end(), new_centroid.begin(), new_centroid.end());
+            //ensure_pending_size(pending, new_cid);
+            best_cid = new_cid;
+        } else {
+            if (best_cid < 0) best_cid = 0;
+            //ensure_pending_size(pending, best_cid);
+        }
+
+        Pending& p = pending[best_cid];
+        if (p.sum.empty()) p.sum.assign(dim_sz, 0.0f);
+        p.ids.push_back(ids[i]);
+        p.vecs.insert(p.vecs.end(), vptr, vptr + dim_sz);
+        for (size_t d = 0; d < dim_sz; ++d) p.sum[d] += vptr[d];
+        ++p.count;
+    }
+
+    for (auto& x: pending) {
+        int cid = x.first;
+        Pending& p = x.second;
+        if (p.count == 0) continue;
+        
+        if (cid < 0){
+            // Convert negative cid back to positive (we used -(cid+1) to avoid 0)
+            int actual_cid = -(cid + 1);
+            const size_t base = l0_.index->cluster_live_size(actual_cid);
+            const size_t total = base - p.count;
+            if (total == 0) continue;
+            
+            const float* old_c = l0_.centroids.data() + actual_cid * dim_sz;
+            std::vector<float> updated(dim_sz);
+            for (size_t d = 0; d < dim_sz; ++d) {
+                float old_sum = static_cast<float>(base) * old_c[d];
+                float removed_sum = p.sum[d];  // Sum of OLD vectors being removed
+                updated[d] = (old_sum - removed_sum) / static_cast<float>(total);
+            }
+            
+            l0_.index->set_centroid(actual_cid, updated);
+            std::copy(updated.begin(), updated.end(), l0_.centroids.begin() + actual_cid * dim_sz);
+            
+            l0_.index->erase_batch(actual_cid, p.ids.data(), p.count);
+        }
+        else{
+            const size_t base = l0_.index->cluster_live_size(cid);
+            const size_t total = base + p.count;
+            if (total == 0) continue;
+
+            const float* old_c = l0_.centroids.data() + cid * dim_sz;
+            std::vector<float> updated(dim_sz);
+            for (size_t d = 0; d < dim_sz; ++d) {
+                float old_sum = static_cast<float>(base) * old_c[d];
+                float new_sum = p.sum[d];
+                updated[d] = (old_sum + new_sum) / static_cast<float>(total);
+            }
+
+            l0_.index->set_centroid(static_cast<int>(cid), updated);
+            std::copy(updated.begin(), updated.end(), l0_.centroids.begin() + cid * dim_sz);
+
+            l0_.index->add_batch(static_cast<int>(cid),
+                                p.ids.data(),
+                                p.vecs.data(),
+                                p.count);
+        }
+    }
     if (l1_strategy_) l1_strategy_->on_update(ids, vecs, n_rows);
 }
 

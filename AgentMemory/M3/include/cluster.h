@@ -61,6 +61,10 @@ public:
     // ---- Maintenance ----
     void compact();
 
+    //Helpers
+    // Returns pointer to vector data if found, nullptr otherwise
+    const float* get_vector(DocId id) const;
+
 private:
     // Unified scoring function returning “smaller is better”.
     float score_(const float* q, const float* v) const;
