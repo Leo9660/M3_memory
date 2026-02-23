@@ -245,6 +245,38 @@ PYBIND11_MODULE(_m3_async, m) {
              py::arg("split_threshold") = 200000,
              py::arg("compact_ratio") = 0.7)
 
+        // ---- split/merge helpers (sync) ----
+        .def("split_cluster",
+             [](AsyncEngine& e, int index_id, int cluster_id, size_t max_vectors_before_split) {
+                 py::gil_scoped_release _g;
+                 return e.split_cluster(index_id, cluster_id, max_vectors_before_split);
+             },
+             py::arg("index_id"),
+             py::arg("cluster_id"),
+             py::arg("max_vectors_before_split"))
+        .def("merge_clusters",
+             [](AsyncEngine& e, int index_id, int cluster_id_a, int cluster_id_b) {
+                 py::gil_scoped_release _g;
+                 e.merge_clusters(index_id, cluster_id_a, cluster_id_b);
+             },
+             py::arg("index_id"),
+             py::arg("cluster_id_a"),
+             py::arg("cluster_id_b"))
+        .def("cluster_live_size",
+             [](const AsyncEngine& e, int index_id, int cluster_id) {
+                 py::gil_scoped_release _g;
+                 return e.cluster_live_size(index_id, cluster_id);
+             },
+             py::arg("index_id"),
+             py::arg("cluster_id"))
+        .def("cluster_valid",
+             [](const AsyncEngine& e, int index_id, int cluster_id) {
+                 py::gil_scoped_release _g;
+                 return e.cluster_valid(index_id, cluster_id);
+             },
+             py::arg("index_id"),
+             py::arg("cluster_id"))
+
         // ---- enqueue_insert(index_id, cluster_id, ids, vecs) ----
         .def("enqueue_insert",
              [](AsyncEngine& e,

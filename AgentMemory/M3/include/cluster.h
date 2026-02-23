@@ -12,6 +12,8 @@
 #include "base.h"
 
 namespace m3 {
+// Monotonic time for access times (nanoseconds). Implemented in cluster.cpp.
+uint64_t monotonic_time_ns();
 // =====================================================================
 // Cluster: a single IVF partition, thread model = one writer per cluster
 // =====================================================================
@@ -61,7 +63,16 @@ public:
     // ---- Maintenance ----
     void compact();
 
-    //Helpers
+    // Export all live (non-deleted) vectors for split/merge. Appends to out_ids and out_vecs.
+    void export_live(std::vector<DocId>& out_ids, std::vector<float>& out_vecs) const;
+
+    // ---- Per-vector access time (for LRU eviction) ----
+    // 0 if not found or not set.
+    uint64_t get_last_access_time(DocId id) const;
+    // Update access time for a vector (e.g. when returned in search or on insert/update).
+    void set_last_access_time(DocId id, uint64_t time_ns);
+
+    // Helpers
     // Returns pointer to vector data if found, nullptr otherwise
     const float* get_vector(DocId id) const;
 
@@ -86,6 +97,7 @@ private:
     std::vector<DocId> ids_;
     std::vector<float> mat_;
     std::vector<uint8_t> alive_;
+    std::vector<uint64_t> last_access_time_;  // same size as ids_; 0 = not set
     std::unordered_map<DocId, uint32_t> id2row_;
     size_t live_count_{0};
 };

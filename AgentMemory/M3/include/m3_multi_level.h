@@ -4,11 +4,61 @@
 #include <shared_mutex>
 #include <limits>
 #include <vector>
-
+#include <cstdint>
+#include <mutex> 
 #include "base.h"      // Metric, DocId, topk_smallest
 #include "m3_index.h"  // IVFIndex
 
 namespace m3 {
+
+// ================================================================
+// Cache configuration: thresholds for L0/L1 sizes, eviction,
+// promotion/demotion, and L1 neighborhood caching.
+// ================================================================
+struct CacheConfig {
+    // L0 limits
+    int l0_max_clusters = 16;
+    size_t l0_max_vectors_per_cluster = 1000;
+
+    // L1 limits
+    int l1_max_clusters = 32;
+    size_t l1_max_vectors_per_cluster = 10000;
+
+    // Eviction thresholds (trigger when cluster at X% of max)
+    float l0_eviction_ratio = 0.8f;
+    float l1_eviction_ratio = 0.9f;
+
+    // Promotion/demotion (cluster-level)
+    uint64_t l0_access_threshold = 10;
+    uint64_t l1_access_threshold = 5;
+    uint64_t cold_time_ns = 60'000'000'000ULL;  // 60s in nanoseconds
+
+    // L1 top-k' (broader neighborhood)
+    int l1_k_prime = 0;  // 0 = use 2*k at use site
+};
+
+// ================================================================
+// Per-cluster metadata (one per L2 centroid ID). Used for
+// cluster-level promotion/demotion and to know which levels
+// contain this cluster.
+// ================================================================
+struct ClusterMetadata {
+    bool in_l0 = false;
+    bool in_l1 = false;
+    bool in_l2 = true;   // L2 always has the cluster once it exists
+
+    uint64_t last_access_time = 0;
+    uint64_t access_count = 0;
+
+    size_t l0_vector_count = 0;
+    size_t l1_vector_count = 0;
+    size_t l2_vector_count = 0;
+
+    uint64_t l0_last_eviction_time = 0;
+};
+
+// L0 and L1 are IVFIndex with same nlist as L2; valid_[cid]=false and
+// remove_cluster(cid) indicate uncached/invalidated slots.
 
 class L1Strategy {
 public:

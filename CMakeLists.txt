@@ -8,6 +8,7 @@ set(M3_SRC
     AgentMemory/M3/src/bindings_async.cpp
     AgentMemory/M3/src/m3_async.cpp
     AgentMemory/M3/src/m3_index.cpp
+    AgentMemory/M3/src/m3_multi_level.cpp
     AgentMemory/M3/src/cluster.cpp
     AgentMemory/M3/src/base.cpp
 )

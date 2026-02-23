@@ -27,6 +27,9 @@ public:
     // Add a new empty cluster at runtime and return its cluster_id (= index in vector).
     int  add_cluster(const std::vector<float>& centroid);
 
+    // Remove a cluster: drop ref (hard erase), mark slot invalid. Cluster_id remains stable.
+    void remove_cluster(int cluster_id);
+
     // Update centroid of an existing cluster.
     void set_centroid(int cluster_id, const std::vector<float>& centroid);
 
@@ -56,6 +59,10 @@ public:
     void compact_cluster(int cluster_id);
     // Best-effort pass: iterate all clusters and compact based on simple heuristics (optional).
     void maintenance_pass();
+    // Split one cluster into two (K-means k=2). Returns new cluster_id or -1 if not done.
+    int split_cluster(int cluster_id, size_t max_vectors_before_split = 200000);
+    // Merge cluster_id_b into cluster_id_a; cluster b is removed. Both must be valid.
+    void merge_clusters(int cluster_id_a, int cluster_id_b);
 
     // ---- Search APIs ----
     // Search explicitly on a subset of clusters.
@@ -73,13 +80,16 @@ public:
 
 private:
     // ---- Helpers ----
-    // Return a stable snapshot of clusters and centroids under read lock.
+    // Return a stable snapshot of clusters, centroids, and valid flags under read lock.
     void snapshot(std::vector<std::shared_ptr<Cluster>>& out_clusters,
-                  std::vector<float>& out_centroids) const;
+                  std::vector<float>& out_centroids,
+                  std::vector<bool>& out_valid) const;
 
     // For a single query, select top-nprobe cluster ids by centroid score ("smaller is better").
+    // Only considers cids where valid_snapshot[cid] is true.
     void select_nprobe_for_query(const float* q,
                                  const std::vector<float>& centroids_snapshot, // [nlist, dim_]
+                                 const std::vector<bool>& valid_snapshot,
                                  int nprobe,
                                  std::vector<int>& out_ids) const;
 
@@ -90,9 +100,10 @@ private:
     const bool   normalized_;
 
     // Topology & data
-    mutable std::shared_mutex topo_mu_;       // guards clusters_ & centroids_
+    mutable std::shared_mutex topo_mu_;       // guards clusters_, centroids_, valid_
     std::vector<std::shared_ptr<Cluster>> clusters_; // cluster_id == index
     std::vector<float> centroids_;            // row-major [nlist, dim_]
+    std::vector<bool> valid_;                // valid_[cid] => slot is in use (not removed)
 };
 
 } // namespace m3

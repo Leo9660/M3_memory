@@ -12,6 +12,54 @@ namespace m3 {
 
 namespace {
 
+// K-means k=2 on row-major vecs [n_rows, dim]. Returns two centroids and assignment (0 or 1) per row.
+static void kmeans2(const float* vecs, size_t n_rows, int dim,
+                    Metric metric, bool normalized,
+                    std::vector<float>& out_c0, std::vector<float>& out_c1,
+                    std::vector<int>& assign) {
+    assign.resize(n_rows);
+    if (n_rows == 0) return;
+    out_c0.resize(static_cast<size_t>(dim));
+    out_c1.resize(static_cast<size_t>(dim));
+    const size_t d = static_cast<size_t>(dim);
+
+    // Initialize: c0 = first vector, c1 = vector at n/2 (or last)
+    const float* v0 = vecs;
+    const float* v1 = vecs + (n_rows / 2) * d;
+    if (n_rows == 1) { v1 = v0; }
+    std::copy(v0, v0 + dim, out_c0.begin());
+    std::copy(v1, v1 + dim, out_c1.begin());
+
+    const int max_iter = 10;
+    for (int iter = 0; iter < max_iter; ++iter) {
+        // Assign each vector to nearest centroid
+        for (size_t i = 0; i < n_rows; ++i) {
+            const float* v = vecs + i * d;
+            float s0 = unified_score(v, out_c0.data(), dim, metric, normalized);
+            float s1 = unified_score(v, out_c1.data(), dim, metric, normalized);
+            assign[i] = (s0 <= s1) ? 0 : 1;
+        }
+        // Recompute centroids as mean of assigned vectors
+        size_t n0 = 0, n1 = 0;
+        std::fill(out_c0.begin(), out_c0.end(), 0.f);
+        std::fill(out_c1.begin(), out_c1.end(), 0.f);
+        for (size_t i = 0; i < n_rows; ++i) {
+            const float* v = vecs + i * d;
+            if (assign[i] == 0) {
+                ++n0;
+                for (size_t j = 0; j < d; ++j) out_c0[j] += v[j];
+            } else {
+                ++n1;
+                for (size_t j = 0; j < d; ++j) out_c1[j] += v[j];
+            }
+        }
+        if (n0 > 0)
+            for (size_t j = 0; j < d; ++j) out_c0[j] /= static_cast<float>(n0);
+        if (n1 > 0)
+            for (size_t j = 0; j < d; ++j) out_c1[j] /= static_cast<float>(n1);
+    }
+}
+
 // merge helper: merge multiple partial top-k lists (already sorted asc by score)
 // inputs: per-cluster results for ONE query: vector< vector<Pair> >
 // output: final top-k ids/scores
@@ -106,6 +154,7 @@ void IVFIndex::set_centroids(const std::vector<float>& centroids) {
 
     // resize clusters_ to nlist, creating empty clusters if needed
     clusters_.resize(nlist);
+    valid_.assign(static_cast<size_t>(nlist), true);
     centroids_ = centroids;
 
     for (int cid = 0; cid < nlist; ++cid) {
@@ -140,7 +189,15 @@ int IVFIndex::add_cluster(const std::vector<float>& centroid) {
     const int cid = (int)clusters_.size();
     clusters_.push_back(std::make_shared<Cluster>(dim_, metric_, normalized_, cid, centroid));
     centroids_.insert(centroids_.end(), centroid.begin(), centroid.end());
+    valid_.push_back(true);
     return cid;
+}
+
+void IVFIndex::remove_cluster(int cluster_id) {
+    std::unique_lock lk(topo_mu_);
+    if (cluster_id < 0 || cluster_id >= (int)clusters_.size()) return;
+    valid_[static_cast<size_t>(cluster_id)] = false;
+    clusters_[static_cast<size_t>(cluster_id)].reset();  // hard erase, drop ref
 }
 
 void IVFIndex::set_centroid(int cluster_id, const std::vector<float>& centroid) {
@@ -149,7 +206,7 @@ void IVFIndex::set_centroid(int cluster_id, const std::vector<float>& centroid) 
     }
 
     std::unique_lock lk(topo_mu_);
-    if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+    if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)]) {
         throw std::out_of_range("IVFIndex::set_centroid: invalid cluster_id");
     }
     // update snapshot centroid
@@ -171,6 +228,7 @@ int IVFIndex::nlist() const {
 const float* IVFIndex::centroid_ptr(int cluster_id) const {
     std::shared_lock lk(topo_mu_);
     if (cluster_id < 0 || cluster_id >= (int)clusters_.size()) return nullptr;
+    if (!valid_[static_cast<size_t>(cluster_id)]) return nullptr;
     return &centroids_[cluster_id * (size_t)dim_];
 }
 
@@ -178,7 +236,7 @@ void IVFIndex::add_batch(int cluster_id, const DocId* ids, const float* vecs, si
     std::shared_ptr<Cluster> c;
     {
         std::shared_lock lk(topo_mu_);
-        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)] || !clusters_[cluster_id]) {
             throw std::out_of_range("IVFIndex::add_batch: invalid cluster_id");
         }
         c = clusters_[cluster_id];
@@ -191,7 +249,7 @@ void IVFIndex::update_batch(int cluster_id, const DocId* ids, const float* vecs,
     std::shared_ptr<Cluster> c;
     {
         std::shared_lock lk(topo_mu_);
-        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)] || !clusters_[cluster_id]) {
             throw std::out_of_range("IVFIndex::update_batch: invalid cluster_id");
         }
         c = clusters_[cluster_id];
@@ -203,7 +261,7 @@ void IVFIndex::erase_batch(int cluster_id, const DocId* ids, size_t n_rows) {
     std::shared_ptr<Cluster> c;
     {
         std::shared_lock lk(topo_mu_);
-        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)] || !clusters_[cluster_id]) {
             throw std::out_of_range("IVFIndex::erase_batch: invalid cluster_id");
         }
         c = clusters_[cluster_id];
@@ -215,7 +273,7 @@ void IVFIndex::rebuild_cluster(int cluster_id, const DocId* ids, const float* ve
     std::shared_ptr<Cluster> c;
     {
         std::shared_lock lk(topo_mu_);
-        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)] || !clusters_[cluster_id]) {
             throw std::out_of_range("IVFIndex::rebuild_cluster: invalid cluster_id");
         }
         c = clusters_[cluster_id];
@@ -231,6 +289,7 @@ int IVFIndex::nearest_cluster(const float* vec) const {
     float best = std::numeric_limits<float>::infinity();
     int best_id = -1;
     for (int cid = 0; cid < nlist; ++cid) {
+        if (cid >= (int)valid_.size() || !valid_[static_cast<size_t>(cid)]) continue;
         const float* c = &centroids_[cid * (size_t)dim_];
         float s = unified_score(vec, c, dim_, metric_, normalized_);
         if (s < best) {
@@ -253,6 +312,7 @@ void IVFIndex::nearest_clusters(const float* vecs, size_t n_rows, std::vector<in
         float best = std::numeric_limits<float>::infinity();
         int best_id = -1;
         for (int cid = 0; cid < nlist; ++cid) {
+            if (cid >= (int)valid_.size() || !valid_[static_cast<size_t>(cid)]) continue;
             const float* c = &centroids_[cid * (size_t)dim_];
             float s = unified_score(v, c, dim_, metric_, normalized_);
             if (s < best) {
@@ -268,7 +328,7 @@ const float* IVFIndex::cluster_get_vector(int cluster_id, DocId id) const {
     std::shared_ptr<Cluster> c;
     {
         std::shared_lock lk(topo_mu_);
-        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)] || !clusters_[cluster_id]) {
             return nullptr;
         }
         c = clusters_[cluster_id];
@@ -280,7 +340,7 @@ size_t IVFIndex::cluster_live_size(int cluster_id) const {
     std::shared_ptr<Cluster> c;
     {
         std::shared_lock lk(topo_mu_);
-        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)] || !clusters_[cluster_id]) {
             return 0;
         }
         c = clusters_[cluster_id];
@@ -292,7 +352,7 @@ void IVFIndex::compact_cluster(int cluster_id) {
     std::shared_ptr<Cluster> c;
     {
         std::shared_lock lk(topo_mu_);
-        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !clusters_[cluster_id]) {
+        if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)] || !clusters_[cluster_id]) {
             return;
         }
         c = clusters_[cluster_id];
@@ -301,19 +361,23 @@ void IVFIndex::compact_cluster(int cluster_id) {
 }
 
 void IVFIndex::maintenance_pass() {
-    // simplest policy:
-    // 1) for each cluster, if live_size is far smaller than size → compact
-    // 2) if size is too big -> TODO: split
-    const size_t MAX_ROWS_BEFORE_SPLIT = 200000; // example number
-    const double COMPACT_RATIO = 0.7; // if live/size < 0.7 -> compact
+    // 1) Compact clusters with high tombstone ratio
+    // 2) Split any cluster over threshold (one per pass)
+    // 3) Optionally merge two smallest clusters if both below merge threshold
+    const size_t MAX_ROWS_BEFORE_SPLIT = 200000;
+    const size_t MAX_ROWS_BEFORE_MERGE = 5000;  // merge if both clusters below this
+    const double COMPACT_RATIO = 0.7;
 
     std::vector<std::shared_ptr<Cluster>> snapshot;
+    std::vector<bool> valid_snap;
     {
         std::shared_lock lk(topo_mu_);
-        snapshot = clusters_; // shallow copy of shared_ptr
+        snapshot = clusters_;
+        valid_snap = valid_;
     }
 
     for (size_t cid = 0; cid < snapshot.size(); ++cid) {
+        if (cid >= valid_snap.size() || !valid_snap[cid]) continue;
         auto& c = snapshot[cid];
         if (!c) continue;
 
@@ -326,14 +390,121 @@ void IVFIndex::maintenance_pass() {
             c->compact();
         }
 
-        if (c->size() > MAX_ROWS_BEFORE_SPLIT) {
-            // TODO: split cluster 'cid' into two clusters:
-            //  - need Cluster to expose iteration or export of ids+vectors
-            //  - create a new cluster with same dim/metric
-            //  - redistribute points
-            // For now, just compact (already done above).
+        if (c->live_size() > MAX_ROWS_BEFORE_SPLIT) {
+            int new_cid = split_cluster(static_cast<int>(cid), MAX_ROWS_BEFORE_SPLIT);
+            (void)new_cid;
+            return;  // one split per pass
         }
     }
+
+    // Merge pass: find two valid clusters both below threshold, merge smaller into larger
+    int smallest_cid = -1, second_cid = -1;
+    size_t smallest_size = SIZE_MAX, second_size = SIZE_MAX;
+    for (size_t cid = 0; cid < snapshot.size(); ++cid) {
+        if (cid >= valid_snap.size() || !valid_snap[cid]) continue;
+        auto& c = snapshot[cid];
+        if (!c) continue;
+        size_t live = c->live_size();
+        if (live > MAX_ROWS_BEFORE_MERGE) continue;
+        if (live < smallest_size) {
+            second_size = smallest_size;
+            second_cid = smallest_cid;
+            smallest_size = live;
+            smallest_cid = static_cast<int>(cid);
+        } else if (live < second_size) {
+            second_size = live;
+            second_cid = static_cast<int>(cid);
+        }
+    }
+    if (smallest_cid >= 0 && second_cid >= 0 && smallest_cid != second_cid) {
+        merge_clusters(second_cid, smallest_cid);  // merge smaller into larger
+    }
+}
+
+int IVFIndex::split_cluster(int cluster_id, size_t max_vectors_before_split) {
+    std::unique_lock lk(topo_mu_);
+    if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)] || !clusters_[cluster_id])
+        return -1;
+
+    std::shared_ptr<Cluster> c = clusters_[cluster_id];
+    std::vector<DocId> ids;
+    std::vector<float> vecs;
+    c->export_live(ids, vecs);
+    const size_t n = ids.size();
+    if (n < 2) return -1;
+    if (n <= max_vectors_before_split) return -1;
+
+    const size_t dim_sz = static_cast<size_t>(dim_);
+    std::vector<float> c0, c1;
+    std::vector<int> assign;
+    kmeans2(vecs.data(), n, dim_, metric_, normalized_, c0, c1, assign);
+
+    std::vector<DocId> ids0, ids1;
+    std::vector<float> vecs0, vecs1;
+    ids0.reserve(n);
+    ids1.reserve(n);
+    vecs0.reserve(n * dim_sz);
+    vecs1.reserve(n * dim_sz);
+    for (size_t i = 0; i < n; ++i) {
+        if (assign[i] == 0) {
+            ids0.push_back(ids[i]);
+            vecs0.insert(vecs0.end(), vecs.data() + i * dim_sz, vecs.data() + (i + 1) * dim_sz);
+        } else {
+            ids1.push_back(ids[i]);
+            vecs1.insert(vecs1.end(), vecs.data() + i * dim_sz, vecs.data() + (i + 1) * dim_sz);
+        }
+    }
+    if (ids0.empty() || ids1.empty()) return -1;
+
+    // Rebuild original cluster in-place.
+    clusters_[static_cast<size_t>(cluster_id)]->rebuild_from(ids0.data(), vecs0.data(), ids0.size());
+    std::copy(c0.begin(), c0.end(), centroids_.begin() + static_cast<size_t>(cluster_id) * dim_sz);
+
+    // Create new cluster without re-locking topo_mu_ (avoid deadlock with add_cluster).
+    const int new_cid = static_cast<int>(clusters_.size());
+    clusters_.push_back(std::make_shared<Cluster>(dim_, metric_, normalized_, new_cid, c1));
+    centroids_.insert(centroids_.end(), c1.begin(), c1.end());
+    valid_.push_back(true);
+
+    // Fill new cluster with its assigned vectors.
+    clusters_[static_cast<size_t>(new_cid)]->add_batch(ids1.data(), vecs1.data(), ids1.size());
+    return new_cid;
+}
+
+void IVFIndex::merge_clusters(int cluster_id_a, int cluster_id_b) {
+    std::unique_lock lk(topo_mu_);
+    if (cluster_id_a == cluster_id_b) return;
+    if (cluster_id_a < 0 || cluster_id_a >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id_a)] || !clusters_[cluster_id_a])
+        return;
+    if (cluster_id_b < 0 || cluster_id_b >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id_b)] || !clusters_[cluster_id_b])
+        return;
+
+    std::shared_ptr<Cluster> cb = clusters_[cluster_id_b];
+    std::vector<DocId> ids_b;
+    std::vector<float> vecs_b;
+    cb->export_live(ids_b, vecs_b);
+    if (ids_b.empty()) {
+        remove_cluster(cluster_id_b);
+        return;
+    }
+
+    const size_t n_a_old = clusters_[static_cast<size_t>(cluster_id_a)]->live_size();
+    const size_t n_b = ids_b.size();
+    clusters_[static_cast<size_t>(cluster_id_a)]->add_batch(ids_b.data(), vecs_b.data(), ids_b.size());
+
+    const size_t dim_sz = static_cast<size_t>(dim_);
+    const float* old_ca = &centroids_[static_cast<size_t>(cluster_id_a) * dim_sz];
+    if ((n_a_old + n_b) > 0) {
+        float* dst = &centroids_[static_cast<size_t>(cluster_id_a) * dim_sz];
+        for (size_t d = 0; d < dim_sz; ++d) {
+            float sum = old_ca[d] * static_cast<float>(n_a_old);
+            for (size_t i = 0; i < n_b; ++i)
+                sum += vecs_b[i * dim_sz + d];
+            dst[d] = sum / static_cast<float>(n_a_old + n_b);
+        }
+    }
+    valid_[static_cast<size_t>(cluster_id_b)] = false;
+    clusters_[static_cast<size_t>(cluster_id_b)].reset();
 }
 
 void IVFIndex::search_on(const std::vector<int>& cluster_ids,
@@ -397,13 +568,15 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
     out_scores.assign(q_rows, {});
     if (!queries || q_rows == 0 || k <= 0) return;
 
-    // Snapshot once
+    // Snapshot once (shared_ptrs keep clusters alive if bg removes them)
     std::vector<std::shared_ptr<Cluster>> clusters_snap;
     std::vector<float> centroids_snap;
+    std::vector<bool> valid_snap;
     {
         std::shared_lock lk(topo_mu_);
         clusters_snap = clusters_;
         centroids_snap = centroids_;
+        valid_snap = valid_;
     }
 
     const int nlist = (int)clusters_snap.size();
@@ -431,9 +604,9 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
     for (size_t qi = 0; qi < q_rows; ++qi) {
         const float* q = queries + qi * (size_t)dim_;
 
-        // 1) pick top-nprobe clusters by centroid distance
+        // 1) pick top-nprobe clusters by centroid distance (only valid)
         chosen.clear();
-        select_nprobe_for_query(q, centroids_snap, real_nprobe, chosen);
+        select_nprobe_for_query(q, centroids_snap, valid_snap, real_nprobe, chosen);
         // chosen.size() <= real_nprobe
 
         // print chosen for debug
@@ -508,24 +681,28 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
 }
 
 void IVFIndex::snapshot(std::vector<std::shared_ptr<Cluster>>& out_clusters,
-                        std::vector<float>& out_centroids) const {
+                        std::vector<float>& out_centroids,
+                        std::vector<bool>& out_valid) const {
     std::shared_lock lk(topo_mu_);
     out_clusters = clusters_;
     out_centroids = centroids_;
+    out_valid = valid_;
 }
 
 void IVFIndex::select_nprobe_for_query(const float* q,
                                        const std::vector<float>& centroids_snapshot,
+                                       const std::vector<bool>& valid_snapshot,
                                        int nprobe,
                                        std::vector<int>& out_ids) const {
     const int nlist = (int)(centroids_snapshot.size() / (size_t)dim_);
     out_ids.clear();
     if (nlist == 0 || nprobe <= 0) return;
 
-    // compute score to each centroid
+    // compute score to each valid centroid
     std::vector<std::pair<float,int>> tmp;
-    tmp.reserve(nlist);
+    tmp.reserve(static_cast<size_t>(nlist));
     for (int cid = 0; cid < nlist; ++cid) {
+        if (cid >= (int)valid_snapshot.size() || !valid_snapshot[static_cast<size_t>(cid)]) continue;
         const float* c = &centroids_snapshot[cid * (size_t)dim_];
         float s = unified_score(q, c, dim_, metric_, normalized_);
         tmp.emplace_back(s, cid);

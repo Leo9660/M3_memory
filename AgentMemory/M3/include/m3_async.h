@@ -120,6 +120,16 @@ public:
     bool   normalized_of(int index_id) const;
     int    nlist_of(int index_id) const;
 
+    // ---- cluster topology maintenance (sync) ----
+    // These operate on a single IVFIndex (treat as L2 for now).
+    // split_cluster returns the newly created cluster_id or -1 if no split performed.
+    int split_cluster(int index_id, int cluster_id, size_t max_vectors_before_split);
+    // merge cluster_id_b into cluster_id_a (cluster_id_b becomes invalid/removed)
+    void merge_clusters(int index_id, int cluster_id_a, int cluster_id_b);
+    // inspection helpers for tests/debugging
+    size_t cluster_live_size(int index_id, int cluster_id) const;
+    bool   cluster_valid(int index_id, int cluster_id) const;
+
 private:
     // index_id -> IVFIndex
     std::unordered_map<int, std::shared_ptr<IVFIndex>> indices_;

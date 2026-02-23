@@ -1,6 +1,7 @@
 #include "cluster.h"
 
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -12,6 +13,11 @@
 #include <mutex>
 
 namespace m3 {
+
+uint64_t monotonic_time_ns() {
+    return static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+}
 
 // ------------------------ Cluster impl ------------------------
 
@@ -41,6 +47,7 @@ void Cluster::reserve_rows(size_t rows_hint) {
     ids_.reserve(want);
     alive_.reserve(want);
     mat_.reserve(want * (size_t)dim_);
+    last_access_time_.reserve(want);
 }
 
 size_t Cluster::size() const noexcept {
@@ -77,9 +84,11 @@ void Cluster::add_batch(const DocId* ids, const float* vecs, size_t n_rows) {
     const size_t new_rows = old_rows + n_rows;
 
     // --- One-shot grow to final sizes ---
+    const uint64_t now = monotonic_time_ns();
     ids_.resize(new_rows);
     alive_.resize(new_rows);
     mat_.resize(new_rows * (size_t)dim_);
+    last_access_time_.resize(new_rows);
     id2row_.reserve(id2row_.size() + n_rows);
 
     // --- Bulk copy/initialize ---
@@ -88,6 +97,8 @@ void Cluster::add_batch(const DocId* ids, const float* vecs, size_t n_rows) {
     std::memcpy(mat_.data() + old_rows * (size_t)dim_,
                 vecs,
                 n_rows * (size_t)dim_ * sizeof(float));
+    for (size_t r = old_rows; r < new_rows; ++r)
+        last_access_time_[r] = now;
 
     // --- Build id2row_ mapping (single linear pass) ---
     for (size_t r = 0; r < n_rows; ++r) {
@@ -99,12 +110,14 @@ void Cluster::add_batch(const DocId* ids, const float* vecs, size_t n_rows) {
     // sanity
     assert(mat_.size() == ids_.size() * (size_t)dim_);
     assert(alive_.size() == ids_.size());
+    assert(last_access_time_.size() == ids_.size());
 }
 
 void Cluster::update_batch(const DocId* ids, const float* vecs, size_t n_rows,
                            bool insert_if_absent) {
     if (!ids || !vecs || n_rows == 0) return;
 
+    const uint64_t now = monotonic_time_ns();
     std::unique_lock lk(mu_);
     for (size_t r = 0; r < n_rows; ++r) {
         DocId id = ids[r];
@@ -119,18 +132,21 @@ void Cluster::update_batch(const DocId* ids, const float* vecs, size_t n_rows,
             ids_.push_back(id);
             alive_.push_back(1u);
             mat_.insert(mat_.end(), src, src + dim_);
+            last_access_time_.push_back(now);
             id2row_.emplace(id, row);
             ++live_count_;
         } else {
             uint32_t row = it->second;
             float* dst = row_ptr_(row);
             std::copy(src, src + dim_, dst);
+            last_access_time_[row] = now;
         }
     }
 
     // sanity
     assert(mat_.size() == ids_.size() * (size_t)dim_);
     assert(alive_.size() == ids_.size());
+    assert(last_access_time_.size() == ids_.size());
 }
 
 void Cluster::erase_batch(const DocId* ids, size_t n_rows) {
@@ -157,9 +173,11 @@ void Cluster::rebuild_from(const DocId* ids, const float* vecs, size_t n_rows) {
         throw std::invalid_argument("Cluster::rebuild_from: ids/vecs must be provided");
     }
 
+    const uint64_t now = monotonic_time_ns();
     ids_.resize(n_rows);
     alive_.assign(n_rows, 1u);
     mat_.resize(n_rows * (size_t)dim_);
+    last_access_time_.assign(n_rows, now);
     id2row_.clear();
     id2row_.reserve(n_rows);
 
@@ -176,6 +194,7 @@ void Cluster::rebuild_from(const DocId* ids, const float* vecs, size_t n_rows) {
 
     assert(mat_.size() == ids_.size() * (size_t)dim_);
     assert(alive_.size() == ids_.size());
+    assert(last_access_time_.size() == ids_.size());
 }
 
 void Cluster::search(const float* queries, size_t q_rows, int k,
@@ -287,6 +306,36 @@ const float* Cluster::get_vector(DocId id) const {
     return row_ptr_(row);
 }
 
+uint64_t Cluster::get_last_access_time(DocId id) const {
+    std::shared_lock lk(mu_);
+    auto it = id2row_.find(id);
+    if (it == id2row_.end()) return 0;
+    size_t row = it->second;
+    return row < last_access_time_.size() ? last_access_time_[row] : 0;
+}
+
+void Cluster::set_last_access_time(DocId id, uint64_t time_ns) {
+    std::unique_lock lk(mu_);
+    auto it = id2row_.find(id);
+    if (it == id2row_.end()) return;
+    size_t row = it->second;
+    if (row < last_access_time_.size())
+        last_access_time_[row] = time_ns;
+}
+
+void Cluster::export_live(std::vector<DocId>& out_ids, std::vector<float>& out_vecs) const {
+    std::shared_lock lk(mu_);
+    const size_t N = ids_.size();
+    out_ids.reserve(out_ids.size() + live_count_);
+    out_vecs.reserve(out_vecs.size() + live_count_ * (size_t)dim_);
+    for (size_t row = 0; row < N; ++row) {
+        if (!alive_[row]) continue;
+        out_ids.push_back(ids_[row]);
+        const float* v = &mat_[row * (size_t)dim_];
+        out_vecs.insert(out_vecs.end(), v, v + dim_);
+    }
+}
+
 void Cluster::compact() {
     std::unique_lock lk(mu_);
 
@@ -296,9 +345,11 @@ void Cluster::compact() {
     std::vector<DocId> new_ids;
     std::vector<float> new_mat;
     std::vector<uint8_t> new_alive;
+    std::vector<uint64_t> new_access;
     new_ids.reserve(live_count_);
     new_mat.reserve(live_count_ * (size_t)dim_);
     new_alive.reserve(live_count_);
+    new_access.reserve(live_count_);
     std::unordered_map<DocId, uint32_t> new_map;
     new_map.reserve(live_count_);
 
@@ -309,17 +360,23 @@ void Cluster::compact() {
         const float* src = &mat_[row * (size_t)dim_];
         new_mat.insert(new_mat.end(), src, src + dim_);
         new_alive.push_back(1u);
+        if (row < last_access_time_.size())
+            new_access.push_back(last_access_time_[row]);
+        else
+            new_access.push_back(0);
         new_map.emplace(new_ids.back(), new_row);
     }
 
     ids_.swap(new_ids);
     mat_.swap(new_mat);
     alive_.swap(new_alive);
+    last_access_time_.swap(new_access);
     id2row_.swap(new_map);
     live_count_ = ids_.size();
 
     assert(mat_.size() == ids_.size() * (size_t)dim_);
     assert(alive_.size() == ids_.size());
+    assert(last_access_time_.size() == ids_.size());
 }
 
 float Cluster::score_(const float* q, const float* v) const {

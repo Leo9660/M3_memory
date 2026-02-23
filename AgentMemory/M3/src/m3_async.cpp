@@ -350,6 +350,46 @@ int AsyncEngine::nlist_of(int index_id) const {
     return idx ? idx->nlist() : 0;
 }
 
+int AsyncEngine::split_cluster(int index_id, int cluster_id, size_t max_vectors_before_split) {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) throw std::out_of_range("AsyncEngine::split_cluster: index not found");
+    return idx->split_cluster(cluster_id, max_vectors_before_split);
+}
+
+void AsyncEngine::merge_clusters(int index_id, int cluster_id_a, int cluster_id_b) {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) throw std::out_of_range("AsyncEngine::merge_clusters: index not found");
+    idx->merge_clusters(cluster_id_a, cluster_id_b);
+}
+
+size_t AsyncEngine::cluster_live_size(int index_id, int cluster_id) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) return 0;
+    return idx->cluster_live_size(cluster_id);
+}
+
+bool AsyncEngine::cluster_valid(int index_id, int cluster_id) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) return false;
+    return idx->centroid_ptr(cluster_id) != nullptr;
+}
+
 // ==================== apply batch (no async-layer lock) ====================
 
 void AsyncEngine::apply_batch_noindexlock(
