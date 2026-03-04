@@ -130,9 +130,17 @@ public:
     size_t cluster_live_size(int index_id, int cluster_id) const;
     bool   cluster_valid(int index_id, int cluster_id) const;
 
+    // Attach a MultiLevelIndex whose maintenance_pass will be driven by
+    // this engine's maintenance threads.
+    void set_multilevel_index(class MultiLevelIndex* idx);
+
 private:
     // index_id -> IVFIndex
     std::unordered_map<int, std::shared_ptr<IVFIndex>> indices_;
+
+    // Optional attached MultiLevelIndex for cache-aware maintenance.
+    // Lifetime is owned by the caller; AsyncEngine only borrows the pointer.
+    class MultiLevelIndex* multi_index_{nullptr};
 
     // protects indices_ map and index pointers
     mutable pthread_rwlock_t indices_rwlock_;

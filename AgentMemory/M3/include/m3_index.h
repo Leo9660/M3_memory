@@ -64,6 +64,14 @@ public:
     // Merge cluster_id_b into cluster_id_a; cluster b is removed. Both must be valid.
     void merge_clusters(int cluster_id_a, int cluster_id_b);
 
+    // Export live vectors from a cluster (for promotion copy). No-op if invalid/empty.
+    void export_cluster_live(int cluster_id,
+                             std::vector<DocId>& out_ids,
+                             std::vector<float>& out_vecs) const;
+
+    // Ensure cluster slot exists: if valid_[cluster_id] is false, create new empty cluster.
+    void ensure_cluster(int cluster_id, const std::vector<float>& centroid);
+
     // ---- Search APIs ----
     // Search explicitly on a subset of clusters.
     void search_on(const std::vector<int>& cluster_ids,
@@ -77,6 +85,17 @@ public:
     void search_nprobe(const float* queries, size_t q_rows, int k, int nprobe,
                        std::vector<std::vector<DocId>>& out_ids,
                        std::vector<std::vector<float>>& out_scores) const;
+
+    // For one query, return the top-nprobe cluster ids by centroid distance (for cache probe set).
+    void get_probe_ids(const float* query, int nprobe, std::vector<int>& out_ids) const;
+
+    // Search within a single cluster (query as vector); returns k nearest doc_ids and scores.
+    void search_within_cluster(int cluster_id, const float* query, int k,
+                              std::vector<DocId>& out_ids,
+                              std::vector<float>& out_scores) const;
+
+    // Get up to n coldest doc_ids in cluster (by last_access_time) for eviction.
+    void get_coldest_doc_ids(int cluster_id, size_t n, std::vector<DocId>& out_ids) const;
 
 private:
     // ---- Helpers ----
@@ -92,6 +111,9 @@ private:
                                  const std::vector<bool>& valid_snapshot,
                                  int nprobe,
                                  std::vector<int>& out_ids) const;
+
+    // Remove cluster without acquiring topo_mu_ (caller must already hold a unique_lock).
+    void remove_cluster_nolock_(int cluster_id);
 
 private:
     // Fixed config

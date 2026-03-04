@@ -1,4 +1,5 @@
 #include "m3_async.h"
+#include "m3_multi_level.h"
 
 #include <stdexcept>
 #include <algorithm>
@@ -390,6 +391,10 @@ bool AsyncEngine::cluster_valid(int index_id, int cluster_id) const {
     return idx->centroid_ptr(cluster_id) != nullptr;
 }
 
+void AsyncEngine::set_multilevel_index(MultiLevelIndex* idx) {
+    multi_index_ = idx;
+}
+
 // ==================== apply batch (no async-layer lock) ====================
 
 void AsyncEngine::apply_batch_noindexlock(
@@ -509,7 +514,16 @@ bool AsyncEngine::pop_batch(std::vector<WriteOp>& batch, size_t max_n) {
 // ==================== maintenance helper ====================
 
 void AsyncEngine::run_maintenance_once() {
-    // snapshot all indices
+    if (multi_index_) {
+        // Drive cache-aware, cross-level maintenance for the attached
+        // MultiLevelIndex (L0/L1/L2 eviction + demotion).
+        multi_index_->maintenance_pass();
+        return;
+    }
+
+    // Legacy IVF-only maintenance. Kept for reference; currently unused when
+    // a MultiLevelIndex is attached.
+    /*
     std::unordered_map<int, std::shared_ptr<IVFIndex>> indices_snap;
     pthread_rwlock_rdlock(&indices_rwlock_);
     indices_snap = indices_;
@@ -520,6 +534,7 @@ void AsyncEngine::run_maintenance_once() {
             kv.second->maintenance_pass();
         }
     }
+    */
 }
 
 } // namespace m3

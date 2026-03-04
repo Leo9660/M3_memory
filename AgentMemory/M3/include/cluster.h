@@ -66,6 +66,9 @@ public:
     // Export all live (non-deleted) vectors for split/merge. Appends to out_ids and out_vecs.
     void export_live(std::vector<DocId>& out_ids, std::vector<float>& out_vecs) const;
 
+    // Return up to n doc_ids with oldest last_access_time (for LRU eviction). 0 = oldest.
+    void get_coldest_doc_ids(size_t n, std::vector<DocId>& out_ids) const;
+
     // ---- Per-vector access time (for LRU eviction) ----
     // 0 if not found or not set.
     uint64_t get_last_access_time(DocId id) const;

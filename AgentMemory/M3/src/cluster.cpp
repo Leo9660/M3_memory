@@ -1,5 +1,6 @@
 #include "cluster.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -334,6 +335,24 @@ void Cluster::export_live(std::vector<DocId>& out_ids, std::vector<float>& out_v
         const float* v = &mat_[row * (size_t)dim_];
         out_vecs.insert(out_vecs.end(), v, v + dim_);
     }
+}
+
+void Cluster::get_coldest_doc_ids(size_t n, std::vector<DocId>& out_ids) const {
+    std::shared_lock lk(mu_);
+    const size_t N = ids_.size();
+    if (n == 0 || live_count_ == 0) return;
+    std::vector<std::pair<uint64_t, DocId>> pairs;
+    pairs.reserve(live_count_);
+    for (size_t row = 0; row < N; ++row) {
+        if (!alive_[row]) continue;
+        uint64_t t = (row < last_access_time_.size()) ? last_access_time_[row] : 0;
+        pairs.emplace_back(t, ids_[row]);
+    }
+    std::sort(pairs.begin(), pairs.end(),
+             [](const auto& a, const auto& b) { return a.first < b.first; });
+    const size_t take = std::min(n, pairs.size());
+    for (size_t i = 0; i < take; ++i)
+        out_ids.push_back(pairs[i].second);
 }
 
 void Cluster::compact() {

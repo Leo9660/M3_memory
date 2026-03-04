@@ -31,6 +31,20 @@ PYBIND11_MODULE(_m3_async, m) {
         .def_readwrite("l0_merge_threshold", &MultiLevelConfig::l0_merge_threshold)
         .def_readwrite("l0_max_nlist", &MultiLevelConfig::l0_max_nlist);
 
+    // ----- CacheConfig -----
+    py::class_<CacheConfig>(m, "CacheConfig")
+        .def(py::init<>())
+        .def_readwrite("l0_max_clusters", &CacheConfig::l0_max_clusters)
+        .def_readwrite("l0_max_vectors_per_cluster", &CacheConfig::l0_max_vectors_per_cluster)
+        .def_readwrite("l1_max_clusters", &CacheConfig::l1_max_clusters)
+        .def_readwrite("l1_max_vectors_per_cluster", &CacheConfig::l1_max_vectors_per_cluster)
+        .def_readwrite("l0_eviction_ratio", &CacheConfig::l0_eviction_ratio)
+        .def_readwrite("l1_eviction_ratio", &CacheConfig::l1_eviction_ratio)
+        .def_readwrite("cold_time_ns", &CacheConfig::cold_time_ns)
+        .def_readwrite("l0_neighborhood_k", &CacheConfig::l0_neighborhood_k)
+        .def_readwrite("l1_neighborhood_k", &CacheConfig::l1_neighborhood_k)
+        .def_readwrite("max_promote_per_query", &CacheConfig::max_promote_per_query);
+
     // ----- MultiLevelIndex -----
     py::class_<MultiLevelIndex>(m, "MultiLevelIndex")
         .def(py::init([](int dim,
@@ -76,6 +90,10 @@ PYBIND11_MODULE(_m3_async, m) {
                  c.assign((float*)buf.ptr, (float*)buf.ptr + buf.size);
                  py::gil_scoped_release _g;
                  idx.set_l2_centroids(c);
+             })
+        .def("set_cache_config",
+             [](MultiLevelIndex& idx, const CacheConfig& cfg) {
+                 idx.set_cache_config(cfg);
              })
         .def("insert",
              [](MultiLevelIndex& idx,
@@ -171,6 +189,14 @@ PYBIND11_MODULE(_m3_async, m) {
                      e.stop();
                  }
              })
+
+      // Attach a MultiLevelIndex so that AsyncEngine's maintenance threads
+      // call its maintenance_pass() (driving L0/L1/L2 cache maintenance).
+      .def("attach_multilevel_index",
+           [](AsyncEngine& e, MultiLevelIndex& idx) {
+               e.set_multilevel_index(&idx);
+           },
+           py::arg("index"))
 
         // create one IVF index under index_id
         .def("create_ivf",

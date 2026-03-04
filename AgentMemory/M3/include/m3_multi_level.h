@@ -4,8 +4,9 @@
 #include <shared_mutex>
 #include <limits>
 #include <vector>
+#include <unordered_map>
 #include <cstdint>
-#include <mutex> 
+#include <mutex>
 #include "base.h"      // Metric, DocId, topk_smallest
 #include "m3_index.h"  // IVFIndex
 
@@ -28,13 +29,15 @@ struct CacheConfig {
     float l0_eviction_ratio = 0.8f;
     float l1_eviction_ratio = 0.9f;
 
-    // Promotion/demotion (cluster-level)
-    uint64_t l0_access_threshold = 10;
-    uint64_t l1_access_threshold = 5;
+    // Cluster-level demotion: remove whole cluster if not accessed for this long
     uint64_t cold_time_ns = 60'000'000'000ULL;  // 60s in nanoseconds
 
-    // L1 top-k' (broader neighborhood)
-    int l1_k_prime = 0;  // 0 = use 2*k at use site
+    // Neighborhood sizes for promotion: vector + k nearest in cluster -> L0; wider k' -> L1
+    int l0_neighborhood_k = 10;
+    int l1_neighborhood_k = 20;
+
+    // Max result vectors to promote per query (0 = all)
+    int max_promote_per_query = 0;
 };
 
 // ================================================================
@@ -97,6 +100,7 @@ public:
     void set_l0_centroids(const std::vector<float>& centroids);
     void set_l1_centroids(const std::vector<float>& centroids);
     void set_l2_centroids(const std::vector<float>& centroids);
+    void set_cache_config(CacheConfig cfg) { cache_config_ = std::move(cfg); }
     void set_l1_strategy(std::shared_ptr<L1Strategy> s) {
         std::unique_lock lk(topo_mu_);
         l1_strategy_ = std::move(s);
@@ -140,6 +144,14 @@ private:
                        std::vector<DocId>& out_ids,
                        std::vector<float>& out_scores) const;
 
+    // Promotion: on access, promote vector + neighborhood to L0 (narrow) and L1 (wider).
+    void promote_vector_neighborhood_(DocId doc_id) const;
+    void record_access_(int cid) const;
+    void demote_cluster_(int cid) const;
+    void run_vector_eviction_per_level_() const;
+    void run_cluster_count_demotion_() const;
+    bool cache_enabled_() const;
+
 private:
     const int    dim_;
     const Metric metric_;
@@ -151,7 +163,12 @@ private:
     Layer l2_;
     std::shared_ptr<L1Strategy> l1_strategy_;
 
-    mutable std::shared_mutex topo_mu_; // protects layer pointers/centroids
+    CacheConfig cache_config_;
+    mutable std::vector<ClusterMetadata> metadata_;   // indexed by L2 cluster id
+    mutable std::mutex meta_mu_;                     // protects metadata_
+    std::unordered_map<DocId, int> doc_id_to_cid_;   // L2 assignment (canonical)
+
+    mutable std::shared_mutex topo_mu_;              // protects layer pointers/centroids, doc_id_to_cid_
 };
 
 } // namespace m3

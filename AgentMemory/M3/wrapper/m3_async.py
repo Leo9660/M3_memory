@@ -7,6 +7,7 @@ from AgentMemory.M3 import _m3_async  # compiled extension
 
 Metric = _m3_async.Metric
 MultiLevelConfig = _m3_async.MultiLevelConfig
+CacheConfig = getattr(_m3_async, "CacheConfig", None)  # optional
 _MultiLevelIndex = _m3_async.MultiLevelIndex
 
 
@@ -140,6 +141,10 @@ class M3MultiLevelIndex:
     def set_l2_centroids(self, centroids: np.ndarray) -> None:
         c = np.ascontiguousarray(centroids, dtype=np.float32)
         self._idx.set_l2_centroids(c)
+
+    def set_cache_config(self, cache_config: "CacheConfig") -> None:
+        if CacheConfig is not None and hasattr(self._idx, "set_cache_config"):
+            self._idx.set_cache_config(cache_config)
 
     def insert(self, ids: np.ndarray, vectors: np.ndarray) -> None:
         ids64 = np.ascontiguousarray(ids, dtype=np.int64)
