@@ -427,7 +427,49 @@ class M3MultiLevelBackend(MemoryBackend):
         )
 
     def rebuild_index_from_faiss(self, index_id: int, *, path: str, normalized: Optional[bool] = None) -> None:
-        raise NotImplementedError("M3MultiLevelBackend does not support rebuild_index_from_faiss yet")
+        try:
+            import faiss  # type: ignore
+            from faiss.contrib.inspect_tools import get_invlist  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("faiss is required to rebuild an index from a Faiss file") from exc
+
+        if index_id not in self._indices:
+            raise KeyError(f"M3MultiLevelBackend: index_id {index_id} not found. Call create_index() first.")
+
+        from pathlib import Path
+
+        idx = self._indices[index_id]
+        faiss_path = Path(path)
+        if not faiss_path.is_file():
+            raise FileNotFoundError(f"Faiss index file not found: {faiss_path}")
+
+        index = faiss.read_index(str(faiss_path))
+        ivf = faiss.extract_index_ivf(index)
+        if ivf is None:
+            raise ValueError("Provided index does not contain an IVF component")
+        ivf = faiss.downcast_index(ivf)
+        if ivf.ntotal == 0:
+            return
+
+        # Keep behavior aligned with existing M3 faiss loader:
+        # only IndexIVFFlat-style uint8 codes (viewable as float32 vectors).
+        invlists = faiss.downcast_InvertedLists(ivf.invlists)
+        for list_id in range(ivf.nlist):
+            list_ids, list_codes = get_invlist(invlists, list_id)
+            if list_ids.size == 0:
+                continue
+            if list_codes.dtype != np.uint8:
+                raise ValueError("Only IndexIVFFlat (float codes) is supported for now")
+            vectors = list_codes.view(np.float32).reshape(list_ids.shape[0], ivf.d)
+            idx.insert(
+                np.ascontiguousarray(list_ids, dtype=np.int64),
+                np.ascontiguousarray(vectors, dtype=np.float32),
+            )
+
+        # Rebuild path loads raw vectors/ids only; metadata/payload stores are reset.
+        self._meta[index_id] = {}
+        self._data[index_id] = {}
+        self._int2ext[index_id] = {}
 
     @staticmethod
     def _keys_to_int64(keys, err: str):
