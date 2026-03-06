@@ -53,6 +53,9 @@ class MemoryManagement:
         elif backend.lower() == "m3":
             from .backend.m3 import M3Backend
             self.backend: MemoryBackend = M3Backend()
+        elif backend.lower() == "m3multi":
+            from .backend.m3 import M3MultiLevelBackend
+            self.backend: MemoryBackend = M3MultiLevelBackend()
         elif backend.lower() == "amem":
             from .backend.amem import AMemBackend
             self.backend: MemoryBackend = AMemBackend()

@@ -3,6 +3,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <limits>
+#include <deque>
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
@@ -32,12 +33,18 @@ struct CacheConfig {
     // Cluster-level demotion: remove whole cluster if not accessed for this long
     uint64_t cold_time_ns = 60'000'000'000ULL;  // 60s in nanoseconds
 
-    // Neighborhood sizes for promotion: vector + k nearest in cluster -> L0; wider k' -> L1
-    int l0_neighborhood_k = 10;
+    // k' for L1 promotion: number of nearest neighbours (from L2) cached into L1 per access.
+    // L0 stores the directly accessed vector only (no neighbourhood search), per spec.
     int l1_neighborhood_k = 20;
 
     // Max result vectors to promote per query (0 = all)
     int max_promote_per_query = 0;
+
+    // Early-termination: dynamic threshold = alpha_et * dagent.
+    // Set to 0 to disable dynamic threshold and fall back to MultiLevelConfig::search_threshold.
+    float alpha_et = 0.7f;
+    // Rolling window size (number of recent queries) used to compute dagent.
+    int dagent_window = 20;
 };
 
 // ================================================================
@@ -107,12 +114,15 @@ public:
     }
 
     // ---- writes (high-level routing) ----
-    // Current scaffold: all writes land in L0 cluster 0.
-    // Subsequent iterations will fan out and promote.
     void insert(const DocId* ids, const float* vecs, size_t n_rows);
     void update(const DocId* ids, const float* vecs, size_t n_rows,
                 bool insert_if_absent = false);
     void erase(const DocId* ids, size_t n_rows);
+
+    // Bulk-load: write directly into L2 cluster cid, bypassing L0/L1.
+    // Intended for corpus bootstrap (e.g. rebuild_from_faiss).
+    // Requires cache mode (set_l2_centroids called first).
+    void load_cluster(int cid, const DocId* ids, const float* vecs, size_t n_rows);
 
     // ---- search ----
     // Searches all available layers and merges top-k (smaller score is better).
@@ -151,6 +161,8 @@ private:
     void run_vector_eviction_per_level_() const;
     void run_cluster_count_demotion_() const;
     bool cache_enabled_() const;
+    // Update the dagent rolling average with the k-th distances from a completed search batch.
+    void update_dagent_(const std::vector<std::vector<float>>& out_scores, int k) const;
 
 private:
     const int    dim_;
@@ -169,6 +181,11 @@ private:
     std::unordered_map<DocId, int> doc_id_to_cid_;   // L2 assignment (canonical)
 
     mutable std::shared_mutex topo_mu_;              // protects layer pointers/centroids, doc_id_to_cid_
+
+    // dagent: rolling mean of recent per-query k-th distances, used for dynamic αet·dagent threshold.
+    mutable std::deque<float> dagent_history_;
+    mutable float             dagent_ = 0.0f;
+    mutable std::mutex        dagent_mu_;            // protects dagent_history_ and dagent_
 };
 
 } // namespace m3

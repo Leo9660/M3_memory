@@ -41,9 +41,10 @@ PYBIND11_MODULE(_m3_async, m) {
         .def_readwrite("l0_eviction_ratio", &CacheConfig::l0_eviction_ratio)
         .def_readwrite("l1_eviction_ratio", &CacheConfig::l1_eviction_ratio)
         .def_readwrite("cold_time_ns", &CacheConfig::cold_time_ns)
-        .def_readwrite("l0_neighborhood_k", &CacheConfig::l0_neighborhood_k)
         .def_readwrite("l1_neighborhood_k", &CacheConfig::l1_neighborhood_k)
-        .def_readwrite("max_promote_per_query", &CacheConfig::max_promote_per_query);
+        .def_readwrite("max_promote_per_query", &CacheConfig::max_promote_per_query)
+        .def_readwrite("alpha_et", &CacheConfig::alpha_et)
+        .def_readwrite("dagent_window", &CacheConfig::dagent_window);
 
     // ----- MultiLevelIndex -----
     py::class_<MultiLevelIndex>(m, "MultiLevelIndex")
@@ -163,6 +164,24 @@ PYBIND11_MODULE(_m3_async, m) {
                  py::gil_scoped_release _g;
                  idx.maintenance_pass();
              })
+        .def("load_cluster",
+             [](MultiLevelIndex& idx,
+                int cid,
+                py::array_t<int64_t, py::array::c_style> ids,
+                py::array_t<float,   py::array::c_style> vecs) {
+                 auto idb = ids.request();
+                 auto vb  = vecs.request();
+                 if (idb.ndim != 1) throw std::runtime_error("ids must be 1D [N]");
+                 if (vb.ndim != 2)  throw std::runtime_error("vectors must be 2D [N, D]");
+                 if (idb.shape[0] != vb.shape[0]) throw std::runtime_error("ids.size != vectors.N");
+                 if (vb.shape[1] != idx.dim()) throw std::runtime_error("vectors dim mismatch");
+                 py::gil_scoped_release _g;
+                 idx.load_cluster(cid, (const DocId*)idb.ptr, (const float*)vb.ptr,
+                                  (size_t)idb.shape[0]);
+             },
+             py::arg("cluster_id"),
+             py::arg("ids"),
+             py::arg("vectors"))
         .def("dim", &MultiLevelIndex::dim)
         .def("metric", &MultiLevelIndex::metric)
         .def("normalized", &MultiLevelIndex::normalized);

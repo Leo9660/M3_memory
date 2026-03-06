@@ -451,8 +451,22 @@ class M3MultiLevelBackend(MemoryBackend):
         if ivf.ntotal == 0:
             return
 
-        # Keep behavior aligned with existing M3 faiss loader:
-        # only IndexIVFFlat-style uint8 codes (viewable as float32 vectors).
+        # Extract centroids from the Faiss IVF quantizer.
+        quantizer = faiss.downcast_index(ivf.quantizer)
+        if hasattr(quantizer, "xb") and quantizer.ntotal == ivf.nlist:
+            centroids = faiss.vector_to_array(quantizer.xb).astype(np.float32).reshape(ivf.nlist, ivf.d)
+        else:
+            centroids = np.vstack(
+                [quantizer.reconstruct(i) for i in range(ivf.nlist)]
+            ).astype(np.float32)
+        centroids = np.ascontiguousarray(centroids)
+
+        # Enable cache mode: set L2 topology (also aligns L0/L1 and resizes metadata).
+        # All subsequent runtime inserts will route to L0 (hot tier) automatically.
+        idx.set_l2_centroids(centroids)
+
+        # Load corpus vectors directly into L2 — this is a cold bulk bootstrap,
+        # not agent activity, so vectors bypass L0/L1 and land in the canonical store.
         invlists = faiss.downcast_InvertedLists(ivf.invlists)
         for list_id in range(ivf.nlist):
             list_ids, list_codes = get_invlist(invlists, list_id)
@@ -461,7 +475,8 @@ class M3MultiLevelBackend(MemoryBackend):
             if list_codes.dtype != np.uint8:
                 raise ValueError("Only IndexIVFFlat (float codes) is supported for now")
             vectors = list_codes.view(np.float32).reshape(list_ids.shape[0], ivf.d)
-            idx.insert(
+            idx.load_cluster(
+                int(list_id),
                 np.ascontiguousarray(list_ids, dtype=np.int64),
                 np.ascontiguousarray(vectors, dtype=np.float32),
             )

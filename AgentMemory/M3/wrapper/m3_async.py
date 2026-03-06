@@ -171,3 +171,9 @@ class M3MultiLevelIndex:
 
     def maintenance_pass(self) -> None:
         self._idx.maintenance_pass()
+
+    def load_cluster(self, cluster_id: int, ids: np.ndarray, vectors: np.ndarray) -> None:
+        """Bulk-load directly into L2 cluster. Call set_l2_centroids first."""
+        ids64 = np.ascontiguousarray(ids, dtype=np.int64)
+        vecs = np.ascontiguousarray(vectors, dtype=np.float32)
+        self._idx.load_cluster(int(cluster_id), ids64, vecs)
