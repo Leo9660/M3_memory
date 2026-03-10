@@ -148,9 +148,12 @@ private:
     void promote_vector_neighborhood_(DocId doc_id) const;
     void record_access_(int cid) const;
     void demote_cluster_(int cid) const;
-    void run_vector_eviction_per_level_() const;
-    void run_cluster_count_demotion_() const;
+    void run_vector_eviction_per_level_() const;   // called from maintenance_pass
+    void run_cluster_count_demotion_() const;       // called from maintenance_pass
     bool cache_enabled_() const;
+    // Scan L2 to find which cluster currently holds doc id.
+    // O(nlist) — only call during reconciliation when doc_id_to_cid_ is stale.
+    int  find_l2_cluster_for_doc_(DocId id) const;
 
 private:
     const int    dim_;

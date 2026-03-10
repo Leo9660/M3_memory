@@ -330,6 +330,33 @@ void IVFIndex::nearest_clusters(const float* vecs, size_t n_rows, std::vector<in
     }
 }
 
+void IVFIndex::nearest_clusters_with_scores(const float* vecs, size_t n_rows,
+                                            std::vector<int>& out_cids, std::vector<float>& out_scores) const {
+    out_cids.assign(n_rows, -1);
+    out_scores.assign(n_rows, std::numeric_limits<float>::infinity());
+    if (!vecs || n_rows == 0) return;
+    std::shared_lock lk(topo_mu_);
+    const int nlist = (int)clusters_.size();
+    if (nlist == 0 || centroids_.empty()) return;
+
+    for (size_t i = 0; i < n_rows; ++i) {
+        const float* v = vecs + i * (size_t)dim_;
+        float best = std::numeric_limits<float>::infinity();
+        int best_id = -1;
+        for (int cid = 0; cid < nlist; ++cid) {
+            if (cid >= (int)valid_.size() || !valid_[static_cast<size_t>(cid)]) continue;
+            const float* c = &centroids_[cid * (size_t)dim_];
+            float s = unified_score(v, c, dim_, metric_, normalized_);
+            if (s < best) {
+                best = s;
+                best_id = cid;
+            }
+        }
+        out_cids[i] = best_id;
+        out_scores[i] = best;
+    }
+}
+
 const float* IVFIndex::cluster_get_vector(int cluster_id, DocId id) const {
     std::shared_ptr<Cluster> c;
     {

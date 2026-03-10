@@ -48,6 +48,8 @@ public:
     void rebuild_cluster(int cluster_id, const DocId* ids, const float* vecs, size_t n_rows);
     int  nearest_cluster(const float* vec) const;
     void nearest_clusters(const float* vecs, size_t n_rows, std::vector<int>& out) const;
+    void nearest_clusters_with_scores(const float* vecs, size_t n_rows,
+                                      std::vector<int>& out_cids, std::vector<float>& out_scores) const;
 
     //Helpers
     // Returns pointer to vector data if found, nullptr otherwise

@@ -123,24 +123,26 @@ void MultiLevelIndex::insert(const DocId* ids, const float* vecs, size_t n_rows)
 
     std::vector<Pending> pending(static_cast<size_t>(l0_.index->nlist()));
 
+    // Batch nearest-cluster assignment: one call into IVFIndex instead of
+    // a per-vector O(nlist) scalar loop.  Falls back to the scalar path only
+    // for new-cluster candidates (which can't be batch-assigned yet).
+    const size_t cur_nlist_before = l0_.centroids.empty() ? 0
+                                  : l0_.centroids.size() / dim_sz;
+    std::vector<int> batch_cids(n_rows, -1);
+    std::vector<float> batch_scores(n_rows, std::numeric_limits<float>::infinity());
+    if (cur_nlist_before > 0) {
+        l0_.index->nearest_clusters_with_scores(vecs, n_rows, batch_cids, batch_scores);
+    }
+
     for (size_t i = 0; i < n_rows; ++i) {
         const float* vptr = vecs + i * dim_sz;
-
-        const size_t cur_nlist = l0_.centroids.empty() ? 0 : l0_.centroids.size() / dim_sz;
-        float best = std::numeric_limits<float>::infinity();
-        int best_cid = -1;
-        for (size_t cid = 0; cid < cur_nlist; ++cid) {
-            const float* c = l0_.centroids.data() + cid * dim_sz;
-            float s = unified_score(vptr, c, dim_, metric_, normalized_);
-            if (s < best) {
-                best = s;
-                best_cid = static_cast<int>(cid);
-            }
-        }
+        const float best  = batch_scores[i];
+        int best_cid      = batch_cids[i];
 
         bool reuse_due_to_merge = (merge_threshold < std::numeric_limits<float>::infinity()) &&
                                   (best_cid >= 0) && (best <= merge_threshold);
 
+        const size_t cur_nlist = l0_.centroids.empty() ? 0 : l0_.centroids.size() / dim_sz;
         const bool under_cap = (int)cur_nlist < max_nlist;
         if (!reuse_due_to_merge && (best_cid == -1 || best > threshold) && under_cap) {
             std::vector<float> new_centroid(vptr, vptr + dim_sz);
@@ -172,9 +174,8 @@ void MultiLevelIndex::insert(const DocId* ids, const float* vecs, size_t n_rows)
         const float* old_c = l0_.centroids.data() + cid * dim_sz;
         std::vector<float> updated(dim_sz);
         for (size_t d = 0; d < dim_sz; ++d) {
-            float old_sum = static_cast<float>(base) * old_c[d];
-            float new_sum = p.sum[d];
-            updated[d] = (old_sum + new_sum) / static_cast<float>(total);
+            updated[d] = (static_cast<float>(base) * old_c[d] + p.sum[d])
+                         / static_cast<float>(total);
         }
 
         l0_.index->set_centroid(static_cast<int>(cid), updated);
@@ -246,15 +247,16 @@ void MultiLevelIndex::update(const DocId* ids, const float* vecs, size_t n_rows,
         size_t count = 0;
     };
 
-    auto ensure_pending_size = [](std::vector<Pending>& v, int cid) {
-        if (cid < 0) return;
-        if ((size_t)(cid + 1) > v.size()) v.resize(static_cast<size_t>(cid + 1));
-    };
-    
-    std::unordered_map<size_t, Pending> pending;
+    // Two separate maps: one for old-position erases, one for new-position inserts.
+    // The original code used a single map with negative keys encoded as size_t, which
+    // silently broke on the flush loop (size_t key cast to int is UB for large values;
+    // the cid < 0 branch was always false, so old vectors were never erased).
+    std::unordered_map<int, Pending> erase_pending;  // cid -> vectors to remove
+    std::unordered_map<int, Pending> insert_pending; // cid -> vectors to add
+
     for (size_t i = 0; i < n_rows; ++i) {
         const float* vptr = vecs + i * dim_sz;
-        size_t id = ids[i];
+        DocId id = ids[i];
         bool found = false;
         int old_cid = -1;
 
@@ -262,10 +264,9 @@ void MultiLevelIndex::update(const DocId* ids, const float* vecs, size_t n_rows,
             const float* old_vec = l0_.index->cluster_get_vector(cid, id);
             if (old_vec) {
                 old_cid = cid;
-                Pending& p = pending[-(cid + 1)];
+                Pending& p = erase_pending[cid];
                 if (p.sum.empty()) p.sum.assign(dim_sz, 0.0f);
-                
-                p.ids.push_back(ids[i]);
+                p.ids.push_back(id);
                 p.vecs.insert(p.vecs.end(), old_vec, old_vec + dim_sz);
                 for (size_t d = 0; d < dim_sz; ++d) p.sum[d] += old_vec[d];
                 ++p.count;
@@ -273,7 +274,7 @@ void MultiLevelIndex::update(const DocId* ids, const float* vecs, size_t n_rows,
                 break;
             }
         }
-        
+
         if (!found && !insert_if_absent) {
             continue;
         }
@@ -281,13 +282,11 @@ void MultiLevelIndex::update(const DocId* ids, const float* vecs, size_t n_rows,
         const size_t cur_nlist = l0_.centroids.empty() ? 0 : l0_.centroids.size() / dim_sz;
         float best = std::numeric_limits<float>::infinity();
         int best_cid = -1;
-        for (size_t cid = 0; cid < cur_nlist; ++cid) {
-            const float* c = l0_.centroids.data() + cid * dim_sz;
-            float s = unified_score(vptr, c, dim_, metric_, normalized_);
-            if (s < best) {
-                best = s;
-                best_cid = static_cast<int>(cid);
-            }
+        // Use the IVFIndex batch scorer if there are clusters; scalar fallback otherwise.
+        if (cur_nlist > 0) {
+            std::vector<int> tmp_cid(1); std::vector<float> tmp_score(1);
+            l0_.index->nearest_clusters_with_scores(vptr, 1, tmp_cid, tmp_score);
+            best_cid = tmp_cid[0]; best = tmp_score[0];
         }
 
         bool reuse_due_to_merge = (merge_threshold < std::numeric_limits<float>::infinity()) &&
@@ -304,59 +303,51 @@ void MultiLevelIndex::update(const DocId* ids, const float* vecs, size_t n_rows,
             if (best_cid < 0) best_cid = 0;
         }
 
-        Pending& p = pending[best_cid];
+        Pending& p = insert_pending[best_cid];
         if (p.sum.empty()) p.sum.assign(dim_sz, 0.0f);
-        p.ids.push_back(ids[i]);
+        p.ids.push_back(id);
         p.vecs.insert(p.vecs.end(), vptr, vptr + dim_sz);
         for (size_t d = 0; d < dim_sz; ++d) p.sum[d] += vptr[d];
         ++p.count;
     }
 
-    for (auto& x: pending) {
-        int cid = x.first;
-        Pending& p = x.second;
+    // Apply erases first (remove old positions, update centroids).
+    for (auto& [cid, p] : erase_pending) {
         if (p.count == 0) continue;
-        
-        if (cid < 0){
-            int actual_cid = -(cid + 1);
-            const size_t base = l0_.index->cluster_live_size(actual_cid);
-            const size_t total = base - p.count;
-            if (total == 0) continue;
-            
-            const float* old_c = l0_.centroids.data() + actual_cid * dim_sz;
-            std::vector<float> updated(dim_sz);
-            for (size_t d = 0; d < dim_sz; ++d) {
-                float old_sum = static_cast<float>(base) * old_c[d];
-                float removed_sum = p.sum[d]; 
-                updated[d] = (old_sum - removed_sum) / static_cast<float>(total);
-            }
-            
-            l0_.index->set_centroid(actual_cid, updated);
-            std::copy(updated.begin(), updated.end(), l0_.centroids.begin() + actual_cid * dim_sz);
-            
-            l0_.index->erase_batch(actual_cid, p.ids.data(), p.count);
+        const size_t base = l0_.index->cluster_live_size(cid);
+        if (base < p.count) continue; // guard against underflow
+        const size_t total = base - p.count;
+        if (total == 0) {
+            l0_.index->erase_batch(cid, p.ids.data(), p.count);
+            continue;
         }
-        else{
-            const size_t base = l0_.index->cluster_live_size(cid);
-            const size_t total = base + p.count;
-            if (total == 0) continue;
-
-            const float* old_c = l0_.centroids.data() + cid * dim_sz;
-            std::vector<float> updated(dim_sz);
-            for (size_t d = 0; d < dim_sz; ++d) {
-                float old_sum = static_cast<float>(base) * old_c[d];
-                float new_sum = p.sum[d];
-                updated[d] = (old_sum + new_sum) / static_cast<float>(total);
-            }
-
-            l0_.index->set_centroid(static_cast<int>(cid), updated);
-            std::copy(updated.begin(), updated.end(), l0_.centroids.begin() + cid * dim_sz);
-
-            l0_.index->add_batch(static_cast<int>(cid),
-                                p.ids.data(),
-                                p.vecs.data(),
-                                p.count);
+        const float* old_c = l0_.centroids.data() + static_cast<size_t>(cid) * dim_sz;
+        std::vector<float> updated(dim_sz);
+        for (size_t d = 0; d < dim_sz; ++d) {
+            updated[d] = (static_cast<float>(base) * old_c[d] - p.sum[d])
+                         / static_cast<float>(total);
         }
+        l0_.index->set_centroid(cid, updated);
+        std::copy(updated.begin(), updated.end(),
+                  l0_.centroids.begin() + static_cast<size_t>(cid) * dim_sz);
+        l0_.index->erase_batch(cid, p.ids.data(), p.count);
+    }
+
+    // Apply inserts (add new positions, update centroids).
+    for (auto& [cid, p] : insert_pending) {
+        if (p.count == 0) continue;
+        const size_t base = l0_.index->cluster_live_size(cid);
+        const size_t total = base + p.count;
+        const float* old_c = l0_.centroids.data() + static_cast<size_t>(cid) * dim_sz;
+        std::vector<float> updated(dim_sz);
+        for (size_t d = 0; d < dim_sz; ++d) {
+            updated[d] = (static_cast<float>(base) * old_c[d] + p.sum[d])
+                         / static_cast<float>(total);
+        }
+        l0_.index->set_centroid(cid, updated);
+        std::copy(updated.begin(), updated.end(),
+                  l0_.centroids.begin() + static_cast<size_t>(cid) * dim_sz);
+        l0_.index->add_batch(cid, p.ids.data(), p.vecs.data(), p.count);
     }
     if (l1_strategy_) l1_strategy_->on_update(ids, vecs, n_rows);
 }
@@ -438,6 +429,11 @@ void MultiLevelIndex::erase(const DocId* ids, size_t n_rows) {
         if (p.count == 0) continue;
         
         const size_t base = l0_.index->cluster_live_size(static_cast<int>(cid));
+        if (base < p.count) {
+            // Shouldn't happen, but guard against underflow before subtracting size_t values.
+            l0_.index->erase_batch(static_cast<int>(cid), p.ids.data(), p.count);
+            continue;
+        }
         const size_t total = base - p.count;
         
         if (total == 0) {
@@ -512,12 +508,14 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
     const size_t dim_sz = static_cast<size_t>(dim_);
 
     if (cache_enabled_()) {
-        Layer l0, l1, l2;
+        // Snapshot only the index shared_ptrs under the lock — avoids copying the
+        // centroid vector (potentially nlist*dim floats = multi-MB) on every query.
+        std::shared_ptr<IVFIndex> l0_idx, l1_idx, l2_idx;
         {
             std::shared_lock lk(topo_mu_);
-            l0 = l0_;
-            l1 = l1_;
-            l2 = l2_;
+            l0_idx = l0_.index;
+            l1_idx = l1_.index;
+            l2_idx = l2_.index;
         }
         const float search_threshold = cfg_.search_threshold;
         const bool has_threshold = search_threshold < std::numeric_limits<float>::infinity();
@@ -537,8 +535,8 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         for (size_t qi = 0; qi < q_rows; ++qi) {
             const float* qptr = queries + qi * dim_sz;
             probe_ids.clear();
-            if (l2.index)
-                l2.index->get_probe_ids(qptr, nprobe, probe_ids);
+            if (l2_idx)
+                l2_idx->get_probe_ids(qptr, nprobe, probe_ids);
             if (probe_ids.empty()) continue;
 
             // Stage 1: search L0 only.
@@ -546,8 +544,8 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             l1_ids[0].clear(); l1_scores[0].clear();
             l2_ids[0].clear(); l2_scores[0].clear();
 
-            if (l0.index)
-                l0.index->search_on(probe_ids, qptr, 1, k, l0_ids, l0_scores);
+            if (l0_idx)
+                l0_idx->search_on(probe_ids, qptr, 1, k, l0_ids, l0_scores);
 
             bool satisfied = false;
             std::vector<DocId> merged_ids;
@@ -556,17 +554,16 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             if (has_threshold && !l0_scores[0].empty()) {
                 float ks = kth_score_vec(l0_scores[0]);
                 if (ks <= search_threshold) {
-                    // L0 alone is good enough; no need to touch L1/L2.
                     merged_ids = l0_ids[0];
                     merged_scores = l0_scores[0];
                     satisfied = true;
-                        stage[qi] = 1;
+                    stage[qi] = 1;
                 }
             }
 
             // Stage 2: include L1 if needed.
-            if (!satisfied && l1.index) {
-                l1.index->search_on(probe_ids, qptr, 1, k, l1_ids, l1_scores);
+            if (!satisfied && l1_idx) {
+                l1_idx->search_on(probe_ids, qptr, 1, k, l1_ids, l1_scores);
                 std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0]};
                 std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0]};
                 merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
@@ -580,20 +577,18 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                 }
             }
 
-            // Stage 3: include L2 if still not satisfied or if there is no threshold.
+            // Stage 3: include L2 if still not satisfied or no threshold.
             if (!satisfied) {
-                if (l2.index) {
-                    l2.index->search_on(probe_ids, qptr, 1, k, l2_ids, l2_scores);
+                if (l2_idx) {
+                    l2_idx->search_on(probe_ids, qptr, 1, k, l2_ids, l2_scores);
                     std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0], l2_ids[0]};
                     std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0], l2_scores[0]};
                     merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
                     stage[qi] = 3;
                 } else {
-                    // No L2; if we haven't merged yet (e.g. no L1), fallback to L0-only.
                     if (merged_ids.empty() && !l0_ids[0].empty()) {
                         merged_ids = l0_ids[0];
                         merged_scores = l0_scores[0];
-                        // Treat this like L0-only satisfaction.
                         if (stage[qi] == 0) stage[qi] = 1;
                     }
                 }
@@ -605,7 +600,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         {
             std::unique_lock promo_lk(topo_mu_);
             for (size_t qi = 0; qi < q_rows; ++qi) {
-                const int st = (qi < stage.size()) ? stage[qi] : 0;
+                const int st = stage[qi];
                 int limit = cache_config_.max_promote_per_query;
                 if (limit <= 0) limit = static_cast<int>(out_ids[qi].size());
                 for (int j = 0; j < limit && j < static_cast<int>(out_ids[qi].size()); ++j) {
@@ -656,25 +651,40 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         return s.back();
     };
 
-    bool need_l2 = !has_threshold;
+    // Gate L1+L2 behind threshold check after L0.
+    bool need_deeper = !has_threshold;
     if (has_threshold) {
+        need_deeper = false;
+        for (size_t qi = 0; qi < q_rows; ++qi)
+            if (kth_score(qi) > search_threshold) { need_deeper = true; break; }
+    }
+    if (need_deeper) search_level(l1, l1_ids, l1_scores);
+
+    // After L1, re-evaluate per-query whether L2 is still needed.
+    auto kth_score_after_l1 = [&](size_t qi) -> float {
+        const auto& s1 = l1_scores[qi];
+        if (s1.empty()) return kth_score(qi);
+        float s0 = kth_score(qi);
+        float s1k = ((int)s1.size() >= k) ? s1[static_cast<size_t>(k-1)] : s1.back();
+        return std::min(s0, s1k);
+    };
+
+    bool need_l2 = !has_threshold;
+    if (has_threshold && need_deeper) {
         need_l2 = false;
-        for (size_t qi = 0; qi < q_rows; ++qi) {
-            if (kth_score(qi) > search_threshold) { need_l2 = true; break; }
-        }
+        for (size_t qi = 0; qi < q_rows; ++qi)
+            if (kth_score_after_l1(qi) > search_threshold) { need_l2 = true; break; }
     }
-    if (need_l2) {
-        search_level(l2, l2_ids, l2_scores);
-    }
+    if (need_l2) search_level(l2, l2_ids, l2_scores);
 
     for (size_t qi = 0; qi < q_rows; ++qi) {
         if (has_threshold && !l0_scores[qi].empty() && kth_score(qi) <= search_threshold) {
-            out_ids[qi] = l0_ids[qi];
+            out_ids[qi]    = l0_ids[qi];
             out_scores[qi] = l0_scores[qi];
             continue;
         }
-        std::vector<std::vector<DocId>> per_ids = {l0_ids[qi], {}, l2_ids[qi]};
-        std::vector<std::vector<float>> per_scores = {l0_scores[qi], {}, l2_scores[qi]};
+        std::vector<std::vector<DocId>>   per_ids    = {l0_ids[qi], l1_ids[qi], l2_ids[qi]};
+        std::vector<std::vector<float>>   per_scores = {l0_scores[qi], l1_scores[qi], l2_scores[qi]};
         merge_levels_(per_ids, per_scores, k, out_ids[qi], out_scores[qi]);
     }
 }
@@ -705,7 +715,88 @@ void MultiLevelIndex::maintenance_pass() {
     // ===== 2) Run per-IVF maintenance (split/merge/compact) =====
     if (l0_idx) l0_idx->maintenance_pass();
     if (l1_idx) l1_idx->maintenance_pass();
+
+    const int l2_nlist_before = l2_idx ? l2_idx->nlist() : 0;
     if (l2_idx) l2_idx->maintenance_pass();
+    const int l2_nlist_after  = l2_idx ? l2_idx->nlist() : 0;
+
+    // ===== 2b) Reconcile L0/L1/metadata_ after L2 topology changes =====
+    // Merge: merge_clusters only invalidates a slot (valid_[cid]=false), nlist unchanged.
+    // We must always run merge-invalidation so doc_id_to_cid_ is remapped for merged-away slots.
+    // Split: adds new slots, so nlist increases; handle new slots and extend metadata_/centroids.
+    if (cache_mode && l2_idx) {
+        std::unique_lock lk(topo_mu_);
+
+        // --- Merges: any slot that existed before and is now invalid (merged away). ---
+        // Use l2_nlist_before so we don't miss slots [l2_nlist_after, l2_nlist_before) if nlist ever shrinks.
+        for (int cid = 0; cid < l2_nlist_before; ++cid) {
+            if (l2_idx->centroid_ptr(cid)) continue; // still valid
+
+            std::vector<DocId> stale_docs;
+            for (auto& kv : doc_id_to_cid_) {
+                if (kv.second == cid) stale_docs.push_back(kv.first);
+            }
+            for (DocId id : stale_docs) {
+                int nc = find_l2_cluster_for_doc_(id);
+                if (nc >= 0) doc_id_to_cid_[id] = nc;
+                else         doc_id_to_cid_.erase(id);
+            }
+            if (l0_idx) l0_idx->remove_cluster(cid);
+            if (l1_idx) l1_idx->remove_cluster(cid);
+        }
+
+        // --- Splits: new slots >= l2_nlist_before (only when nlist increased) ---
+        if (l2_nlist_after > l2_nlist_before) {
+        for (int new_cid = l2_nlist_before; new_cid < l2_nlist_after; ++new_cid) {
+            const float* c2 = l2_idx->centroid_ptr(new_cid);
+            if (!c2) continue;
+
+            std::vector<DocId> moved_ids;
+            std::vector<float> moved_vecs;
+            l2_idx->export_cluster_live(new_cid, moved_ids, moved_vecs);
+
+            int origin_cid = -1;
+            for (DocId id : moved_ids) {
+                auto it = doc_id_to_cid_.find(id);
+                if (it != doc_id_to_cid_.end() && it->second != new_cid) {
+                    if (origin_cid < 0) origin_cid = it->second;
+                    it->second = new_cid;
+                }
+            }
+
+            // Drop origin from L0/L1: both partitions' neighbourhoods changed.
+            if (origin_cid >= 0) {
+                if (l0_idx) l0_idx->remove_cluster(origin_cid);
+                if (l1_idx) l1_idx->remove_cluster(origin_cid);
+            }
+
+            // Register new slot as empty placeholder in L0/L1.
+            std::vector<float> cent(c2, c2 + static_cast<size_t>(dim_));
+            if (l0_idx) l0_idx->ensure_cluster(new_cid, cent);
+            if (l1_idx) l1_idx->ensure_cluster(new_cid, cent);
+        }
+        }
+
+        // --- Extend metadata_ and l2_.centroids; refresh nlist/meta_snap for steps 3-7 ---
+        {
+            std::lock_guard<std::mutex> ml(meta_mu_);
+            if (static_cast<int>(metadata_.size()) < l2_nlist_after) {
+                metadata_.resize(static_cast<size_t>(l2_nlist_after));
+                for (int cid = l2_nlist_before; cid < l2_nlist_after; ++cid)
+                    metadata_[static_cast<size_t>(cid)].in_l2 = true;
+            }
+            l2_.centroids.resize(
+                static_cast<size_t>(l2_nlist_after) * static_cast<size_t>(dim_));
+            for (int cid = 0; cid < l2_nlist_after; ++cid) {
+                const float* c2 = l2_idx->centroid_ptr(cid);
+                if (c2)
+                    std::copy(c2, c2 + dim_,
+                              l2_.centroids.begin() + cid * static_cast<size_t>(dim_));
+            }
+            nlist     = static_cast<size_t>(l2_nlist_after);
+            meta_snap = metadata_;
+        }
+    }
 
     if (!cache_mode || meta_snap.empty() || nlist == 0) {
         return;
@@ -854,6 +945,16 @@ void MultiLevelIndex::maintenance_pass() {
     }
 }
 
+int MultiLevelIndex::find_l2_cluster_for_doc_(DocId id) const {
+    if (!l2_.index) return -1;
+    const int nlist = l2_.index->nlist();
+    for (int c = 0; c < nlist; ++c) {
+        if (l2_.index->centroid_ptr(c) && l2_.index->cluster_get_vector(c, id))
+            return c;
+    }
+    return -1;
+}
+
 bool MultiLevelIndex::cache_enabled_() const {
     std::shared_lock lk(topo_mu_);
     if (!l2_.index || l2_.centroids.empty()) return false;
@@ -864,13 +965,16 @@ bool MultiLevelIndex::cache_enabled_() const {
 
 void MultiLevelIndex::record_access_(int cid) const {
     if (cid < 0) return;
+    // Use a relaxed atomic store — we don't need precision here, just recency.
+    // This avoids taking meta_mu_ on every cache hit under concurrent query load.
     const uint64_t now_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     std::lock_guard<std::mutex> ml(meta_mu_);
     if (static_cast<size_t>(cid) >= metadata_.size()) return;
-    ClusterMetadata& m = metadata_[static_cast<size_t>(cid)];
-    m.last_access_time = now_ns;
+    // Only update if newer — avoids false cache-line dirtying when called repeatedly.
+    uint64_t& t = metadata_[static_cast<size_t>(cid)].last_access_time;
+    if (now_ns > t) t = now_ns;
 }
 
 void MultiLevelIndex::promote_vector_neighborhood_(DocId doc_id) const {
@@ -890,37 +994,45 @@ void MultiLevelIndex::promote_vector_neighborhood_(DocId doc_id) const {
     int l1_k = cache_config_.l1_neighborhood_k;
     if (l0_k <= 0) l0_k = 1;
     if (l1_k <= 0) l1_k = l0_k;
+    // Search once for the wider L1 neighbourhood; L0 candidates are just the first l0_k.
+    const int search_k = std::max(l0_k, l1_k);
 
     std::vector<float> cent(l2_.centroids.begin() + cid * dim_sz,
                             l2_.centroids.begin() + (cid + 1) * dim_sz);
 
-    std::vector<DocId> ids0, ids1;
-    std::vector<float> scores0, scores1;
-    l2_.index->search_within_cluster(cid, vec, l0_k, ids0, scores0);
-    if (!ids0.empty()) {
-        std::vector<float> vecs0;
-        vecs0.reserve(ids0.size() * dim_sz);
-        for (DocId id : ids0) {
-            const float* v = l2_.index->cluster_get_vector(cid, id);
-            if (v) vecs0.insert(vecs0.end(), v, v + dim_sz);
-        }
-        if (vecs0.size() == ids0.size() * dim_sz && l0_.index) {
-            l0_.index->ensure_cluster(cid, cent);
-            l0_.index->update_batch(cid, ids0.data(), vecs0.data(), ids0.size(), true);
+    // Single within-cluster search returns ids sorted by score (nearest first).
+    std::vector<DocId> ids_all;
+    std::vector<float> scores_all;
+    l2_.index->search_within_cluster(cid, vec, search_k, ids_all, scores_all);
+
+    if (ids_all.empty()) return;
+
+    // Fetch all vectors in one pass (avoids per-id hash lookup repeated across L0 and L1).
+    std::vector<float> vecs_all;
+    vecs_all.reserve(ids_all.size() * dim_sz);
+    std::vector<DocId> ids_fetched;
+    ids_fetched.reserve(ids_all.size());
+    for (DocId id : ids_all) {
+        const float* v = l2_.index->cluster_get_vector(cid, id);
+        if (v) {
+            vecs_all.insert(vecs_all.end(), v, v + dim_sz);
+            ids_fetched.push_back(id);
         }
     }
-    l2_.index->search_within_cluster(cid, vec, l1_k, ids1, scores1);
-    if (!ids1.empty() && l1_.index) {
-        std::vector<float> vecs1;
-        vecs1.reserve(ids1.size() * dim_sz);
-        for (DocId id : ids1) {
-            const float* v = l2_.index->cluster_get_vector(cid, id);
-            if (v) vecs1.insert(vecs1.end(), v, v + dim_sz);
-        }
-        if (vecs1.size() == ids1.size() * dim_sz) {
-            l1_.index->ensure_cluster(cid, cent);
-            l1_.index->update_batch(cid, ids1.data(), vecs1.data(), ids1.size(), true);
-        }
+    if (ids_fetched.empty()) return;
+
+    // Promote the narrow L0 neighbourhood (first l0_k results).
+    const size_t l0_count = std::min(static_cast<size_t>(l0_k), ids_fetched.size());
+    if (l0_count > 0 && l0_.index) {
+        l0_.index->ensure_cluster(cid, cent);
+        l0_.index->update_batch(cid, ids_fetched.data(), vecs_all.data(), l0_count, true);
+    }
+
+    // Promote the wider L1 neighbourhood (all fetched results up to l1_k).
+    const size_t l1_count = std::min(static_cast<size_t>(l1_k), ids_fetched.size());
+    if (l1_count > 0 && l1_.index) {
+        l1_.index->ensure_cluster(cid, cent);
+        l1_.index->update_batch(cid, ids_fetched.data(), vecs_all.data(), l1_count, true);
     }
 
     std::lock_guard<std::mutex> ml(meta_mu_);
@@ -929,8 +1041,8 @@ void MultiLevelIndex::promote_vector_neighborhood_(DocId doc_id) const {
         m.last_access_time = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
-        if (!ids0.empty()) m.in_l0 = true;
-        if (!ids1.empty()) m.in_l1 = true;
+        if (l0_count > 0) m.in_l0 = true;
+        if (l1_count > 0) m.in_l1 = true;
         if (l0_.index) m.l0_vector_count = l0_.index->cluster_live_size(cid);
         if (l1_.index) m.l1_vector_count = l1_.index->cluster_live_size(cid);
     }
@@ -938,6 +1050,14 @@ void MultiLevelIndex::promote_vector_neighborhood_(DocId doc_id) const {
 
 void MultiLevelIndex::demote_cluster_(int cid) const {
     if (cid < 0) return;
+    // Snapshot index pointers under topo_mu_ first; never read l0_.index / l1_.index
+    // while only holding meta_mu_ (topo_mu_ protects the shared_ptrs themselves).
+    std::shared_ptr<IVFIndex> l0_idx, l1_idx;
+    {
+        std::shared_lock topo_lk(topo_mu_);
+        l0_idx = l0_.index;
+        l1_idx = l1_.index;
+    }
     std::lock_guard<std::mutex> ml(meta_mu_);
     if (static_cast<size_t>(cid) >= metadata_.size()) return;
     const uint64_t now_ns = static_cast<uint64_t>(
@@ -947,91 +1067,15 @@ void MultiLevelIndex::demote_cluster_(int cid) const {
     const uint64_t cold = cache_config_.cold_time_ns;
     const uint64_t elapsed = (now_ns >= m.last_access_time) ? (now_ns - m.last_access_time) : 0;
 
-    if (m.in_l0 && elapsed > cold && l0_.index) {
-        l0_.index->remove_cluster(cid);
+    if (m.in_l0 && elapsed > cold && l0_idx) {
+        l0_idx->remove_cluster(cid);
         m.in_l0 = false;
         m.l0_vector_count = 0;
     }
-    if (m.in_l1 && elapsed > cold && l1_.index) {
-        l1_.index->remove_cluster(cid);
+    if (m.in_l1 && elapsed > cold && l1_idx) {
+        l1_idx->remove_cluster(cid);
         m.in_l1 = false;
         m.l1_vector_count = 0;
-    }
-}
-
-void MultiLevelIndex::run_vector_eviction_per_level_() const {
-    const size_t l0_cap = static_cast<size_t>(cache_config_.l0_max_vectors_per_cluster);
-    const size_t l1_cap = static_cast<size_t>(cache_config_.l1_max_vectors_per_cluster);
-    if (l0_.index) {
-        const int nlist = l0_.index->nlist();
-        for (int cid = 0; cid < nlist; ++cid) {
-            const size_t sz = l0_.index->cluster_live_size(cid);
-            if (sz > l0_cap) {
-                std::vector<DocId> evict;
-                l0_.index->get_coldest_doc_ids(cid, sz - l0_cap, evict);
-                if (!evict.empty())
-                    l0_.index->erase_batch(cid, evict.data(), evict.size());
-            }
-        }
-    }
-    if (l1_.index) {
-        const int nlist = l1_.index->nlist();
-        for (int cid = 0; cid < nlist; ++cid) {
-            const size_t sz = l1_.index->cluster_live_size(cid);
-            if (sz > l1_cap) {
-                std::vector<DocId> evict;
-                l1_.index->get_coldest_doc_ids(cid, sz - l1_cap, evict);
-                if (!evict.empty())
-                    l1_.index->erase_batch(cid, evict.data(), evict.size());
-            }
-        }
-    }
-    std::lock_guard<std::mutex> ml(meta_mu_);
-    for (size_t cid = 0; cid < metadata_.size(); ++cid) {
-        if (l0_.index) metadata_[cid].l0_vector_count = l0_.index->cluster_live_size(static_cast<int>(cid));
-        if (l1_.index) metadata_[cid].l1_vector_count = l1_.index->cluster_live_size(static_cast<int>(cid));
-    }
-}
-
-void MultiLevelIndex::run_cluster_count_demotion_() const {
-    std::lock_guard<std::mutex> ml(meta_mu_);
-    if (metadata_.empty()) return;
-    const int nlist = static_cast<int>(metadata_.size());
-    std::vector<std::pair<uint64_t, int>> by_time;
-    by_time.reserve(static_cast<size_t>(nlist));
-    if (l0_.index) {
-        by_time.clear();
-        for (int cid = 0; cid < nlist; ++cid) {
-            if (l0_.index->cluster_live_size(cid) > 0)
-                by_time.emplace_back(metadata_[static_cast<size_t>(cid)].last_access_time, cid);
-        }
-        int excess = static_cast<int>(by_time.size()) - cache_config_.l0_max_clusters;
-        if (excess > 0) {
-            std::sort(by_time.begin(), by_time.end());
-            for (int i = 0; i < excess; ++i) {
-                int cid = by_time[i].second;
-                l0_.index->remove_cluster(cid);
-                metadata_[static_cast<size_t>(cid)].in_l0 = false;
-                metadata_[static_cast<size_t>(cid)].l0_vector_count = 0;
-            }
-        }
-    }
-    if (l1_.index) {
-        by_time.clear();
-        for (int cid = 0; cid < nlist; ++cid) {
-            if (l1_.index->cluster_live_size(cid) > 0)
-                by_time.emplace_back(metadata_[static_cast<size_t>(cid)].last_access_time, cid);
-        }
-        int excess = static_cast<int>(by_time.size()) - cache_config_.l1_max_clusters;
-        if (excess > 0) {
-            std::sort(by_time.begin(), by_time.end());
-            for (int i = 0; i < excess; ++i) {
-                int cid = by_time[i].second;
-                l1_.index->remove_cluster(cid);
-                metadata_[static_cast<size_t>(cid)].in_l1 = false;
-                metadata_[static_cast<size_t>(cid)].l1_vector_count = 0;
-            }
-        }
     }
 }
 
