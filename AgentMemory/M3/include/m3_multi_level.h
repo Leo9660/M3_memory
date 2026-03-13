@@ -124,6 +124,32 @@ public:
     // Requires cache mode (set_l2_centroids called first).
     void load_cluster(int cid, const DocId* ids, const float* vecs, size_t n_rows);
 
+    // Export all live vectors from an L2 cluster into out_ids / out_vecs.
+    // Used by GpuCoordinator::promote_to_gpu() to snapshot a cluster before
+    // uploading its data to GPU memory.
+    // Returns false if cache mode is inactive or cid is out of range.
+    bool export_l2_cluster(int cid,
+                           std::vector<DocId>& out_ids,
+                           std::vector<float>&  out_vecs) const;
+
+    // Replace the content of L2 cluster `cid` with the supplied vectors
+    // (discards existing data). Used after a GPU-side split to write
+    // partition A back into the original cluster slot.
+    // No-op if cache mode is inactive or cid is out of range.
+    void rebuild_l2_cluster(int cid,
+                             const DocId*  ids,
+                             const float*  vecs,
+                             size_t        n);
+
+    // Append a brand-new cluster to L2 with the given centroid and
+    // initial vector set. Also appends the centroid to l0_ / l1_ tables
+    // so future routing includes the new cluster.
+    // Returns the new cluster id, or -1 on failure.
+    int add_l2_cluster(const float* centroid,
+                       const DocId* ids,
+                       const float* vecs,
+                       size_t       n);
+
     // ---- search ----
     // Searches all available layers and merges top-k (smaller score is better).
     void search(const float* queries, size_t q_rows, int k, int nprobe,
@@ -137,6 +163,21 @@ public:
     int    dim()        const noexcept { return dim_; }
     Metric metric()     const noexcept { return metric_; }
     bool   normalized() const noexcept { return normalized_; }
+
+    // Returns a snapshot of all cluster metadata (indexed by L2 cluster id).
+    // Thread-safe; safe to call at any time.
+    std::vector<ClusterMetadata> get_cluster_metadata() const {
+        std::lock_guard<std::mutex> ml(meta_mu_);
+        return metadata_;
+    }
+
+    // Returns the access_count for a single cluster (0 if cid is out of range).
+    // Used by GpuBudgetManager to make LFU eviction decisions without a full snapshot.
+    uint64_t get_access_count(int cid) const {
+        std::lock_guard<std::mutex> ml(meta_mu_);
+        if (cid < 0 || static_cast<size_t>(cid) >= metadata_.size()) return 0;
+        return metadata_[static_cast<size_t>(cid)].access_count;
+    }
 
 private:
     struct Layer {

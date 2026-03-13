@@ -540,6 +540,94 @@ void MultiLevelIndex::load_cluster(int cid, const DocId* ids, const float* vecs,
     }
 }
 
+bool MultiLevelIndex::export_l2_cluster(int cid,
+                                         std::vector<DocId>& out_ids,
+                                         std::vector<float>&  out_vecs) const {
+    std::shared_lock lk(topo_mu_);
+    if (!l2_.index || cid < 0) return false;
+    const size_t nlist = l2_.centroids.empty() ? 0
+                       : l2_.centroids.size() / static_cast<size_t>(dim_);
+    if (static_cast<size_t>(cid) >= nlist) return false;
+    l2_.index->export_cluster_live(cid, out_ids, out_vecs);
+    return true;
+}
+
+void MultiLevelIndex::rebuild_l2_cluster(int cid,
+                                          const DocId*  ids,
+                                          const float*  vecs,
+                                          size_t        n) {
+    if (cid < 0) return;
+    std::unique_lock lk(topo_mu_);
+    if (!l2_.index) return;
+    const size_t nlist = l2_.centroids.empty() ? 0
+                       : l2_.centroids.size() / static_cast<size_t>(dim_);
+    if (static_cast<size_t>(cid) >= nlist) return;
+
+    // Replace cluster content; IVFIndex::rebuild_cluster handles tombstone cleanup.
+    l2_.index->rebuild_cluster(cid, ids, vecs, n);
+
+    // Rebuild doc_id_to_cid_ for this cluster's new vectors.
+    // Remove old entries that point to cid.
+    for (auto it = doc_id_to_cid_.begin(); it != doc_id_to_cid_.end(); ) {
+        if (it->second == cid) it = doc_id_to_cid_.erase(it);
+        else                   ++it;
+    }
+    for (size_t i = 0; i < n; ++i)
+        doc_id_to_cid_[ids[i]] = cid;
+
+    {
+        std::lock_guard<std::mutex> ml(meta_mu_);
+        if (static_cast<size_t>(cid) < metadata_.size())
+            metadata_[cid].l2_vector_count = n;
+    }
+}
+
+int MultiLevelIndex::add_l2_cluster(const float* centroid,
+                                     const DocId* ids,
+                                     const float* vecs,
+                                     size_t       n) {
+    if (!centroid) return -1;
+    std::unique_lock lk(topo_mu_);
+    if (!l2_.index) return -1;
+
+    const std::vector<float> c(centroid, centroid + dim_);
+
+    // Add to L2 index; returns the new cluster id.
+    const int new_cid = l2_.index->add_cluster(c);
+    if (new_cid < 0) return -1;
+
+    // Mirror centroid into l2_.centroids so centroid-based routing sees it.
+    l2_.centroids.insert(l2_.centroids.end(), c.begin(), c.end());
+
+    // Mirror into l0_ / l1_ centroid tables for routing consistency.
+    if (l0_.index) {
+        l0_.index->add_cluster(c);
+        l0_.centroids.insert(l0_.centroids.end(), c.begin(), c.end());
+    }
+    if (l1_.index) {
+        l1_.index->add_cluster(c);
+        l1_.centroids.insert(l1_.centroids.end(), c.begin(), c.end());
+    }
+
+    // Insert initial vectors if provided.
+    if (ids && vecs && n > 0) {
+        l2_.index->add_batch(new_cid, ids, vecs, n);
+        for (size_t i = 0; i < n; ++i)
+            doc_id_to_cid_[ids[i]] = new_cid;
+    }
+
+    // Extend metadata table.
+    {
+        std::lock_guard<std::mutex> ml(meta_mu_);
+        if (static_cast<size_t>(new_cid) >= metadata_.size())
+            metadata_.resize(static_cast<size_t>(new_cid) + 1);
+        metadata_[new_cid].in_l2          = true;
+        metadata_[new_cid].l2_vector_count = n;
+    }
+
+    return new_cid;
+}
+
 void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int nprobe,
                              std::vector<std::vector<DocId>>& out_ids,
                              std::vector<std::vector<float>>& out_scores) const {
@@ -1081,6 +1169,7 @@ void MultiLevelIndex::record_access_(int cid) const {
     if (static_cast<size_t>(cid) >= metadata_.size()) return;
     ClusterMetadata& m = metadata_[static_cast<size_t>(cid)];
     m.last_access_time = now_ns;
+    ++m.access_count;
 }
 
 void MultiLevelIndex::promote_vector_neighborhood_(DocId doc_id) const {

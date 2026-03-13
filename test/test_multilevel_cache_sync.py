@@ -109,8 +109,7 @@ def main() -> None:
     cache_cfg.l1_max_clusters = 4
     cache_cfg.l0_max_vectors_per_cluster = 50
     cache_cfg.l1_max_vectors_per_cluster = 100
-    cache_cfg.l0_neighborhood_k = 3
-    cache_cfg.l1_neighborhood_k = 6
+    cache_cfg.l1_neighborhood_k = 6   # k' — neighbours cached into L1 per access
     cache_cfg.cold_time_ns = 1_000_000_000
     cache_cfg.max_promote_per_query = 10
     idx.set_cache_config(cache_cfg)
