@@ -65,7 +65,7 @@ bool ClusterInsertBuffer::drain(int cid,
     return true;
 }
 
-size_t ClusterInsertBuffer::search_buffer(int cid,
+size_t ClusterInsertBuffer::scan_insert_buffer(int cid,
                                            const float* query,
                                            int k,
                                            Metric metric,

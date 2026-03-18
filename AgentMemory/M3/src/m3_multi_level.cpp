@@ -1,4 +1,8 @@
 #include "m3_multi_level.h"
+#include "gpu_coordinator.h"
+#include "m3_logger.h"
+#include <chrono>
+#include <future>
 #include <mutex>
 #include <algorithm>
 #include <limits>
@@ -28,13 +32,16 @@ MultiLevelIndex::MultiLevelIndex(int dim, Metric metric, bool normalized,
     if (dim_ <= 0) {
         throw std::invalid_argument("MultiLevelIndex: dim must be > 0");
     }
+    l0_.name = "L0";
+    l1_.name = "L1";
+    l2_.name = "L2";
 }
 
 void MultiLevelIndex::ensure_layer_initialized_(Layer& layer, int nlist_hint) {
     if (layer.index) return;
 
     // Build a fresh IVFIndex with placeholder centroids so callers can write immediately.
-    layer.index = std::make_shared<IVFIndex>(dim_, metric_, normalized_);
+    layer.index = std::make_shared<IVFIndex>(dim_, metric_, normalized_, layer.name);
     layer.centroids = make_zero_centroids(nlist_hint, dim_);
     layer.index->set_centroids(layer.centroids);
 }
@@ -45,7 +52,7 @@ void MultiLevelIndex::ensure_layer_centroids_(Layer& layer, const std::vector<fl
     if (layer.index) {
         layer.index->set_centroids(centroids);
     } else {
-        layer.index = std::make_shared<IVFIndex>(dim_, metric_, normalized_);
+        layer.index = std::make_shared<IVFIndex>(dim_, metric_, normalized_, layer.name);
         layer.index->set_centroids(centroids);
     }
     layer.centroids = centroids;
@@ -95,24 +102,96 @@ void MultiLevelIndex::insert(const DocId* ids, const float* vecs, size_t n_rows)
         cache_mode = (metadata_.size() == nlist);
     }
     if (cache_mode && l2_.index && !l2_.centroids.empty()) {
+        using clock = std::chrono::steady_clock;
+        using fms   = std::chrono::duration<double, std::milli>;
+        const bool profiling = M3Profiler::instance().is_enabled();
+        const auto t_insert_start = clock::now();
+
         const size_t dim_sz = static_cast<size_t>(dim_);
         std::vector<int> cids(n_rows);
-        // Use L2 topology to assign each vector to its canonical cluster.
+
+        // Stage 1: assign each vector to its canonical L2 cluster.
+        const auto t_assign0 = profiling ? clock::now() : clock::time_point{};
         l2_.index->nearest_clusters(vecs, n_rows, cids);
+        const double p_assign_ms = profiling ? fms(clock::now() - t_assign0).count() : 0.0;
+
+        // Vectors targeting GPU-resident clusters are collected and dispatched
+        // after releasing topo_mu_, because the buffer-overflow fallback path
+        // inside GpuCoordinator::insert() calls idx_.load_cluster() which also
+        // acquires topo_mu_ — holding it here would deadlock.
+        struct GpuPending { int cid; DocId id; size_t vec_offset; };
+        std::vector<GpuPending> gpu_pending;
+
+        // Per-cid count deltas applied to metadata after the loop (one meta_mu_ lock).
+        std::unordered_map<int, size_t> l0_delta, l2_delta;
+
+        // Stage 2: L0 + L2 writes for non-GPU-resident vectors.
+        const auto t_l0l2_0 = profiling ? clock::now() : clock::time_point{};
         for (size_t i = 0; i < n_rows; ++i) {
             int cid = cids[i];
             if (cid < 0) continue;
             // Record canonical L2 cluster (used by update/erase/promote).
             doc_id_to_cid_[ids[i]] = cid;
-            // Runtime inserts land in L0 (hot tier). Maintenance flushes L0→L1→L2.
-            if (l0_.index) {
-                l0_.index->add_batch(cid, &ids[i], vecs + i * dim_sz, 1);
+            if (gpu_coord_ && gpu_coord_->is_gpu_resident(cid)) {
+                // GPU-resident: defer to after lock release.
+                gpu_pending.push_back({cid, ids[i], i * dim_sz});
+            } else {
+                // Not GPU-resident: write to L0 (recent access) and L2 (ground truth).
+                if (l0_.index) {
+                    if (m3_verbose || M3Logger::instance().is_enabled()) {
+                        const int l0n = l0_.index->nlist();
+                        const int l2n = l2_.index ? l2_.index->nlist() : -1;
+                        const int cenn = static_cast<int>(
+                            l2_.centroids.size() / static_cast<size_t>(dim_sz));
+                        const bool l2v = (cid >= 0 && cid < l2n);
+                        const bool l0v = (cid >= 0 && cid < l0n);
+                        M3Logger::instance().log_insert_routing(
+                            cid, l0n, l2n, cenn, l2v, l0v);
+                    }
+                    // allow_missing=true: if this cluster was cold-demoted from L0 since
+                    // routing, silently skip — L2 write below is the ground truth.
+                    l0_.index->add_batch(cid, &ids[i], vecs + i * dim_sz, 1, /*allow_missing=*/true);
+                    ++l0_delta[cid];
+                }
+                if (l2_.index) {
+                    l2_.index->add_batch(cid, &ids[i], vecs + i * dim_sz, 1);
+                    ++l2_delta[cid];
+                }
             }
         }
-        if (m3_verbose) {
-            fprintf(stderr, "[M3:insert] cache-mode  n=%zu -> L0\n", n_rows);
+        const double p_l0l2_ms = profiling ? fms(clock::now() - t_l0l2_0).count() : 0.0;
+
+        // Apply deltas to metadata under meta_mu_ (same ordering as record_access_: topo_mu_ → meta_mu_).
+        if (!l0_delta.empty() || !l2_delta.empty()) {
+            std::lock_guard<std::mutex> ml(meta_mu_);
+            for (auto& [cid, d] : l0_delta)
+                if (static_cast<size_t>(cid) < metadata_.size())
+                    metadata_[cid].l0_vector_count += d;
+            for (auto& [cid, d] : l2_delta)
+                if (static_cast<size_t>(cid) < metadata_.size())
+                    metadata_[cid].l2_vector_count += d;
         }
-        if (l1_strategy_) l1_strategy_->on_insert(ids, vecs, n_rows);
+        if (m3_verbose) {
+            fprintf(stderr, "[M3:insert] cache-mode  n=%zu  gpu_pending=%zu\n",
+                    n_rows, gpu_pending.size());
+        }
+        auto strat = l1_strategy_;
+        lk.unlock();
+
+        // Stage 3: GPU dispatch (outside lock — see deadlock note above).
+        const auto t_gpu0 = profiling ? clock::now() : clock::time_point{};
+        for (const auto& gp : gpu_pending)
+            gpu_coord_->insert(gp.cid, gp.id, vecs + gp.vec_offset);
+        const double p_gpu_ms = profiling ? fms(clock::now() - t_gpu0).count() : 0.0;
+
+        if (profiling) {
+            const double total_ms = fms(clock::now() - t_insert_start).count();
+            M3Profiler::instance().log_insert_batch(
+                n_rows, gpu_pending.size(),
+                p_assign_ms, p_l0l2_ms, p_gpu_ms, total_ms);
+        }
+
+        if (strat) strat->on_insert(ids, vecs, n_rows);
         return;
     }
 
@@ -535,9 +614,6 @@ void MultiLevelIndex::load_cluster(int cid, const DocId* ids, const float* vecs,
             metadata_[cid].l2_vector_count += n_rows;
         }
     }
-    if (m3_verbose) {
-        fprintf(stderr, "[M3:load_cluster] cid=%d  n=%zu -> L2\n", cid, n_rows);
-    }
 }
 
 bool MultiLevelIndex::export_l2_cluster(int cid,
@@ -638,6 +714,11 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
     const size_t dim_sz = static_cast<size_t>(dim_);
 
     if (cache_enabled_()) {
+        using clock = std::chrono::steady_clock;
+        using fms   = std::chrono::duration<double, std::milli>;
+        const bool profiling = M3Profiler::instance().is_enabled();
+        const auto t_search_start = clock::now();
+
         Layer l0, l1, l2;
         {
             std::shared_lock lk(topo_mu_);
@@ -667,6 +748,12 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         // 0 = no results, 1 = satisfied by L0 only, 2 = satisfied after L1, 3 = needed L2
         std::vector<int> stage(q_rows, 0);
 
+        // Profile accumulators (only populated when profiling is enabled).
+        double p_probe_ms = 0, p_l0_ms = 0, p_l1_ms = 0;
+        double p_l2_gpu_ms = 0, p_l2_cpu_ms = 0, p_merge_ms = 0;
+        size_t p_l0_exits = 0, p_l1_exits = 0;
+        size_t p_l2_gpu_clusters = 0, p_l2_cpu_clusters = 0;
+
         auto kth_score_vec = [&](const std::vector<float>& s) -> float {
             if (s.empty()) return std::numeric_limits<float>::infinity();
             if ((int)s.size() >= k) return s[static_cast<size_t>(k - 1)];
@@ -676,8 +763,13 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         for (size_t qi = 0; qi < q_rows; ++qi) {
             const float* qptr = queries + qi * dim_sz;
             probe_ids.clear();
-            if (l2.index)
-                l2.index->get_probe_ids(qptr, nprobe, probe_ids);
+
+            {
+                const auto t0 = profiling ? clock::now() : clock::time_point{};
+                if (l2.index)
+                    l2.index->get_probe_ids(qptr, nprobe, probe_ids);
+                if (profiling) p_probe_ms += fms(clock::now() - t0).count();
+            }
             if (probe_ids.empty()) continue;
 
             // Stage 1: search L0 only.
@@ -685,8 +777,12 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             l1_ids[0].clear(); l1_scores[0].clear();
             l2_ids[0].clear(); l2_scores[0].clear();
 
-            if (l0.index)
-                l0.index->search_on(probe_ids, qptr, 1, k, l0_ids, l0_scores);
+            {
+                const auto t0 = profiling ? clock::now() : clock::time_point{};
+                if (l0.index)
+                    l0.index->search_on(probe_ids, qptr, 1, k, l0_ids, l0_scores);
+                if (profiling) p_l0_ms += fms(clock::now() - t0).count();
+            }
 
             bool satisfied = false;
             std::vector<DocId> merged_ids;
@@ -699,22 +795,32 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     merged_ids = l0_ids[0];
                     merged_scores = l0_scores[0];
                     satisfied = true;
-                        stage[qi] = 1;
+                    stage[qi] = 1;
+                    if (profiling) ++p_l0_exits;
                 }
             }
 
             // Stage 2: include L1 if needed.
             if (!satisfied && l1.index) {
-                l1.index->search_on(probe_ids, qptr, 1, k, l1_ids, l1_scores);
-                std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0]};
-                std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0]};
-                merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
+                {
+                    const auto t0 = profiling ? clock::now() : clock::time_point{};
+                    l1.index->search_on(probe_ids, qptr, 1, k, l1_ids, l1_scores);
+                    if (profiling) p_l1_ms += fms(clock::now() - t0).count();
+                }
+                {
+                    const auto t0 = profiling ? clock::now() : clock::time_point{};
+                    std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0]};
+                    std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0]};
+                    merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
+                    if (profiling) p_merge_ms += fms(clock::now() - t0).count();
+                }
 
                 if (has_threshold && !merged_scores.empty()) {
                     float ks = kth_score_vec(merged_scores);
                     if (ks <= search_threshold) {
                         satisfied = true;
                         stage[qi] = 2;
+                        if (profiling) ++p_l1_exits;
                     }
                 }
             }
@@ -722,10 +828,63 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             // Stage 3: include L2 if still not satisfied or if there is no threshold.
             if (!satisfied) {
                 if (l2.index) {
-                    l2.index->search_on(probe_ids, qptr, 1, k, l2_ids, l2_scores);
-                    std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0], l2_ids[0]};
-                    std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0], l2_scores[0]};
-                    merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
+                    if (gpu_coord_) {
+                        // Partition probe clusters: GPU-resident → GPU kernel + buffer scan,
+                        // non-resident → CPU L2 linear scan.
+                        std::vector<int> gpu_cids, cpu_cids;
+                        for (int cid : probe_ids) {
+                            if (gpu_coord_->is_gpu_resident(cid))
+                                gpu_cids.push_back(cid);
+                            else
+                                cpu_cids.push_back(cid);
+                        }
+                        if (profiling) {
+                            p_l2_gpu_clusters += gpu_cids.size();
+                            p_l2_cpu_clusters += cpu_cids.size();
+                        }
+                        // GPU and CPU L2 searches run in parallel:
+                        //   - GPU search is dispatched to a background thread so the
+                        //     CUDA kernel and D2H transfer overlap with the CPU scan.
+                        //   - CPU scan runs on this thread while the GPU thread is active.
+                        //   - Results are joined before the merge step below.
+                        std::vector<DocId> gpu_l2_ids;
+                        std::vector<float> gpu_l2_scores;
+                        const auto t_gpu0 = profiling ? clock::now() : clock::time_point{};
+                        auto gpu_fut = !gpu_cids.empty()
+                            ? std::async(std::launch::async, [&]() {
+                                  gpu_coord_->search(gpu_cids, qptr, k,
+                                                     gpu_l2_ids, gpu_l2_scores);
+                              })
+                            : std::future<void>{};
+
+                        // CPU L2 path runs on this thread while GPU thread is active.
+                        const auto t_cpu0 = profiling ? clock::now() : clock::time_point{};
+                        if (!cpu_cids.empty())
+                            l2.index->search_on(cpu_cids, qptr, 1, k,
+                                                l2_ids, l2_scores);
+                        if (profiling) p_l2_cpu_ms += fms(clock::now() - t_cpu0).count();
+
+                        // Join GPU thread before merge.
+                        if (gpu_fut.valid()) gpu_fut.get();
+                        if (profiling) p_l2_gpu_ms += fms(clock::now() - t_gpu0).count();
+                        // Fold GPU results into l2 result vectors for unified merge.
+                        l2_ids[0].insert(l2_ids[0].end(),
+                                         gpu_l2_ids.begin(), gpu_l2_ids.end());
+                        l2_scores[0].insert(l2_scores[0].end(),
+                                            gpu_l2_scores.begin(), gpu_l2_scores.end());
+                    } else {
+                        if (profiling) p_l2_cpu_clusters += probe_ids.size();
+                        const auto t0 = profiling ? clock::now() : clock::time_point{};
+                        l2.index->search_on(probe_ids, qptr, 1, k, l2_ids, l2_scores);
+                        if (profiling) p_l2_cpu_ms += fms(clock::now() - t0).count();
+                    }
+                    {
+                        const auto t0 = profiling ? clock::now() : clock::time_point{};
+                        std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0], l2_ids[0]};
+                        std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0], l2_scores[0]};
+                        merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
+                        if (profiling) p_merge_ms += fms(clock::now() - t0).count();
+                    }
                     stage[qi] = 3;
                 } else {
                     // No L2; if we haven't merged yet (e.g. no L1), fallback to L0-only.
@@ -764,8 +923,14 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                         out_ids[qi].size());
             }
         }
+
+        // Promotion loop: shared lock — we only read the Layer structs (l0_, l1_, l2_)
+        // and write into the individual index cluster stores (protected by their own locks).
+        // Downgrading from exclusive to shared allows concurrent searches to proceed in
+        // parallel while promotion runs, eliminating the 3-7s serialisation gap.
+        const auto t_promo_start = profiling ? clock::now() : clock::time_point{};
         {
-            std::unique_lock promo_lk(topo_mu_);
+            std::shared_lock promo_lk(topo_mu_);
             for (size_t qi = 0; qi < q_rows; ++qi) {
                 const int st = (qi < stage.size()) ? stage[qi] : 0;
                 int limit = cache_config_.max_promote_per_query;
@@ -782,6 +947,19 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     promote_vector_neighborhood_(doc_id);
                 }
             }
+        }
+
+        // Emit one profile line per batch — includes promotion since it runs on this thread.
+        if (profiling) {
+            const double p_promo_ms = fms(clock::now() - t_promo_start).count();
+            const double total_ms   = fms(clock::now() - t_search_start).count();
+            M3Profiler::instance().log_search_batch(
+                q_rows,
+                p_probe_ms, p_l0_ms, p_l0_exits,
+                p_l1_ms,    p_l1_exits,
+                p_l2_gpu_clusters, p_l2_cpu_clusters,
+                p_l2_gpu_ms, p_l2_cpu_ms,
+                p_merge_ms, p_promo_ms, total_ms);
         }
         // Update dagent rolling average with this batch so the next call can use αet·dagent.
         update_dagent_(out_scores, k);
@@ -854,6 +1032,39 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
     update_dagent_(out_scores, k);
 }
 
+std::vector<int> MultiLevelIndex::get_l2_probe_ids(const float* query, int nprobe) const {
+    std::shared_ptr<IVFIndex> l2_idx;
+    {
+        std::shared_lock lk(topo_mu_);
+        l2_idx = l2_.index;
+    }
+    std::vector<int> out;
+    if (l2_idx)
+        l2_idx->get_probe_ids(query, nprobe, out);
+    return out;
+}
+
+void MultiLevelIndex::search_l2_clusters(const std::vector<int>& cids,
+                                          const float* query, int k,
+                                          std::vector<DocId>&  out_ids,
+                                          std::vector<float>&  out_scores) const {
+    if (cids.empty() || !query || k <= 0) return;
+    std::shared_ptr<IVFIndex> l2_idx;
+    {
+        std::shared_lock lk(topo_mu_);
+        l2_idx = l2_.index;
+    }
+    if (!l2_idx) return;
+
+    // search_on returns results per query; we have a single query here.
+    std::vector<std::vector<DocId>>  ids(1);
+    std::vector<std::vector<float>>  scores(1);
+    l2_idx->search_on(cids, query, /*q_rows=*/1, k, ids, scores);
+
+    out_ids.insert(out_ids.end(), ids[0].begin(), ids[0].end());
+    out_scores.insert(out_scores.end(), scores[0].begin(), scores[0].end());
+}
+
 void MultiLevelIndex::maintenance_pass() {
     if (m3_verbose) {
         fprintf(stderr, "[M3:maint] ── maintenance_pass() begin ──\n");
@@ -880,16 +1091,32 @@ void MultiLevelIndex::maintenance_pass() {
         }
     }
 
-    // ===== 2) Run per-IVF maintenance (split/merge/compact) =====
-    if (l0_idx) l0_idx->maintenance_pass();
-    if (l1_idx) l1_idx->maintenance_pass();
-    if (l2_idx) l2_idx->maintenance_pass();
+    // Note: IVF-level split/merge (l?_idx->maintenance_pass()) intentionally omitted.
+    // Maintenance is event-driven: only overflow triggers eviction; no periodic compaction.
+
+    if (m3_verbose || M3Logger::instance().is_enabled()) {
+        const int l0n = l0_idx ? l0_idx->nlist() : -1;
+        const int l1n = l1_idx ? l1_idx->nlist() : -1;
+        const int l2n = l2_idx ? l2_idx->nlist() : -1;
+        int cen_n = -1;
+        {
+            std::shared_lock ck(topo_mu_);
+            cen_n = l2_.centroids.empty() ? 0
+                  : static_cast<int>(l2_.centroids.size() / static_cast<size_t>(dim_));
+        }
+        M3Logger::instance().log_maint_topology(l0n, l1n, l2n, cen_n);
+    }
 
     if (!cache_mode || meta_snap.empty() || nlist == 0) {
         return;
     }
 
-    // ===== 3) Vector-level eviction per level (no MultiLevelIndex locks) =====
+    // ===== 2) L0 overflow: event-driven eviction into L1 =====
+    // L0 and L1 share the same cluster ids; only the vector sets differ.
+    // Eviction policy: for each LRU vector leaving L0 —
+    //   • already in L1 → just erase from L0 (no-op for L1)
+    //   • not in L1     → if L1 cluster is at cap, evict LRU from L1 first (simple erase,
+    //                     GT is always in L2), then add the vector to L1, then erase from L0.
     const size_t l0_cap = static_cast<size_t>(cache_config_.l0_max_vectors_per_cluster);
     const size_t l1_cap = static_cast<size_t>(cache_config_.l1_max_vectors_per_cluster);
     const size_t dim_sz = static_cast<size_t>(dim_);
@@ -898,87 +1125,90 @@ void MultiLevelIndex::maintenance_pass() {
         const int nlist0 = l0_idx->nlist();
         for (int cid = 0; cid < nlist0; ++cid) {
             const size_t sz = l0_idx->cluster_live_size(cid);
-            if (sz > l0_cap) {
-                std::vector<DocId> evict;
-                l0_idx->get_coldest_doc_ids(cid, sz - l0_cap, evict);
-                if (!evict.empty()) {
-                    // Spec: "When an L0 cluster overflows, evicted vectors are written back into L1."
-                    if (l1_idx && l2_idx) {
-                        const float* cp = l2_idx->centroid_ptr(cid);
-                        if (cp) {
-                            std::vector<float> cent(cp, cp + dim_sz);
-                            l1_idx->ensure_cluster(cid, cent);
-                            std::vector<DocId> wb_ids;
-                            std::vector<float>  wb_vecs;
-                            wb_ids.reserve(evict.size());
-                            wb_vecs.reserve(evict.size() * dim_sz);
-                            for (DocId id : evict) {
-                                const float* v = l0_idx->cluster_get_vector(cid, id);
-                                if (v) {
-                                    wb_ids.push_back(id);
-                                    wb_vecs.insert(wb_vecs.end(), v, v + dim_sz);
-                                }
-                            }
-                            if (!wb_ids.empty()) {
-                                l1_idx->update_batch(cid, wb_ids.data(), wb_vecs.data(),
-                                                     wb_ids.size(), /*insert_if_absent=*/true);
-                                if (m3_verbose) {
-                                    fprintf(stderr,
-                                            "[M3:maint] L0->L1 writeback  cid=%d  "
-                                            "evicted=%zu  written_to_L1=%zu  "
-                                            "(L0 was %zu > cap %zu)\n",
-                                            cid, evict.size(), wb_ids.size(), sz, l0_cap);
-                                }
-                            }
+            if (sz <= l0_cap) continue;
+
+            std::vector<DocId> evict;
+            l0_idx->get_coldest_doc_ids(cid, sz - l0_cap, evict);
+            if (evict.empty()) continue;
+
+            if (l1_idx && l2_idx) {
+                const float* cp = l2_idx->centroid_ptr(cid);
+                if (cp) {
+                    std::vector<float> cent(cp, cp + dim_sz);
+                    l1_idx->ensure_cluster(cid, cent);
+                }
+
+                size_t written_to_l1 = 0;
+                std::vector<DocId> l0_to_erase;
+                l0_to_erase.reserve(evict.size());
+
+                for (DocId id : evict) {
+                    const float* v = l0_idx->cluster_get_vector(cid, id);
+                    l0_to_erase.push_back(id);
+                    if (!v) continue;
+
+                    if (l1_idx->cluster_get_vector(cid, id)) {
+                        // Already cached in L1 — nothing to do beyond dropping from L0.
+                        continue;
+                    }
+
+                    // Not in L1: enforce per-cluster L1 cap before inserting.
+                    if (l1_cap > 0) {
+                        const size_t l1_sz = l1_idx->cluster_live_size(cid);
+                        if (l1_sz >= l1_cap) {
+                            // Evict the single LRU vector from L1 (GT lives in L2 → simple erase).
+                            std::vector<DocId> l1_evict;
+                            l1_idx->get_coldest_doc_ids(cid, 1, l1_evict);
+                            if (!l1_evict.empty())
+                                l1_idx->erase_batch(cid, l1_evict.data(), l1_evict.size());
                         }
                     }
-                    l0_idx->erase_batch(cid, evict.data(), evict.size());
+
+                    l1_idx->update_batch(cid, &id, v, 1, /*insert_if_absent=*/true);
+                    ++written_to_l1;
                 }
+
+                if (!l0_to_erase.empty())
+                    l0_idx->erase_batch(cid, l0_to_erase.data(), l0_to_erase.size());
+
+                if (m3_verbose && written_to_l1 > 0) {
+                    fprintf(stderr,
+                            "[M3:maint] L0->L1 eviction  cid=%d  "
+                            "evicted_from_L0=%zu  written_to_L1=%zu  "
+                            "(L0 was %zu > cap %zu)\n",
+                            cid, evict.size(), written_to_l1, sz, l0_cap);
+                }
+            } else {
+                // No L1 available: just drop from L0 (GT is in L2).
+                l0_idx->erase_batch(cid, evict.data(), evict.size());
             }
         }
     }
+
+    // ===== 3) L1 overflow: simple erase =====
+    // L1 is populated only by promotion from L2, so GT always exists in L2.
+    // No merge-back needed — eviction is a plain erase.
     if (l1_idx && l1_cap > 0) {
         const int nlist1 = l1_idx->nlist();
         for (int cid = 0; cid < nlist1; ++cid) {
             const size_t sz = l1_idx->cluster_live_size(cid);
-            if (sz > l1_cap) {
-                std::vector<DocId> evict;
-                l1_idx->get_coldest_doc_ids(cid, sz - l1_cap, evict);
-                if (!evict.empty()) {
-                    // Spec: "Once an L1 cluster exceeds threshold, it is merged with L2."
-                    // For any evicted vector not yet in L2 (non-cache-mode origin), persist it now.
-                    if (l2_idx) {
-                        std::vector<DocId> merge_ids;
-                        std::vector<float>  merge_vecs;
-                        merge_ids.reserve(evict.size());
-                        merge_vecs.reserve(evict.size() * dim_sz);
-                        for (DocId id : evict) {
-                            if (!l2_idx->cluster_get_vector(cid, id)) {
-                                const float* v = l1_idx->cluster_get_vector(cid, id);
-                                if (v) {
-                                    merge_ids.push_back(id);
-                                    merge_vecs.insert(merge_vecs.end(), v, v + dim_sz);
-                                }
-                            }
-                        }
-                        if (!merge_ids.empty()) {
-                            l2_idx->add_batch(cid, merge_ids.data(), merge_vecs.data(), merge_ids.size());
-                            if (m3_verbose) {
-                                fprintf(stderr,
-                                        "[M3:maint] L1->L2 merge  cid=%d  "
-                                        "evicted=%zu  merged_into_L2=%zu  "
-                                        "(L1 was %zu > cap %zu)\n",
-                                        cid, evict.size(), merge_ids.size(), sz, l1_cap);
-                            }
-                        }
-                    }
-                    l1_idx->erase_batch(cid, evict.data(), evict.size());
+            if (sz <= l1_cap) continue;
+
+            std::vector<DocId> evict;
+            l1_idx->get_coldest_doc_ids(cid, sz - l1_cap, evict);
+            if (!evict.empty()) {
+                l1_idx->erase_batch(cid, evict.data(), evict.size());
+                if (m3_verbose) {
+                    fprintf(stderr,
+                            "[M3:maint] L1 eviction  cid=%d  "
+                            "evicted=%zu  (L1 was %zu > cap %zu)\n",
+                            cid, evict.size(), sz, l1_cap);
                 }
             }
         }
     }
 
-    // ===== 4) Recompute live sizes for each level (IVF only) =====
+    // ===== 4) Recompute live vector counts per level =====
     std::vector<size_t> l0_counts(nlist, 0), l1_counts(nlist, 0);
     if (l0_idx) {
         const int n0 = l0_idx->nlist();
@@ -1120,7 +1350,7 @@ void MultiLevelIndex::maintenance_pass() {
                 m.l1_vector_count = 0;
             } else {
                 m.l1_vector_count = l1_counts[cid];
-                // L0→L1 writeback in step 3 may have populated this cluster for the first time.
+                // L0→L1 eviction in step 2 may have populated this cluster for the first time.
                 if (l1_counts[cid] > 0) m.in_l1 = true;
             }
         }

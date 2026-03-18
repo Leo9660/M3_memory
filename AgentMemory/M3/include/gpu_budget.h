@@ -78,6 +78,11 @@ public:
     void*  get_ptr(int cid)         const;
     size_t get_bytes(int cid)       const;
 
+    // Update the stored pointer and byte count for a cluster that has already
+    // been registered (e.g. after expand_cluster() replaces the device buffer).
+    // No-op if cid is not currently registered.
+    void update_cluster(int cid, void* new_ptr, size_t new_bytes);
+
     size_t total_bytes_used() const;
     size_t budget_bytes()     const { return budget_bytes_; }
     size_t resident_count()   const;

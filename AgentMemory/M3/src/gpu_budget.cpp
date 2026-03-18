@@ -79,6 +79,16 @@ size_t GpuBudgetManager::resident_count() const {
     return registry_.size();
 }
 
+void GpuBudgetManager::update_cluster(int cid, void* new_ptr, size_t new_bytes) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = registry_.find(cid);
+    if (it == registry_.end()) return;
+    used_bytes_ -= it->second.bytes;
+    it->second.ptr   = new_ptr;
+    it->second.bytes = new_bytes;
+    used_bytes_ += new_bytes;
+}
+
 std::vector<int> GpuBudgetManager::all_resident_cids() const {
     std::lock_guard<std::mutex> lk(mu_);
     std::vector<int> out;

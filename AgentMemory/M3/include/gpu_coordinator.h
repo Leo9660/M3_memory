@@ -12,7 +12,7 @@
 #include "gpu_cluster_index.h"
 #include "gpu_flush_coordinator.h"
 #include "gpu_insert_buffer.h"
-#include "split_kernel_v3.h"
+#include "kmeans_gpu_v4.h"
 #include "m3_multi_level.h"
 
 namespace m3 {
@@ -56,34 +56,11 @@ bool promote_cluster(int cid,
                      MultiLevelIndex&     idx,
                      size_t               bytes_override = 0);
 
-// ======================================================================
-// Block 7 — Maintenance tick (free function)
-//
-// GpuBudgetManager reads ClusterMetadata::access_count directly on every
-// eviction decision — there is no separate frequency counter to sync.
-// maintenance_tick() therefore reduces to: flush pending buffers +
-// idx.maintenance_pass().
-// ======================================================================
-
-// Result type for maintenance_tick().
-struct TickResult {
-    size_t vectors_flushed    = 0;  // total buffer vectors written to L2
-    size_t flush_events       = 0;  // number of cluster flushes performed
-    size_t clusters_promoted  = 0;  // new hotspot clusters promoted to GPU
-};
-
 // Result type for GpuCoordinator::split_gpu_cluster().
 struct SplitResult {
     bool success  = false;
     int  new_cid  = -1;  // cluster id for the B partition; -1 if split failed
 };
-
-// Unified maintenance tick:
-//   1. Flush all pending buffer slots in monitored_cids.
-//   2. Run idx.maintenance_pass() (vector eviction, cold-cluster demotion).
-TickResult maintenance_tick(const std::vector<int>& monitored_cids,
-                             AsyncFlushCoordinator&  flush_coord,
-                             MultiLevelIndex&        idx);
 
 // ======================================================================
 // Block 8 — GpuCoordinator
@@ -115,27 +92,32 @@ TickResult maintenance_tick(const std::vector<int>& monitored_cids,
 //
 // Lifecycle
 // ─────────
-//   promote_to_gpu(cid) — upload L2 data to GPU (copy semantics: L2
-//                         keeps its data), register in budget (auto-
-//                         evicting LFU clusters with drain), activate
-//                         buffer slot.
-//   demote_from_gpu(cid) — drain insert buffer → flush buffer vectors
-//                          to L2 (only the new inserts since promotion),
-//                          remove from GPU, deactivate buffer slot.
-//                          L2 cluster data is intact; only the buffer
-//                          delta needs writing.
+//   promote_to_gpu(cid)  — synchronous: export L2 → H2D → register → activate buffer.
+//                          Blocks caller until H2D transfer completes.
+//                          Use enqueue_promote() for non-blocking promotion.
+//   demote_from_gpu(cid) — synchronous: drain buffer → L2 → remove GPU → deactivate.
+//                          Use enqueue_demote() for non-blocking demotion.
+//   enqueue_promote(cid) — async: push to promote queue, return immediately.
+//                          Cluster stays CPU-resident (L2 authoritative) until the
+//                          background thread processes it and H2D completes.
+//   enqueue_demote(cid)  — async: immediately flips routing to L2 (budget removed,
+//                          buffer deactivated so new inserts/searches use L2 at once),
+//                          then defers drain+cudaFree to the background thread.
+//                          In-flight GPU searches complete safely via shared_ptr ref-count.
 //
-// Maintenance
+// Maintenance (three independent operations)
 // ───────────
-//   maintenance_tick() — three phases:
-//     1. Flush pending buffer slots → GPU expand + L2 durability write.
-//     2. idx.maintenance_pass() — CPU-side L0/L1 eviction and writeback.
-//     3. hotspot_rebalance_() — promote non-GPU-resident clusters whose
-//        access_count exceeds the current minimum GPU-resident cluster;
-//        LFU clusters are evicted via the drain protocol automatically.
-//        TickResult::clusters_promoted reports how many were promoted.
-//   start/stop_background_flush() — background thread that calls
-//                        maintenance_tick() at a configurable interval.
+//   flush_buffers()   — drain insert buffers → GPU expand + L2 durability write.
+//                       High frequency: tied to insert rate.
+//   cpu_maintenance() — L0/L1 vector eviction + cold-cluster demotion in MultiLevelIndex.
+//                       Low frequency: time/size based.
+//   rebalance()       — enqueue promotions for clusters hotter than weakest GPU-resident.
+//                       Medium frequency: access-pattern driven.
+//   drain_pending()   — process async promote/demote queues immediately.
+//                       Called automatically at the start of each maintenance function;
+//                       expose publicly so callers can flush queues on demand.
+//   start_background(flush_ms, maintenance_ms, rebalance_ms) — background thread runs
+//                       each operation on its own independent interval.
 //
 // Thread-safe: all public methods are safe for concurrent use.
 // ======================================================================
@@ -170,9 +152,19 @@ public:
 
     // ---- Search ----
 
-    // Collaborative search over probe_cids:
-    //   GPU-resident clusters → search GpuClusterIndex data.
-    //   All clusters → scan ClusterInsertBuffer.
+    // Collaborative search over GPU-resident probe clusters.
+    //
+    // probe_cids must contain ONLY GPU-resident cluster IDs. The GPU/L2 split
+    // happens at the call site:
+    //   1. all_probes = idx.get_l2_probe_ids(query, nprobe)
+    //   2. gpu_ids = [cid for cid in all_probes if coord.is_gpu_resident(cid)]
+    //   3. l2_ids  = [cid for cid in all_probes if not coord.is_gpu_resident(cid)]
+    //   4. coord.search(gpu_ids, query, k, ...)      — this method
+    //   5. idx.search_l2_clusters(l2_ids, query, k, ...)  — caller merges
+    //
+    // For each cluster in probe_cids:
+    //   • GPU path  : linear scan over GpuClusterIndex device vectors.
+    //   • Buffer path: scan ClusterInsertBuffer (buffered-but-not-yet-flushed vectors).
     // Results are merged (de-duplicated by DocId, best score kept), top-k returned.
     size_t search(const std::vector<int>& probe_cids,
                   const float* query, int k,
@@ -191,6 +183,17 @@ public:
     // buffer slot. Safe to call even if cid is not GPU-resident (no-op).
     // Returns number of vectors drained from the buffer and written to L2.
     size_t demote_from_gpu(int cid);
+
+    // Async promote: push cid onto the promote queue and return immediately.
+    // L2 remains authoritative for this cluster until the background thread
+    // completes the H2D transfer and registers the cluster in the budget.
+    void enqueue_promote(int cid);
+
+    // Async demote: immediately removes cid from the budget and deactivates its
+    // insert buffer slot so all new traffic routes to L2 at once. The buffer
+    // drain and cudaFree are deferred to the background thread.
+    // No-op if cid is not GPU-resident.
+    void enqueue_demote(int cid);
 
     // ---- Block 9 — GPU-side cluster split ----
 
@@ -212,14 +215,33 @@ public:
 
     // ---- Maintenance ----
 
-    // Flush pending buffers, run maintenance_pass(), sync access_counts to budget.
-    TickResult maintenance_tick();
+    // Flush insert buffers for all GPU-resident clusters (GPU expand + L2 write).
+    // Returns total vectors written.
+    size_t flush_buffers();
 
-    // Start a background thread that calls maintenance_tick() every interval_ms ms.
-    void start_background_flush(int interval_ms = 50);
+    // Run L0/L1 vector eviction and cold-cluster demotion in MultiLevelIndex.
+    void cpu_maintenance();
 
-    // Stop the background thread (blocks until exit; final tick performed).
-    void stop_background_flush();
+    // Enqueue promotions for non-resident clusters hotter than the weakest
+    // GPU-resident cluster. Returns the number of clusters enqueued.
+    // Actual H2D transfers happen when drain_pending() next runs.
+    size_t rebalance();
+
+    // Process the async promote/demote queues immediately.
+    // Called automatically at the start of flush_buffers(), cpu_maintenance(),
+    // and rebalance(); also available for explicit use in tests.
+    void drain_pending();
+
+    // Start a background thread with independent intervals for each operation.
+    //   flush_ms        — how often to flush insert buffers       (default  50 ms)
+    //   maintenance_ms  — how often to run cpu_maintenance()      (default 5000 ms)
+    //   rebalance_ms    — how often to rebalance hotspot clusters  (default  500 ms)
+    void start_background(int flush_ms       = 50,
+                          int maintenance_ms = 5000,
+                          int rebalance_ms   = 500);
+
+    // Stop the background thread (blocks until exit; final flush pass performed).
+    void stop_background();
 
     bool background_running() const { return bg_running_.load(); }
 
@@ -233,15 +255,14 @@ public:
     uint64_t         total_flush_events()        const;
 
 private:
-    void   bg_thread_fn_(int interval_ms);
-
-    // Scan all known clusters. For each non-GPU-resident cluster whose
-    // access_count exceeds the minimum frequency among currently GPU-resident
-    // clusters, call promote_to_gpu() (which auto-evicts the LFU cluster via
-    // the drain protocol). Candidates are processed hottest-first so the
-    // budget always ends up holding the highest-frequency clusters.
-    // Returns the number of clusters newly promoted in this call.
+    void   bg_thread_fn_(int flush_ms, int maintenance_ms, int rebalance_ms);
     size_t hotspot_rebalance_();
+
+    // Drain pending_promotes_ and pending_demotes_ queues.
+    // Called at the start of each maintenance_tick() so the background thread
+    // processes async requests promptly without a separate polling loop.
+    // Demotes are processed first (freeing budget space before promotes run).
+    void process_pending_();
 
     MultiLevelIndex&      idx_;
     GpuClusterIndex       gpu_idx_;
@@ -252,6 +273,11 @@ private:
     std::atomic<bool>     bg_running_{false};
     std::atomic<bool>     stop_flag_{false};
     std::thread           bg_thread_;
+
+    std::mutex            pending_mu_;
+    std::vector<int>      pending_promotes_;
+    std::vector<int>      pending_demotes_;
+    std::vector<int>      pending_flushes_;   // cids whose insert buffer hit cap during insert
 };
 
 } // namespace m3

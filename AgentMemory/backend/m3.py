@@ -7,7 +7,7 @@ import numpy as np
 from .base import MemoryBackend
 from ..types import CollectionSpec, RunResult, BackendRequest, BackendOpType, SearchHit
 
-from AgentMemory.M3 import _m3_async as m3, rebuild_from_faiss, M3MultiLevelIndex  # pybind module + loader
+from AgentMemory.M3 import _m3_async as m3, rebuild_from_faiss, M3MultiLevelIndex, GpuCoordinator  # pybind module + loader
 
 def _metric_enum(name: str):
     s = (name or "").lower()
@@ -187,14 +187,12 @@ class M3Backend(MemoryBackend):
                 self._eng.flush()
 
             elif op.op == BackendOpType.SEARCH:
-                # 默认还是先 flush，这样语义跟你前面说的一致
-                flush = True
-                if flush:
-                    self._eng.flush()
-
                 queries = self._as_f32_2d(op.vectors, "SEARCH requires 2D 'vectors'")
                 k = int(op.k or 1)
                 nprobe = int(op.nprobe or 32)
+
+                # Flush pending writes before search for read-your-writes semantics.
+                self._eng.flush()
 
                 out_ids, out_scores = self._eng.search(idx, queries, k, nprobe)
 
@@ -343,6 +341,7 @@ class M3MultiLevelBackend(MemoryBackend):
                 ids = self._keys_to_int64(op.ext_ids, "INSERT requires 'ext_ids'")
                 vecs = _as_f32_2d(op.vectors, "INSERT requires 2D 'vectors'")
                 idx.insert(ids, vecs)
+
                 # Store metadata and data
                 if idx_id not in self._int2ext:
                     self._int2ext[idx_id] = {}
@@ -391,6 +390,7 @@ class M3MultiLevelBackend(MemoryBackend):
                 nprobe = int(op.nprobe or 32)
 
                 out_ids, out_scores = idx.search(queries, k, nprobe)
+
                 rid = op.request_id or f"req-{len(search_payload)}"
                 hits_per_query: List[List[SearchHit]] = []
                 for ids_list, scores_list in zip(out_ids, out_scores):
@@ -502,3 +502,250 @@ class M3MultiLevelBackend(MemoryBackend):
                     h = hashlib.blake2b(str(key).encode("utf-8"), digest_size=8).digest()
                     out[i] = int.from_bytes(h, "big", signed=False) & 0x7fffffffffffffff
         return out
+
+
+class M3MultiGpuBackend(MemoryBackend):
+    """
+    M3 MultiLevelIndex backend with GPU hotspot caching via GpuCoordinator.
+
+    Hot clusters are automatically promoted to VRAM based on access frequency.
+    Inserts for GPU-resident clusters are buffered on CPU and flushed to GPU
+    asynchronously. Searches partition probe clusters between GPU kernels and
+    CPU L2 scans, merging results before returning.
+
+    Configurable via spec.params:
+      gpu_budget_bytes  : VRAM cap in bytes       (default: 2 GB)
+      insert_buf_cap    : per-cluster buffer size  (default: 128)
+      flush_ms          : buffer flush interval    (default: 50 ms)
+      maintenance_ms    : L0/L1 eviction interval  (default: 5000 ms)
+      rebalance_ms      : hotspot rebalance period (default: 500 ms)
+      + all M3MultiLevelBackend centroid/config params
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._indices: Dict[int, M3MultiLevelIndex] = {}
+        self._coordinators: Dict[int, GpuCoordinator] = {}
+
+        self._meta: Dict[int, Dict[int, Optional[Dict[str, Any]]]] = {}
+        self._data: Dict[int, Dict[int, Any]] = {}
+        self._int2ext: Dict[int, Dict[int, Any]] = {}
+
+    def close(self) -> None:
+        # Stop coordinators before destroying indices (coordinator holds a C++ ref to the index).
+        for coord in self._coordinators.values():
+            try:
+                coord.stop_background()
+            except Exception:
+                pass
+        for idx in self._indices.values():
+            try:
+                idx.set_gpu_coordinator(None)
+            except Exception:
+                pass
+        self._coordinators.clear()
+        self._indices.clear()
+
+    def create_index(self, index_id: int, spec: CollectionSpec) -> None:
+        if index_id in self._indices:
+            return
+        dim = int(spec.dim)
+        metric = _metric_enum(getattr(spec, "metric", "l2"))
+        normalized = (metric == m3.Metric.COSINE)
+
+        params = getattr(spec, "params", {}) or {}
+        cfg_kwargs = {
+            "l0_nlist": int(params.get("l0_nlist", 1)),
+            "l1_nlist": int(params.get("l1_nlist", 1)),
+            "l2_nlist": int(params.get("l2_nlist", 1)),
+            "l0_new_cluster_threshold": float(params.get("l0_new_cluster_threshold", float("inf"))),
+            "search_threshold": float(params.get("search_threshold", float("inf"))),
+            "l0_merge_threshold": float(params.get("l0_merge_threshold", float("inf"))),
+            "l0_max_nlist": int(params.get("l0_max_nlist", 0)),
+        }
+        idx = M3MultiLevelIndex(dim=dim, metric=metric, normalized=normalized, **cfg_kwargs)
+
+        centroids = params.get("centroids")
+        if centroids is None:
+            centroids = np.zeros((cfg_kwargs["l0_nlist"], dim), dtype=np.float32)
+        centroids = np.ascontiguousarray(centroids, dtype=np.float32)
+        if centroids.ndim != 2 or centroids.shape[1] != dim:
+            raise ValueError("centroids must be [nlist, dim]")
+        idx.set_l0_centroids(centroids)
+
+        # GPU coordinator parameters.
+        gpu_budget_bytes = int(params.get("gpu_budget_bytes", 10 * 1024 ** 3))  # default 10 GB
+        insert_buf_cap   = int(params.get("insert_buf_cap", 128))
+        flush_ms         = int(params.get("flush_ms", 50))
+        maintenance_ms   = int(params.get("maintenance_ms", 5000))
+        rebalance_ms     = int(params.get("rebalance_ms", 500))
+
+        coord = GpuCoordinator(
+            idx,
+            gpu_budget_bytes=gpu_budget_bytes,
+            dim=dim,
+            metric=metric,
+            normalized=normalized,
+            insert_buf_cap=insert_buf_cap,
+        )
+        idx.set_gpu_coordinator(coord)
+        coord.start_background(
+            flush_ms=flush_ms,
+            maintenance_ms=maintenance_ms,
+            rebalance_ms=rebalance_ms,
+        )
+
+        self._indices[index_id] = idx
+        self._coordinators[index_id] = coord
+        self._meta[index_id] = {}
+        self._data[index_id] = {}
+        self._int2ext[index_id] = {}
+
+    def execute(self, ops: List[BackendRequest]) -> RunResult:
+        insert_cnt = 0
+        update_cnt = 0
+        delete_cnt = 0
+        search_payload: Dict[str, List[List[SearchHit]]] = {}
+
+        for op in ops:
+            idx_id = int(op.index_id)
+            if idx_id not in self._indices:
+                raise KeyError(f"M3MultiGpuBackend: index_id {idx_id} not found. Call create_index() first.")
+            idx = self._indices[idx_id]
+
+            if op.op == BackendOpType.INSERT:
+                ids = self._keys_to_int64(op.ext_ids, "INSERT requires 'ext_ids'")
+                vecs = _as_f32_2d(op.vectors, "INSERT requires 2D 'vectors'")
+                idx.insert(ids, vecs)
+
+                if idx_id not in self._int2ext:
+                    self._int2ext[idx_id] = {}
+                    self._meta[idx_id] = {}
+                    self._data[idx_id] = {}
+                for int_id, ext_id, meta, payload in zip(ids, op.ext_ids or [], op.metas or [], op.payloads or []):
+                    self._int2ext[idx_id][int(int_id)] = ext_id
+                    self._meta[idx_id][int(int_id)] = meta
+                    self._data[idx_id][int(int_id)] = payload
+                insert_cnt += len(ids)
+
+            elif op.op == BackendOpType.UPDATE:
+                ids = self._keys_to_int64(op.ext_ids, "UPDATE requires 'ext_ids'")
+                vecs = _as_f32_2d(op.vectors, "UPDATE requires 2D 'vectors'")
+                idx.update(ids, vecs, insert_if_absent=True)
+                if idx_id not in self._int2ext:
+                    self._int2ext[idx_id] = {}
+                    self._meta[idx_id] = {}
+                    self._data[idx_id] = {}
+                for int_id, ext_id, meta, payload in zip(ids, op.ext_ids or [], op.metas or [], op.payloads or []):
+                    self._int2ext[idx_id][int(int_id)] = ext_id
+                    if meta is not None:
+                        self._meta[idx_id][int(int_id)] = meta
+                    if payload is not None:
+                        self._data[idx_id][int(int_id)] = payload
+                update_cnt += len(ids)
+
+            elif op.op == BackendOpType.DELETE_IDS:
+                ids = self._keys_to_int64(op.ext_ids, "DELETE_IDS requires 'ext_ids'")
+                idx.erase(ids)
+                for int_id in ids:
+                    self._meta.get(idx_id, {}).pop(int(int_id), None)
+                    self._data.get(idx_id, {}).pop(int(int_id), None)
+                    self._int2ext.get(idx_id, {}).pop(int(int_id), None)
+                delete_cnt += len(ids)
+
+            elif op.op == BackendOpType.FLUSH:
+                continue  # background thread handles flush
+
+            elif op.op == BackendOpType.SEARCH:
+                queries = _as_f32_2d(op.vectors, "SEARCH requires 2D 'vectors'")
+                k = int(op.k or 1)
+                nprobe = int(op.nprobe or 32)
+
+                # GPU backend has no explicit flush (background thread handles it).
+                out_ids, out_scores = idx.search(queries, k, nprobe)
+
+                rid = op.request_id or f"req-{len(search_payload)}"
+                hits_per_query: List[List[SearchHit]] = []
+                for ids_list, scores_list in zip(out_ids, out_scores):
+                    hits = []
+                    for doc_id, score in zip(ids_list, scores_list):
+                        int_id = int(doc_id)
+                        ext_id = self._int2ext.get(idx_id, {}).get(int_id, str(int_id))
+                        base_meta = self._meta.get(idx_id, {}).get(int_id) or {}
+                        meta = dict(base_meta) if base_meta else {}
+                        if idx_id in self._data and int_id in self._data[idx_id]:
+                            meta["_data"] = self._data[idx_id][int_id]
+                        doc_id_str = str(ext_id) if ext_id is not None else str(int_id)
+                        hits.append(SearchHit(
+                            id=doc_id_str,
+                            score=float(score),
+                            metadata=meta if meta else None,
+                        ))
+                    hits_per_query.append(hits)
+                search_payload[rid] = hits_per_query
+
+            else:
+                raise NotImplementedError(f"Unsupported op: {op.op}")
+
+        return RunResult(
+            upserted=insert_cnt,
+            updated=update_cnt,
+            deleted=delete_cnt,
+            searches=search_payload,
+        )
+
+    def rebuild_index_from_faiss(self, index_id: int, *, path: str, normalized: Optional[bool] = None) -> None:
+        try:
+            import faiss
+            from faiss.contrib.inspect_tools import get_invlist
+        except ImportError as exc:
+            raise RuntimeError("faiss is required to rebuild an index from a Faiss file") from exc
+
+        if index_id not in self._indices:
+            raise KeyError(f"M3MultiGpuBackend: index_id {index_id} not found. Call create_index() first.")
+
+        from pathlib import Path
+        idx = self._indices[index_id]
+        faiss_path = Path(path)
+        if not faiss_path.is_file():
+            raise FileNotFoundError(f"Faiss index file not found: {faiss_path}")
+
+        index = faiss.read_index(str(faiss_path))
+        ivf = faiss.extract_index_ivf(index)
+        if ivf is None:
+            raise ValueError("Provided index does not contain an IVF component")
+        ivf = faiss.downcast_index(ivf)
+        if ivf.ntotal == 0:
+            return
+
+        quantizer = faiss.downcast_index(ivf.quantizer)
+        if hasattr(quantizer, "xb") and quantizer.ntotal == ivf.nlist:
+            centroids = faiss.vector_to_array(quantizer.xb).astype(np.float32).reshape(ivf.nlist, ivf.d)
+        else:
+            centroids = np.vstack(
+                [quantizer.reconstruct(i) for i in range(ivf.nlist)]
+            ).astype(np.float32)
+        centroids = np.ascontiguousarray(centroids)
+        idx.set_l2_centroids(centroids)
+
+        invlists = faiss.downcast_InvertedLists(ivf.invlists)
+        for list_id in range(ivf.nlist):
+            list_ids, list_codes = get_invlist(invlists, list_id)
+            if list_ids.size == 0:
+                continue
+            if list_codes.dtype != np.uint8:
+                raise ValueError("Only IndexIVFFlat (float codes) is supported for now")
+            vectors = list_codes.view(np.float32).reshape(list_ids.shape[0], ivf.d)
+            idx.load_cluster(
+                int(list_id),
+                np.ascontiguousarray(list_ids, dtype=np.int64),
+                np.ascontiguousarray(vectors, dtype=np.float32),
+            )
+
+        self._meta[index_id] = {}
+        self._data[index_id] = {}
+        self._int2ext[index_id] = {}
+
+    @staticmethod
+    def _keys_to_int64(keys, err: str):
+        return M3MultiLevelBackend._keys_to_int64(keys, err)

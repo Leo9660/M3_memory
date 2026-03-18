@@ -13,6 +13,9 @@
 
 namespace m3 {
 
+// Forward declaration to avoid circular include (gpu_coordinator.h includes this file).
+class GpuCoordinator;
+
 // ================================================================
 // Cache configuration: thresholds for L0/L1 sizes, eviction,
 // promotion/demotion, and L1 neighborhood caching.
@@ -108,6 +111,10 @@ public:
     void set_l1_centroids(const std::vector<float>& centroids);
     void set_l2_centroids(const std::vector<float>& centroids);
     void set_cache_config(CacheConfig cfg) { cache_config_ = std::move(cfg); }
+
+    // Wire in a GpuCoordinator so search/insert can route GPU-resident clusters
+    // through the GPU tier. Pass nullptr to disable GPU routing.
+    void set_gpu_coordinator(GpuCoordinator* gpu) { gpu_coord_ = gpu; }
     void set_l1_strategy(std::shared_ptr<L1Strategy> s) {
         std::unique_lock lk(topo_mu_);
         l1_strategy_ = std::move(s);
@@ -156,6 +163,22 @@ public:
                 std::vector<std::vector<DocId>>& out_ids,
                 std::vector<std::vector<float>>& out_scores) const;
 
+    // Return the IDs of the nprobe L2 clusters nearest to `query` by centroid
+    // distance (ascending order). This is the same probe-set selection that
+    // search() uses internally via IVFIndex::get_probe_ids(). Expose it here
+    // so callers can split the probe set into GPU-resident vs non-resident
+    // clusters before routing to GpuCoordinator::search().
+    std::vector<int> get_l2_probe_ids(const float* query, int nprobe) const;
+
+    // Search specific L2 clusters by ID (linear scan within each cluster).
+    // Results are appended to out_ids / out_scores (not cleared). Used by
+    // callers to search the non-GPU portion of the probe set after GPU-resident
+    // clusters are handled by GpuCoordinator::search().
+    void search_l2_clusters(const std::vector<int>& cids,
+                            const float* query, int k,
+                            std::vector<DocId>&  out_ids,
+                            std::vector<float>&  out_scores) const;
+
     // ---- maintenance ----
     void maintenance_pass(); // per-layer maintenance hooks
 
@@ -183,6 +206,7 @@ private:
     struct Layer {
         std::shared_ptr<IVFIndex> index;    // built on demand
         std::vector<float> centroids;       // last configured centroids
+        const char* name = "??";            // "L0"/"L1"/"L2" — used in debug logs
     };
 
     void ensure_layer_initialized_(Layer& layer, int nlist_hint);
@@ -222,6 +246,8 @@ private:
     std::unordered_map<DocId, int> doc_id_to_cid_;   // L2 assignment (canonical)
 
     mutable std::shared_mutex topo_mu_;              // protects layer pointers/centroids, doc_id_to_cid_
+
+    GpuCoordinator* gpu_coord_ = nullptr;            // optional; not owned
 
     // dagent: rolling mean of recent per-query k-th distances, used for dynamic αet·dagent threshold.
     mutable std::deque<float> dagent_history_;

@@ -8,7 +8,8 @@ from AgentMemory.M3 import _m3_async  # compiled extension
 Metric = _m3_async.Metric
 MultiLevelConfig = _m3_async.MultiLevelConfig
 CacheConfig = getattr(_m3_async, "CacheConfig", None)  # optional
-_MultiLevelIndex = _m3_async.MultiLevelIndex
+_MultiLevelIndex  = _m3_async.MultiLevelIndex
+_GpuCoordinator   = _m3_async.GpuCoordinator
 
 
 class M3AsyncEngine:
@@ -177,3 +178,102 @@ class M3MultiLevelIndex:
         ids64 = np.ascontiguousarray(ids, dtype=np.int64)
         vecs = np.ascontiguousarray(vectors, dtype=np.float32)
         self._idx.load_cluster(int(cluster_id), ids64, vecs)
+
+    def set_gpu_coordinator(self, coordinator: "GpuCoordinator | None") -> None:
+        """Wire (or unwire) a GpuCoordinator so GPU-resident clusters are used for search/insert."""
+        if coordinator is None:
+            self._idx.set_gpu_coordinator(None)
+        else:
+            self._idx.set_gpu_coordinator(coordinator._coord)
+
+
+class GpuCoordinator:
+    """
+    Python wrapper for the C++ GpuCoordinator.
+
+    Orchestrates GPU hotspot caching on top of a MultiLevelIndex:
+      - Promotes hot clusters from L2 into VRAM (GPU-resident).
+      - Routes inserts for GPU-resident clusters to a CPU insert buffer
+        (async H2D flush to GPU + L2 durability write via background thread).
+      - Routes searches for GPU-resident clusters to GPU distance kernels.
+      - Rebalances: promotes hotter non-GPU clusters, evicts coldest GPU ones.
+
+    Lifecycle:
+      coord = GpuCoordinator(idx, gpu_budget_bytes=2 * 1024**3, dim=768, metric=Metric.L2)
+      idx.set_gpu_coordinator(coord)
+      coord.start_background()
+      ...
+      coord.stop_background()
+      idx.set_gpu_coordinator(None)
+    """
+
+    def __init__(
+        self,
+        idx: M3MultiLevelIndex,
+        gpu_budget_bytes: int,
+        dim: int,
+        metric: Metric,
+        *,
+        normalized: bool = False,
+        insert_buf_cap: int = 128,
+    ) -> None:
+        # Keep a Python reference to idx so GC cannot collect it while we hold a C++ ref.
+        self._idx_ref = idx
+        self._coord = _GpuCoordinator(
+            idx._idx,
+            int(gpu_budget_bytes),
+            int(dim),
+            metric,
+            bool(normalized),
+            int(insert_buf_cap),
+        )
+
+    def promote_to_gpu(self, cid: int) -> bool:
+        return self._coord.promote_to_gpu(int(cid))
+
+    def enqueue_promote(self, cid: int) -> None:
+        self._coord.enqueue_promote(int(cid))
+
+    def enqueue_demote(self, cid: int) -> None:
+        self._coord.enqueue_demote(int(cid))
+
+    def drain_pending(self) -> None:
+        self._coord.drain_pending()
+
+    def flush_buffers(self) -> int:
+        return self._coord.flush_buffers()
+
+    def rebalance(self) -> int:
+        return self._coord.rebalance()
+
+    def start_background(
+        self,
+        flush_ms: int = 50,
+        maintenance_ms: int = 5000,
+        rebalance_ms: int = 500,
+    ) -> None:
+        self._coord.start_background(int(flush_ms), int(maintenance_ms), int(rebalance_ms))
+
+    def stop_background(self) -> None:
+        self._coord.stop_background()
+
+    def is_gpu_resident(self, cid: int) -> bool:
+        return self._coord.is_gpu_resident(int(cid))
+
+    def gpu_bytes_used(self) -> int:
+        return self._coord.gpu_bytes_used()
+
+    def gpu_budget_bytes(self) -> int:
+        return self._coord.gpu_budget_bytes()
+
+    def gpu_resident_cids(self) -> list:
+        return self._coord.gpu_resident_cids()
+
+    def background_running(self) -> bool:
+        return self._coord.background_running()
+
+    def __del__(self) -> None:
+        try:
+            self._coord.stop_background()
+        except Exception:
+            pass

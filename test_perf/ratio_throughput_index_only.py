@@ -226,7 +226,16 @@ def main() -> None:
         if not texts:
             raise RuntimeError("No dataset texts were loaded.")
         items = to_items(args.dataset, texts)
-        encoder = None  # use default TransformerEncoder from MemoryManagement
+
+        # Pre-encode outside the timed loop so throughput reflects index ops only.
+        from AgentMemory.encoder import TransformerEncoder
+        _enc = TransformerEncoder(normalize=args.normalize)
+        print(f"[init] pre-encoding {len(items)} items with {_enc.model_name} ...")
+        _enc_start = time.perf_counter()
+        _vecs = _enc.encode_items(items)
+        print(f"[init] encode done in {time.perf_counter() - _enc_start:.2f}s  dim={_enc.dim}")
+        items = [MemoryItem(id=it.id, data=vec) for it, vec in zip(items, _vecs)]
+        encoder = VectorPassthroughEncoder(dim=_enc.dim, normalize=False)  # already normalized
         mm = MemoryManagement(backend=args.backend, encoder=encoder, default_nprobe=args.nprobe)
     else:
         search_ratio, insert_ratio = parse_ratio(args.ratio)

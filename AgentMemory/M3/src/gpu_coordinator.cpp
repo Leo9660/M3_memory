@@ -9,10 +9,6 @@
 
 namespace m3 {
 
-// ======================================================================
-// Block 6 — Eviction Drain Protocol
-// ======================================================================
-
 size_t drain_evicted_clusters(const std::vector<EvictedCluster>& evicted,
                                ClusterInsertBuffer& buf,
                                GpuClusterIndex&     gpu_idx,
@@ -75,23 +71,6 @@ bool promote_cluster(int cid,
     return true;
 }
 
-// ======================================================================
-// Block 7 — Maintenance tick
-// ======================================================================
-
-TickResult maintenance_tick(const std::vector<int>& monitored_cids,
-                             AsyncFlushCoordinator&  flush_coord,
-                             MultiLevelIndex&        idx) {
-    TickResult r;
-    r.vectors_flushed = flush_coord.flush_clusters(monitored_cids);
-    r.flush_events    = flush_coord.total_flush_events();
-    idx.maintenance_pass();
-    return r;
-}
-
-// ======================================================================
-// Block 8 — GpuCoordinator
-// ======================================================================
 
 GpuCoordinator::GpuCoordinator(MultiLevelIndex& idx,
                                 size_t           gpu_budget_bytes,
@@ -103,10 +82,10 @@ GpuCoordinator::GpuCoordinator(MultiLevelIndex& idx,
     , gpu_idx_(dim, metric, normalized)
     , budget_(gpu_budget_bytes, &idx_)   // budget reads access_count directly from idx
     , insert_buf_(dim, insert_buf_cap)
-    , flush_coord_(insert_buf_, idx_, 0, &gpu_idx_) {}
+    , flush_coord_(insert_buf_, idx_, 0, &gpu_idx_, &budget_) {}
 
 GpuCoordinator::~GpuCoordinator() {
-    stop_background_flush();
+    stop_background();
 }
 
 BufferResult GpuCoordinator::insert(int cid, DocId id, const float* vec) {
@@ -119,14 +98,15 @@ BufferResult GpuCoordinator::insert(int cid, DocId id, const float* vec) {
     // GPU-resident: try to buffer.
     auto r = insert_buf_.try_buffer(cid, id, vec);
     if (r == BufferResult::kFull) {
-        // Buffer is at capacity — GPU cluster expansion is pending on the
-        // background flush thread (per paper: async H2D migrate, never block
-        // the insert path). Route this vector directly to L2 until the
-        // background thread drains the buffer and the slot opens up again.
-        fprintf(stderr,
-            "[M3 WARNING] GPU CLUSTER EXPANSION IN PROGRESS FOR CID=%d "
-            "— VECTOR ROUTED TO L2 (INSERT BUFFER FULL, ASYNC DRAIN PENDING)\n",
-            cid);
+        // Buffer is at capacity. Enqueue cid for async GPU expand on the
+        // background thread (non-blocking — same pattern as pending_promotes_).
+        // Route this vector to L2 so the insert is durable immediately;
+        // the background thread will expand the GPU cluster and reopen the
+        // buffer slot without stalling the insert path.
+        {
+            std::lock_guard<std::mutex> lk(pending_mu_);
+            pending_flushes_.push_back(cid);
+        }
         M3Logger::instance().log_insert_overflow(cid);
         idx_.load_cluster(cid, &id, vec, 1);
         return BufferResult::kBuffered;
@@ -244,57 +224,86 @@ size_t GpuCoordinator::hotspot_rebalance_() {
         if (!budget_.all_resident_cids().empty() && freq <= cur_min)
             break;
 
-        if (promote_to_gpu(cid)) {
-            // Override the MANUAL tag written by promote_to_gpu() with AUTO.
-            M3Logger::instance().log_promotion(cid, freq, /*auto_promoted=*/true);
-            ++promoted;
-        }
+        // Enqueue async: H2D transfer happens on the background thread, not here.
+        // promote_to_gpu() will log with auto_promoted=true when it executes.
+        enqueue_promote(cid);
+        ++promoted;
     }
     M3Logger::instance().log_hotspot_rebalance(promoted, n_candidates);
     return promoted;
 }
 
-TickResult GpuCoordinator::maintenance_tick() {
-    TickResult r;
-    // Log GPU memory state at the start of each tick.
+size_t GpuCoordinator::flush_buffers() {
+    process_pending_();
     M3Logger::instance().log_gpu_memory(budget_.total_bytes_used(),
-                                         budget_.budget_bytes(),
-                                         budget_.resident_count());
-    // Phase 1: flush insert buffers for all GPU-resident clusters.
-    auto cids = budget_.all_resident_cids();
-    r.vectors_flushed = flush_coord_.flush_clusters(cids);
-    r.flush_events    = flush_coord_.total_flush_events();
-    // Phase 2: CPU-side L0/L1 eviction and writeback.
-    idx_.maintenance_pass();
-    // Phase 3: hotspot-aware rebalance — auto-promote rising-frequency clusters.
-    r.clusters_promoted = hotspot_rebalance_();
-    return r;
+                                        budget_.budget_bytes(),
+                                        budget_.resident_count());
+    return flush_coord_.force_flush_all(budget_.all_resident_cids());
 }
 
-void GpuCoordinator::start_background_flush(int interval_ms) {
+void GpuCoordinator::cpu_maintenance() {
+    process_pending_();
+    idx_.maintenance_pass();
+}
+
+size_t GpuCoordinator::rebalance() {
+    process_pending_();
+    return hotspot_rebalance_();
+}
+
+void GpuCoordinator::drain_pending() {
+    process_pending_();
+}
+
+void GpuCoordinator::start_background(int flush_ms, int maintenance_ms, int rebalance_ms) {
     if (bg_running_.load()) return;
     stop_flag_.store(false);
     bg_running_.store(true);
-    bg_thread_ = std::thread(&GpuCoordinator::bg_thread_fn_, this, interval_ms);
+    bg_thread_ = std::thread(&GpuCoordinator::bg_thread_fn_, this,
+                             flush_ms, maintenance_ms, rebalance_ms);
 }
 
-void GpuCoordinator::stop_background_flush() {
+void GpuCoordinator::stop_background() {
     if (!bg_running_.load()) return;
     stop_flag_.store(true);
     if (bg_thread_.joinable()) bg_thread_.join();
     bg_running_.store(false);
 }
 
-void GpuCoordinator::bg_thread_fn_(int interval_ms) {
+void GpuCoordinator::bg_thread_fn_(int flush_ms, int maintenance_ms, int rebalance_ms) {
+    using clock = std::chrono::steady_clock;
+    using ms_t  = std::chrono::milliseconds;
+
+    auto last_maintenance = clock::now();
+    auto last_rebalance   = clock::now();
+
     while (!stop_flag_.load()) {
-        maintenance_tick();
-        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+        // Always: drain queues and flush buffers (highest frequency).
+        process_pending_();
+        flush_coord_.flush_clusters(budget_.all_resident_cids());
+
+        auto now = clock::now();
+
+        if (std::chrono::duration_cast<ms_t>(now - last_maintenance).count() >= maintenance_ms) {
+            idx_.maintenance_pass();
+            last_maintenance = now;
+        }
+
+        if (std::chrono::duration_cast<ms_t>(now - last_rebalance).count() >= rebalance_ms) {
+            hotspot_rebalance_();   // enqueues promotes; process_pending_ picks them up next iter
+            last_rebalance = now;
+        }
+
+        std::this_thread::sleep_for(ms_t(flush_ms));
     }
-    maintenance_tick();  // final pass on exit
+
+    // Final pass: drain queues and flush before exit.
+    process_pending_();
+    flush_coord_.flush_clusters(budget_.all_resident_cids());
 }
 
 // ======================================================================
-// Block 9 — GPU-side cluster split
+// GPU-side cluster split
 // ======================================================================
 
 SplitResult GpuCoordinator::split_gpu_cluster(int cid, int max_iters) {
@@ -323,9 +332,9 @@ SplitResult GpuCoordinator::split_gpu_cluster(int cid, int max_iters) {
 
     // 3. Run 2-centroid k-means.
     //    CPU fallback: pass host pointer directly.
-    //    CUDA build: gpu_split_kmeans_v3() manages H2D internally.
+    //    CUDA build: gpu_split_kmeans_v4() manages H2D internally.
     const auto split_t0 = std::chrono::steady_clock::now();
-    GpuSplitResult split = gpu_split_kmeans_v3(vecs.data(), n, dim, max_iters);
+    GpuSplitResult split = gpu_split_kmeans_v4(vecs.data(), n, dim, max_iters);
     const double split_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - split_t0).count();
     M3Logger::instance().log_split(cid, static_cast<size_t>(n), split_ms, gpu_path);
@@ -365,34 +374,100 @@ SplitResult GpuCoordinator::split_gpu_cluster(int cid, int max_iters) {
         return {false, -1};
     }
 
-    // 7. Refresh GPU storage for cid if it was resident.
+    // 7. Refresh GPU storage for cid if it was resident, and update the budget
+    //    to reflect the smaller post-split size (B_a < B_original).
+    //    This frees B_b = B_original - B_a bytes in the budget so that step 8
+    //    can register new_cid without triggering LFU evictions — total bytes
+    //    stays constant (B_a + B_b == B_original).
     if (budget_.is_gpu_resident(cid)) {
-        gpu_idx_.store_cluster(cid,
-                                ids_a.data(), vecs_a.data(), ids_a.size());
+        void* new_ptr_a = gpu_idx_.store_cluster(cid,
+                                                  ids_a.data(), vecs_a.data(),
+                                                  ids_a.size());
+        const size_t bytes_a = ids_a.size() * static_cast<size_t>(dim) * sizeof(float);
+        budget_.update_cluster(cid, new_ptr_a, bytes_a > 0 ? bytes_a : 1);
     }
 
-    // 8. Attempt to promote the new cluster to GPU (budget permitting).
+    // 8. Promote new cluster (partition B) to GPU.
+    //    By design both partitions must remain GPU-resident after a split.
+    //    After the budget update above, B_b bytes are available so this should
+    //    always succeed for the GPU-resident split path.
     if (!ids_b.empty()) {
         void* ptr = gpu_idx_.store_cluster(new_cid,
                                             ids_b.data(), vecs_b.data(),
                                             ids_b.size());
-        const size_t bytes = ids_b.size()
-                           * static_cast<size_t>(dim) * sizeof(float);
+        const size_t bytes_b = ids_b.size()
+                             * static_cast<size_t>(dim) * sizeof(float);
         std::vector<EvictedCluster> evicted;
         bool ok = budget_.register_cluster(new_cid, ptr,
-                                            bytes > 0 ? bytes : 1, evicted);
+                                            bytes_b > 0 ? bytes_b : 1, evicted);
         if (!evicted.empty())
             drain_evicted_clusters(evicted, insert_buf_, gpu_idx_, idx_);
 
         if (ok) {
             insert_buf_.activate_cluster(new_cid);
         } else {
-            // Budget full even after evictions: keep new cluster in L2 only.
+            // Should not happen for a GPU-resident split (bytes are conserved).
+            // Fallback for non-resident split path if budget is fully exhausted.
             gpu_idx_.remove_cluster(new_cid);
         }
     }
 
     return {true, new_cid};
+}
+
+void GpuCoordinator::enqueue_promote(int cid) {
+    std::lock_guard<std::mutex> lk(pending_mu_);
+    pending_promotes_.push_back(cid);
+}
+
+void GpuCoordinator::enqueue_demote(int cid) {
+    if (!budget_.is_gpu_resident(cid)) return;
+
+    // Phase 1 — immediate: flip routing to L2 before returning.
+    // From this point, is_gpu_resident() returns false so new inserts and
+    // searches use L2. In-flight GPU searches hold a shared_ptr<DeviceBuffer>
+    // snapshot and will complete safely; cudaFree is deferred to phase 2.
+    budget_.remove_cluster(cid);
+    insert_buf_.deactivate_cluster(cid);
+
+    // Phase 2 — deferred: drain remaining buffer vectors to L2, then release
+    // the GPU memory. Enqueued here; executed by the background thread.
+    std::lock_guard<std::mutex> lk(pending_mu_);
+    pending_demotes_.push_back(cid);
+}
+
+void GpuCoordinator::process_pending_() {
+    std::vector<int> promotes, demotes, flushes;
+    {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        promotes.swap(pending_promotes_);
+        demotes.swap(pending_demotes_);
+        flushes.swap(pending_flushes_);
+    }
+
+    // Demotes first: drain buffered vectors to L2, then release GPU memory.
+    // Budget space is freed before promotes run, so promotes are more likely
+    // to succeed without triggering additional LFU evictions.
+    for (int cid : demotes) {
+        std::vector<DocId> ids;
+        std::vector<float> vecs;
+        if (insert_buf_.drain(cid, ids, vecs) && !ids.empty())
+            idx_.load_cluster(cid, ids.data(), vecs.data(), ids.size());
+        // shared_ptr ref-count in GpuClusterIndex drops here; cudaFree fires
+        // only after any in-flight search snapshots release their references.
+        gpu_idx_.remove_cluster(cid);
+    }
+
+    // Promotes: full synchronous H2D on the background thread (not the caller).
+    for (int cid : promotes)
+        promote_to_gpu(cid);
+
+    // Flushes: cids whose insert buffer hit cap during an insert call.
+    // force_flush drains the buffer, expands the GPU cluster in-place, and
+    // writes the delta to L2 for durability — reopening the buffer slot so
+    // subsequent inserts can buffer again without routing to L2.
+    if (!flushes.empty())
+        flush_coord_.force_flush_all(flushes);
 }
 
 bool GpuCoordinator::is_gpu_resident(int cid) const {

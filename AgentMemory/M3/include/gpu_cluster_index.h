@@ -1,12 +1,17 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #include "base.h"
 #include "gpu_insert_buffer.h"
+
+#ifdef HAVE_CUDA
+#  include <cuda_runtime.h>
+#endif
 
 namespace m3 {
 
@@ -90,12 +95,17 @@ public:
                           std::vector<DocId>&  out_ids,
                           std::vector<float>&  out_scores) const;
 
-    // Collaborative search over a set of probe clusters.
+    // Collaborative search over GPU-resident probe clusters.
+    //
+    // probe_cids should contain only GPU-resident cluster IDs. The caller is
+    // responsible for splitting the full nprobe set into GPU-resident vs non-
+    // resident before calling this method (use MultiLevelIndex::get_l2_probe_ids()
+    // + GpuCoordinator::is_gpu_resident() to partition the probe set).
     //
     // For each cid in probe_cids:
-    //   • GPU path   : if cluster is resident, run search_cluster().
-    //   • Buffer path: call buf.search_buffer(cid) to include vectors
-    //                  that are buffered but not yet flushed to L2.
+    //   • GPU path   : runs linear-scan search_cluster() over device vectors.
+    //   • Buffer path: calls buf.scan_insert_buffer(cid) ONLY if the cluster
+    //                  has an active insert buffer slot (GPU-resident clusters only).
     //
     // Candidates are de-duplicated by DocId (best score kept) then
     // sorted ascending. Returns top-k in out_ids / out_scores.
@@ -111,9 +121,34 @@ public:
     bool   normalized() const { return normalized_; }
 
 private:
+    // RAII wrapper around a cudaMalloc'd device buffer.
+    // Shared ownership allows search_cluster() to snapshot the pointer without
+    // holding the mutex across the kernel launch — the buffer is kept alive
+    // as long as at least one shared_ptr holds it, giving zero-downtime
+    // behaviour during expand_cluster()'s allocate-new → swap → release-old.
+    struct DeviceBuffer {
+        float*  ptr   = nullptr;
+        size_t  bytes = 0;   // allocated size in bytes
+
+        DeviceBuffer() = default;
+        DeviceBuffer(float* p, size_t b) : ptr(p), bytes(b) {}
+        ~DeviceBuffer() {
+#ifdef HAVE_CUDA
+            if (ptr) { cudaFree(ptr); ptr = nullptr; }
+#else
+            delete[] ptr; ptr = nullptr;
+#endif
+        }
+        DeviceBuffer(const DeviceBuffer&)            = delete;
+        DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    };
+
     struct ClusterData {
-        std::vector<DocId>  ids;
-        std::vector<float>  vecs;  // row-major, stride = dim_
+        std::shared_ptr<DeviceBuffer> vecs_buf; // device (or host-sim) float storage
+        std::vector<DocId>            h_ids;    // always on host for fast top-k
+        size_t                        n = 0;    // number of vectors
+
+        float* d_vecs() const { return vecs_buf ? vecs_buf->ptr : nullptr; }
     };
 
     int    dim_;

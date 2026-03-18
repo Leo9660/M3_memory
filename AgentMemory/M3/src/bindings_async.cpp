@@ -6,6 +6,7 @@
 
 #include "m3_async.h"
 #include "m3_multi_level.h"
+#include "gpu_coordinator.h"
 
 namespace py = pybind11;
 using namespace m3;
@@ -184,7 +185,66 @@ PYBIND11_MODULE(_m3_async, m) {
              py::arg("vectors"))
         .def("dim", &MultiLevelIndex::dim)
         .def("metric", &MultiLevelIndex::metric)
-        .def("normalized", &MultiLevelIndex::normalized);
+        .def("normalized", &MultiLevelIndex::normalized)
+        // Wire a GpuCoordinator into this index (pass None to disconnect).
+        .def("set_gpu_coordinator",
+             [](MultiLevelIndex& idx, py::object coord_obj) {
+                 if (coord_obj.is_none()) {
+                     idx.set_gpu_coordinator(nullptr);
+                 } else {
+                     auto& coord = coord_obj.cast<GpuCoordinator&>();
+                     idx.set_gpu_coordinator(&coord);
+                 }
+             },
+             py::arg("coordinator"));
+
+    // ----- GpuCoordinator -----
+    py::class_<GpuCoordinator>(m, "GpuCoordinator")
+        // keep_alive<0,1>: the new GpuCoordinator keeps idx alive (idx must outlive coordinator).
+        .def(py::init([](MultiLevelIndex& idx,
+                         size_t gpu_budget_bytes,
+                         int    dim,
+                         Metric metric,
+                         bool   normalized,
+                         size_t insert_buf_cap) {
+                 return new GpuCoordinator(idx, gpu_budget_bytes, dim,
+                                           metric, normalized, insert_buf_cap);
+             }),
+             py::arg("idx"),
+             py::arg("gpu_budget_bytes"),
+             py::arg("dim"),
+             py::arg("metric"),
+             py::arg("normalized")     = false,
+             py::arg("insert_buf_cap") = 128,
+             py::keep_alive<0, 1>())   // GpuCoordinator (0) keeps idx (1) alive
+        .def("promote_to_gpu",
+             &GpuCoordinator::promote_to_gpu,
+             py::arg("cid"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("enqueue_promote", &GpuCoordinator::enqueue_promote, py::arg("cid"))
+        .def("enqueue_demote",  &GpuCoordinator::enqueue_demote,  py::arg("cid"))
+        .def("drain_pending",
+             &GpuCoordinator::drain_pending,
+             py::call_guard<py::gil_scoped_release>())
+        .def("flush_buffers",
+             &GpuCoordinator::flush_buffers,
+             py::call_guard<py::gil_scoped_release>())
+        .def("rebalance",
+             &GpuCoordinator::rebalance,
+             py::call_guard<py::gil_scoped_release>())
+        .def("start_background",
+             &GpuCoordinator::start_background,
+             py::arg("flush_ms")       = 50,
+             py::arg("maintenance_ms") = 5000,
+             py::arg("rebalance_ms")   = 500)
+        .def("stop_background",
+             &GpuCoordinator::stop_background,
+             py::call_guard<py::gil_scoped_release>())
+        .def("is_gpu_resident",    &GpuCoordinator::is_gpu_resident,    py::arg("cid"))
+        .def("gpu_bytes_used",     &GpuCoordinator::gpu_bytes_used)
+        .def("gpu_budget_bytes",   &GpuCoordinator::gpu_budget_bytes)
+        .def("gpu_resident_cids",  &GpuCoordinator::gpu_resident_cids)
+        .def("background_running", &GpuCoordinator::background_running);
 
     // ----- AsyncEngine -----
     py::class_<AsyncEngine>(m, "AsyncEngine")

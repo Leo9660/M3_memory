@@ -18,7 +18,11 @@ namespace m3 {
 class IVFIndex {
 public:
     // ---- Construction ----
-    IVFIndex(int dim, Metric metric, bool normalized);
+    // layer_name: optional short label ("L0","L1","L2") used in debug logs.
+    IVFIndex(int dim, Metric metric, bool normalized,
+             const char* layer_name = "??");
+
+    const char* layer_name() const noexcept { return layer_name_; }
 
     // Initialize clusters by centroids (row-major: [nlist, dim]).
     // Existing clusters (if any) will be cleared and rebuilt to match nlist.
@@ -41,7 +45,9 @@ public:
     const float* centroid_ptr(int cluster_id) const; // nullptr if invalid
 
     // ---- Per-cluster writes (caller ensures single-writer-per-cluster) ----
-    void add_batch   (int cluster_id, const DocId* ids, const float* vecs, size_t n_rows);
+    // allow_missing=true: silently no-op if cluster_id is invalid (used for L0 cache writes).
+    void add_batch   (int cluster_id, const DocId* ids, const float* vecs, size_t n_rows,
+                      bool allow_missing = false);
     void update_batch(int cluster_id, const DocId* ids, const float* vecs, size_t n_rows,
                       bool insert_if_absent=false);
     void erase_batch (int cluster_id, const DocId* ids, size_t n_rows);
@@ -120,6 +126,7 @@ private:
     const int    dim_;
     const Metric metric_;
     const bool   normalized_;
+    const char*  layer_name_;   // short debug label, e.g. "L0"/"L1"/"L2"/"??"
 
     // Topology & data
     mutable std::shared_mutex topo_mu_;       // guards clusters_, centroids_, valid_

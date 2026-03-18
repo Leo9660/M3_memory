@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 
+#include "gpu_budget.h"
 #include "gpu_cluster_index.h"
 #include "gpu_insert_buffer.h"
 #include "m3_multi_level.h"
@@ -68,7 +69,8 @@ public:
     AsyncFlushCoordinator(ClusterInsertBuffer& buf,
                           MultiLevelIndex&     idx,
                           size_t               flush_threshold = 0,
-                          GpuClusterIndex*     gpu_idx         = nullptr);
+                          GpuClusterIndex*     gpu_idx         = nullptr,
+                          GpuBudgetManager*    budget          = nullptr);
 
     ~AsyncFlushCoordinator();
 
@@ -82,6 +84,12 @@ public:
     // Iterate `cids` and call maybe_flush() for each.
     // Returns total vectors flushed across all clusters in this call.
     size_t flush_clusters(const std::vector<int>& cids);
+
+    // Force-flush: drain every non-empty buffer in `cids` regardless of
+    // threshold or fullness. Use for explicit flush_buffers() calls where
+    // the caller wants all buffered vectors written out immediately.
+    // Returns total vectors flushed.
+    size_t force_flush_all(const std::vector<int>& cids);
 
     // ---- Async API ----
 
@@ -101,11 +109,15 @@ public:
 
 private:
     void   bg_thread_fn_(std::vector<int> cids, int interval_ms);
+    // Unconditionally drain and flush a non-empty buffer slot for cid.
+    // Returns vectors flushed; caller is responsible for the ready check.
+    size_t do_flush_(int cid);
 
     ClusterInsertBuffer& buf_;
     MultiLevelIndex&     idx_;
     size_t               flush_threshold_;
     GpuClusterIndex*     gpu_idx_;   // nullable; owned by GpuCoordinator
+    GpuBudgetManager*    budget_;    // nullable; updated after expand for byte accounting
 
     mutable std::mutex   stats_mu_;
     uint64_t             total_flushed_ = 0;

@@ -1,4 +1,5 @@
 #include "m3_index.h"
+#include "m3_logger.h"
 
 #include <algorithm>
 #include <limits>
@@ -134,10 +135,11 @@ static void merge_cluster_results_for_one_query(
 // IVFIndex impl
 // ======================================================================
 
-IVFIndex::IVFIndex(int dim, Metric metric, bool normalized)
+IVFIndex::IVFIndex(int dim, Metric metric, bool normalized, const char* layer_name)
     : dim_(dim)
     , metric_(metric)
     , normalized_(normalized)
+    , layer_name_(layer_name ? layer_name : "??")
 {
     if (dim_ <= 0) {
         throw std::invalid_argument("IVFIndex: dim must be > 0");
@@ -238,11 +240,18 @@ const float* IVFIndex::centroid_ptr(int cluster_id) const {
     return &centroids_[cluster_id * (size_t)dim_];
 }
 
-void IVFIndex::add_batch(int cluster_id, const DocId* ids, const float* vecs, size_t n_rows) {
+void IVFIndex::add_batch(int cluster_id, const DocId* ids, const float* vecs, size_t n_rows,
+                         bool allow_missing) {
     std::shared_ptr<Cluster> c;
     {
         std::shared_lock lk(topo_mu_);
         if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)] || !clusters_[cluster_id]) {
+            if (allow_missing) return;
+            const bool oob      = (cluster_id < 0 || cluster_id >= (int)clusters_.size());
+            const bool not_valid = !oob && !valid_[static_cast<size_t>(cluster_id)];
+            const bool null_ptr  = !oob && clusters_[static_cast<size_t>(cluster_id)] == nullptr;
+            M3Logger::instance().log_add_batch_invalid(
+                layer_name_, cluster_id, clusters_.size(), oob, not_valid, null_ptr);
             throw std::out_of_range("IVFIndex::add_batch: invalid cluster_id");
         }
         c = clusters_[cluster_id];
@@ -411,7 +420,7 @@ void IVFIndex::maintenance_pass() {
         auto& c = snapshot[cid];
         if (!c) continue;
         size_t live = c->live_size();
-        if (live > MAX_ROWS_BEFORE_MERGE) continue;
+        if (live == 0 || live > MAX_ROWS_BEFORE_MERGE) continue;
         if (live < smallest_size) {
             second_size = smallest_size;
             second_cid = smallest_cid;
@@ -468,6 +477,8 @@ int IVFIndex::split_cluster(int cluster_id, size_t max_vectors_before_split) {
 
     // Create new cluster without re-locking topo_mu_ (avoid deadlock with add_cluster).
     const int new_cid = static_cast<int>(clusters_.size());
+    M3Logger::instance().log_cpu_split(
+        layer_name_, cluster_id, new_cid, n, ids0.size(), ids1.size());
     clusters_.push_back(std::make_shared<Cluster>(dim_, metric_, normalized_, new_cid, c1));
     centroids_.insert(centroids_.end(), c1.begin(), c1.end());
     valid_.push_back(true);
@@ -490,12 +501,18 @@ void IVFIndex::merge_clusters(int cluster_id_a, int cluster_id_b) {
     std::vector<float> vecs_b;
     cb->export_live(ids_b, vecs_b);
     if (ids_b.empty()) {
+        M3Logger::instance().log_cpu_merge(
+            layer_name_, cluster_id_a, cluster_id_b, 0, 0,
+            "src_cluster_fully_tombstoned");
         remove_cluster_nolock_(cluster_id_b);
         return;
     }
 
     const size_t n_a_old = clusters_[static_cast<size_t>(cluster_id_a)]->live_size();
     const size_t n_b = ids_b.size();
+    M3Logger::instance().log_cpu_merge(
+        layer_name_, cluster_id_a, cluster_id_b, n_a_old, n_b,
+        "both_below_5k_threshold");
     clusters_[static_cast<size_t>(cluster_id_a)]->add_batch(ids_b.data(), vecs_b.data(), ids_b.size());
 
     const size_t dim_sz = static_cast<size_t>(dim_);

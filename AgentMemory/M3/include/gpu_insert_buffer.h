@@ -79,13 +79,16 @@ public:
     // Distances are computed with unified_score() using the supplied metric.
     // Results are appended (not cleared) into out_ids / out_scores.
     // Returns 0 if the cluster has no slot or an empty buffer.
-    size_t search_buffer(int cid,
-                         const float* query,
-                         int k,
-                         Metric metric,
-                         bool normalized,
-                         std::vector<DocId>&  out_ids,
-                         std::vector<float>&  out_scores) const;
+    // Linear scan of the insert buffer for cluster `cid`, returning top-k
+    // candidates. Called during search to include staged-but-not-yet-flushed
+    // vectors alongside the GPU cluster results. Returns 0 if no active slot.
+    size_t scan_insert_buffer(int cid,
+                              const float* query,
+                              int k,
+                              Metric metric,
+                              bool normalized,
+                              std::vector<DocId>&  out_ids,
+                              std::vector<float>&  out_scores) const;
 
     // Remove a single doc_id from a cluster's buffer (used by erase path).
     // Returns true if the id was found and removed.

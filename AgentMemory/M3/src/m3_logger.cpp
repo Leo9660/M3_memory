@@ -12,6 +12,17 @@ namespace m3 {
 
 M3Logger& M3Logger::instance() {
     static M3Logger inst;
+    // Auto-enable: if M3_DEBUG is set, open the file specified by M3_DEBUG_LOG
+    // (default: /tmp/m3_debug.log).  Runs once at first use.
+    static bool auto_init_done = false;
+    if (!auto_init_done) {
+        auto_init_done = true;
+        const char* debug_env = std::getenv("M3_DEBUG");
+        if (debug_env) {
+            const char* log_path = std::getenv("M3_DEBUG_LOG");
+            inst.enable(log_path ? log_path : "/tmp/m3_debug.log");
+        }
+    }
     return inst;
 }
 
@@ -155,6 +166,203 @@ void M3Logger::log(const char* fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    write_(buf);
+}
+
+// ---- CPU topology change events ----
+
+void M3Logger::log_cpu_split(const char* layer, int cid, int new_cid,
+                              size_t n_total, size_t n_a, size_t n_b) {
+    if (!enabled_) return;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "CPU_SPLIT   layer=%-2s  cid=%-4d  new_cid=%-4d  "
+             "vecs_before=%-7zu  partition_A=%-7zu  partition_B=%-7zu  "
+             "reason=cluster_exceeds_200k",
+             layer, cid, new_cid, n_total, n_a, n_b);
+    write_(buf);
+}
+
+void M3Logger::log_cpu_merge(const char* layer, int cid_dst, int cid_src,
+                              size_t n_dst, size_t n_src, const char* reason) {
+    if (!enabled_) return;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "CPU_MERGE   layer=%-2s  cid_dst=%-4d  cid_src=%-4d(INVALIDATED)  "
+             "vecs_dst=%-6zu  vecs_src=%-6zu  vecs_after=%-6zu  reason=%s",
+             layer, cid_dst, cid_src, n_dst, n_src, n_dst + n_src, reason);
+    write_(buf);
+}
+
+void M3Logger::log_add_batch_invalid(const char* layer, int cid, size_t clusters_sz,
+                                      bool oob, bool not_valid, bool null_ptr) {
+    if (!enabled_) return;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "ADD_BATCH_INVALID  layer=%-2s  cid=%-4d  clusters_size=%-4zu  "
+             "out_of_bounds=%-5s  valid_false=%-5s  null_ptr=%-5s  "
+             "likely_cause=%s",
+             layer, cid, clusters_sz,
+             oob       ? "YES" : "NO",
+             not_valid ? "YES" : "NO",
+             null_ptr  ? "YES" : "NO",
+             oob       ? "SPLIT_IN_SIBLING_NOT_MIRRORED"
+                       : not_valid ? "MERGED_AWAY_IN_THIS_LAYER"
+                                   : "UNKNOWN");
+    write_(buf);
+}
+
+void M3Logger::log_insert_routing(int cid, int l0_nlist, int l2_nlist,
+                                   int l2_cen_nlist, bool l2_cid_valid,
+                                   bool l0_cid_valid) {
+    if (!enabled_) return;
+    // Only log when something looks wrong (avoids flooding on 8M inserts).
+    const bool mismatch = (l0_nlist != l2_nlist) || !l0_cid_valid || !l2_cid_valid
+                          || (l2_nlist != l2_cen_nlist);
+    if (!mismatch) return;
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+             "INSERT_ROUTING_WARN  cid=%-4d  "
+             "l0_nlist=%-4d  l2_nlist=%-4d  l2_centroids_nlist=%-4d  "
+             "l2_cid_valid=%-5s  l0_cid_valid=%-5s  "
+             "diagnosis=%s",
+             cid, l0_nlist, l2_nlist, l2_cen_nlist,
+             l2_cid_valid ? "YES" : "NO",
+             l0_cid_valid ? "YES" : "NO",
+             (l2_nlist != l0_nlist) ? "L0_L2_NLIST_DIVERGED"
+             : (!l0_cid_valid)      ? "CID_MERGED_IN_L0_NOT_L2"
+             : (!l2_cid_valid)      ? "CID_MERGED_IN_L2"
+                                    : "CEN_TABLE_STALE");
+    write_(buf);
+}
+
+void M3Logger::log_maint_topology(int l0_nlist, int l1_nlist,
+                                   int l2_nlist, int l2_cen_nlist) {
+    if (!enabled_) return;
+    const bool diverged = (l0_nlist != l2_nlist) || (l2_nlist != l2_cen_nlist);
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "MAINT_TOPOLOGY  l0_nlist=%-4d  l1_nlist=%-4d  l2_nlist=%-4d  "
+             "l2_centroids_nlist=%-4d  topology_ok=%-3s%s",
+             l0_nlist, l1_nlist, l2_nlist, l2_cen_nlist,
+             diverged ? "NO" : "YES",
+             diverged ? "  *** DIVERGED ***" : "");
+    write_(buf);
+}
+
+// =========================================================================
+// M3Profiler implementation
+// =========================================================================
+
+M3Profiler::M3Profiler() {
+    const char* env = std::getenv("M3_PROFILE");
+    if (!env) return;
+    const char* path_env = std::getenv("M3_PROFILE_LOG");
+    const char* path = path_env ? path_env : "m3_profile.log";
+    fp_ = fopen(path, "a");   // append so restarts don't wipe history
+    if (!fp_) {
+        fprintf(stderr, "[M3Profiler] WARN: could not open profile log '%s'\n", path);
+        return;
+    }
+    enabled_ = true;
+    fprintf(fp_, "# M3 Profile Log  (M3_PROFILE_LOG=%s)\n", path);
+    fprintf(fp_, "# Fields: [timestamp]  EVENT  key=value ...\n#\n");
+    fflush(fp_);
+}
+
+M3Profiler::~M3Profiler() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (fp_) { fflush(fp_); fclose(fp_); fp_ = nullptr; }
+}
+
+M3Profiler& M3Profiler::instance() {
+    static M3Profiler inst;
+    return inst;
+}
+
+bool M3Profiler::is_enabled() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return enabled_;
+}
+
+void M3Profiler::timestamp_(char* buf, size_t buf_sz) {
+    using namespace std::chrono;
+    const auto now  = system_clock::now();
+    const auto secs = time_point_cast<seconds>(now);
+    const auto ms   = duration_cast<milliseconds>(now - secs).count();
+    const time_t tt = system_clock::to_time_t(secs);
+    struct tm tm_buf;
+#ifdef _WIN32
+    localtime_s(&tm_buf, &tt);
+#else
+    localtime_r(&tt, &tm_buf);
+#endif
+    char base[32];
+    strftime(base, sizeof(base), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    snprintf(buf, buf_sz, "[%s.%03lld]", base, static_cast<long long>(ms));
+}
+
+void M3Profiler::write_(const char* line) {
+    char ts[40];
+    timestamp_(ts, sizeof(ts));
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!enabled_ || !fp_) return;
+    fprintf(fp_, "%s  %s\n", ts, line);
+    fflush(fp_);
+}
+
+void M3Profiler::log_search_batch(size_t q_rows,
+                                   double probe_select_ms,
+                                   double l0_ms,    size_t l0_early_exits,
+                                   double l1_ms,    size_t l1_early_exits,
+                                   size_t l2_gpu_clusters, size_t l2_cpu_clusters,
+                                   double l2_gpu_ms, double l2_cpu_ms,
+                                   double merge_ms,
+                                   double promotion_ms,
+                                   double total_ms) {
+    if (!enabled_) return;
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "PROFILE_SEARCH_BATCH"
+        "  batch=%-4zu"
+        "  probe_select_ms=%-8.3f"
+        "  l0_ms=%-8.3f  l0_early_exits=%-4zu"
+        "  l1_ms=%-8.3f  l1_early_exits=%-4zu"
+        "  l2_gpu_clusters=%-4zu  l2_cpu_clusters=%-4zu"
+        "  l2_gpu_ms=%-8.3f  l2_cpu_ms=%-8.3f"
+        "  merge_ms=%-8.3f"
+        "  promotion_ms=%-8.3f"
+        "  total_ms=%-8.3f",
+        q_rows,
+        probe_select_ms,
+        l0_ms, l0_early_exits,
+        l1_ms, l1_early_exits,
+        l2_gpu_clusters, l2_cpu_clusters,
+        l2_gpu_ms, l2_cpu_ms,
+        merge_ms,
+        promotion_ms,
+        total_ms);
+    write_(buf);
+}
+
+void M3Profiler::log_insert_batch(size_t n_rows,
+                                   size_t gpu_pending,
+                                   double assign_ms,
+                                   double l0l2_write_ms,
+                                   double gpu_dispatch_ms,
+                                   double total_ms) {
+    if (!enabled_) return;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "PROFILE_INSERT_BATCH"
+        "  batch=%-6zu"
+        "  gpu_pending=%-6zu"
+        "  assign_ms=%-8.3f"
+        "  l0l2_write_ms=%-8.3f"
+        "  gpu_dispatch_ms=%-8.3f"
+        "  total_ms=%-8.3f",
+        n_rows, gpu_pending,
+        assign_ms, l0l2_write_ms, gpu_dispatch_ms, total_ms);
     write_(buf);
 }
 
