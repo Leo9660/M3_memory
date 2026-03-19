@@ -6,6 +6,7 @@
 #include <deque>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 #include <mutex>
 #include "base.h"      // Metric, DocId, topk_smallest
@@ -36,12 +37,17 @@ struct CacheConfig {
     // Cluster-level demotion: remove whole cluster if not accessed for this long
     uint64_t cold_time_ns = 60'000'000'000ULL;  // 60s in nanoseconds
 
-    // k' for L1 promotion: number of nearest neighbours (from L2) cached into L1 per access.
-    // L0 stores the directly accessed vector only (no neighbourhood search), per spec.
+    // k' for L1 promotion: top-k' results (across clusters) from a query are cached as one
+    // new query-centric L1 cluster. L0 still stores only the directly accessed vector.
     int l1_neighborhood_k = 20;
 
     // Max result vectors to promote per query (0 = all)
     int max_promote_per_query = 0;
+
+    // nprobe for L1 search over L1's own query-centric clusters.
+    // 0 (default) = linear scan all L1 clusters (recommended for small L1).
+    // >0 = search only the top-l1_nprobe L1 clusters by centroid distance.
+    int l1_nprobe = 0;
 
     // Early-termination: dynamic threshold = alpha_et * dagent.
     // Set to 0 to disable dynamic threshold and fall back to MultiLevelConfig::search_threshold.
@@ -219,8 +225,12 @@ private:
                        std::vector<DocId>& out_ids,
                        std::vector<float>& out_scores) const;
 
-    // Promotion: on access, promote vector + neighborhood to L0 (narrow) and L1 (wider).
+    // Promotion: on access, promote single vector to L0 (temporal locality).
     void promote_vector_neighborhood_(DocId doc_id) const;
+    // Promotion: per-query, cache top-k' results as a new query-centric L1 cluster.
+    void promote_query_to_l1_(const float* query,
+                               const std::vector<DocId>& result_ids,
+                               const std::vector<float>& result_scores) const;
     void record_access_(int cid) const;
     void demote_cluster_(int cid) const;
     void run_vector_eviction_per_level_() const;
@@ -253,6 +263,14 @@ private:
     mutable std::deque<float> dagent_history_;
     mutable float             dagent_ = 0.0f;
     mutable std::mutex        dagent_mu_;            // protects dagent_history_ and dagent_
+
+    // L1 query-centric cluster tracking (new topology, independent of L2 cluster IDs).
+    // l1_cached_ids_: DocIds currently stored in L1 (for fast dedup on promotion).
+    // l1_cluster_access_time_: L1 cluster_id → last access timestamp (for LRU eviction).
+    // l1_cache_mu_: protects both of the above.
+    mutable std::unordered_set<DocId>       l1_cached_ids_;
+    mutable std::unordered_map<int, uint64_t> l1_cluster_access_time_;
+    mutable std::mutex                      l1_cache_mu_;
 };
 
 } // namespace m3
