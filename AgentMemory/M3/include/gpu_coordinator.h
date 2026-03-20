@@ -233,12 +233,21 @@ public:
     void drain_pending();
 
     // Start a background thread with independent intervals for each operation.
-    //   flush_ms        — how often to flush insert buffers       (default  50 ms)
-    //   maintenance_ms  — how often to run cpu_maintenance()      (default 5000 ms)
-    //   rebalance_ms    — how often to rebalance hotspot clusters  (default  500 ms)
-    void start_background(int flush_ms       = 50,
-                          int maintenance_ms = 5000,
-                          int rebalance_ms   = 500);
+    //   flush_ms        — how often to flush insert buffers              (default    50 ms)
+    //   maintenance_ms  — how often to run cpu_maintenance()             (default  5000 ms)
+    //   rebalance_ms    — how often to rebalance hotspot clusters         (default   500 ms)
+    //   split_every_ops — run a cluster-split sweep after this many ops  (default 0 = off)
+    //   split_threshold — split any cluster whose l2_vector_count exceeds this (default 200 000)
+    //
+    // When split_every_ops > 0 the background thread counts inserts via insert()
+    // and triggers split_sweep_() every split_every_ops inserts.  The sweep calls
+    // split_gpu_cluster() for GPU-resident clusters and idx_.l2_split_cluster()
+    // for non-resident ones — both paths use the same threshold.
+    void start_background(int      flush_ms        =    500,
+                          int      maintenance_ms  =  5000,
+                          int      rebalance_ms    =   500,
+                          uint64_t split_every_ops =   20000,
+                          size_t   split_threshold = 200000);
 
     // Stop the background thread (blocks until exit; final flush pass performed).
     void stop_background();
@@ -258,6 +267,11 @@ private:
     void   bg_thread_fn_(int flush_ms, int maintenance_ms, int rebalance_ms);
     size_t hotspot_rebalance_();
 
+    // Sweep all L2 clusters: split any whose l2_vector_count > split_threshold_.
+    // GPU-resident clusters use split_gpu_cluster() (GPU k-means);
+    // non-resident clusters use idx_.l2_split_cluster() (CPU k-means).
+    void split_sweep_();
+
     // Drain pending_promotes_ and pending_demotes_ queues.
     // Called at the start of each maintenance_tick() so the background thread
     // processes async requests promptly without a separate polling loop.
@@ -273,6 +287,11 @@ private:
     std::atomic<bool>     bg_running_{false};
     std::atomic<bool>     stop_flag_{false};
     std::thread           bg_thread_;
+
+    // Op-count-driven split config (set by start_background).
+    std::atomic<uint64_t> op_count_{0};   // incremented per insert(); relaxed ordering
+    uint64_t              split_every_ops_{0};    // 0 = disabled
+    size_t                split_threshold_{200000};
 
     std::mutex            pending_mu_;
     std::vector<int>      pending_promotes_;

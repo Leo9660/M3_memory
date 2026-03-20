@@ -186,7 +186,7 @@ def to_items(prefix: str, texts: List[str]) -> List[MemoryItem]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Search/insert ratio perf benchmark.")
-    parser.add_argument("--backend", choices=["placeholder", "quake", "m3", "m3multi", "m3multigpu"], default="m3")
+    parser.add_argument("--backend", choices=["placeholder", "quake", "m3", "m3multi", "m3multigpu", "diskann_cpp", "diskann"], default="m3")
     parser.add_argument("--index", default="perf-ratio", help="Index handle passed to MemoryManagement.")
     parser.add_argument("--mode", choices=["item_search_insert", "step_search_then_update", "head_search_tail_insert", "search_only", "ratio"], default="item_search_insert", help="Request scheduling pattern.")
     parser.add_argument("--dataset", choices=list(DATASET_LOADERS.keys()), default=None, help="Dataset name; when omitted, synthetic vectors are used (ratio mode).")

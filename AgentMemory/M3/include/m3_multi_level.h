@@ -27,7 +27,7 @@ struct CacheConfig {
     size_t l0_max_vectors_per_cluster = 1000;
 
     // L1 limits
-    int l1_max_clusters = 32;
+    int l1_max_clusters = 256; //32;
     size_t l1_max_vectors_per_cluster = 10000;
 
     // Eviction thresholds (trigger when cluster at X% of max)
@@ -187,6 +187,13 @@ public:
 
     // ---- maintenance ----
     void maintenance_pass(); // per-layer maintenance hooks
+
+    // Split a single L2 cluster if its live size exceeds `threshold`.
+    // Mirrors the new partition-B centroid into L0/L1 routing tables,
+    // updates doc_id_to_cid_, and extends metadata — same bookkeeping
+    // as add_l2_cluster(). No-op if the cluster is below threshold or
+    // the split is degenerate. Called by GpuCoordinator::split_sweep_().
+    void l2_split_cluster(int cid, size_t threshold);
 
     // ---- meta ----
     int    dim()        const noexcept { return dim_; }

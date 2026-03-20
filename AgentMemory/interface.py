@@ -43,8 +43,11 @@ class MemoryManagement:
         hash_prefix: str = "",
         auto_id_strategy: str = "sequential",   # "uuid" | "sequential"
     ) -> None:
-        # Backend (default to placeholder)
-        if backend.lower() == "placeholder":
+        # Backend: accept a pre-built instance or a string name
+        from .backend.base import MemoryBackend as _MemoryBackend
+        if isinstance(backend, _MemoryBackend):
+            self.backend: MemoryBackend = backend
+        elif backend.lower() == "placeholder":
             from .backend.placeholder import PlaceholderBackend
             self.backend: MemoryBackend = PlaceholderBackend()
         elif backend.lower() == "quake":
@@ -62,6 +65,9 @@ class MemoryManagement:
         elif backend.lower() == "amem":
             from .backend.amem import AMemBackend
             self.backend: MemoryBackend = AMemBackend()
+        elif backend.lower() in ("diskann_cpp", "diskann"):
+            from .backend.diskann import DiskANNCppBackend
+            self.backend: MemoryBackend = DiskANNCppBackend()
         else:
             raise ValueError(f"Unknown backend: {backend}")
 

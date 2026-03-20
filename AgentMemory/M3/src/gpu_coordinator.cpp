@@ -89,6 +89,7 @@ GpuCoordinator::~GpuCoordinator() {
 }
 
 BufferResult GpuCoordinator::insert(int cid, DocId id, const float* vec) {
+    op_count_.fetch_add(1, std::memory_order_relaxed);
     if (!budget_.is_gpu_resident(cid)) {
         // Not GPU-resident: write directly to L2.
         idx_.load_cluster(cid, &id, vec, 1);
@@ -255,8 +256,11 @@ void GpuCoordinator::drain_pending() {
     process_pending_();
 }
 
-void GpuCoordinator::start_background(int flush_ms, int maintenance_ms, int rebalance_ms) {
+void GpuCoordinator::start_background(int flush_ms, int maintenance_ms, int rebalance_ms,
+                                       uint64_t split_every_ops, size_t split_threshold) {
     if (bg_running_.load()) return;
+    split_every_ops_ = split_every_ops;
+    split_threshold_ = split_threshold;
     stop_flag_.store(false);
     bg_running_.store(true);
     bg_thread_ = std::thread(&GpuCoordinator::bg_thread_fn_, this,
@@ -270,12 +274,30 @@ void GpuCoordinator::stop_background() {
     bg_running_.store(false);
 }
 
+void GpuCoordinator::split_sweep_() {
+    // Snapshot cluster metadata so we iterate a stable list.
+    const auto meta = idx_.get_cluster_metadata();
+    const int n = static_cast<int>(meta.size());
+    for (int cid = 0; cid < n; ++cid) {
+        if (meta[static_cast<size_t>(cid)].l2_vector_count <= split_threshold_) continue;
+        if (budget_.is_gpu_resident(cid)) {
+            // GPU-resident: use GPU k-means (avoids H2D re-upload for VRAM data).
+            split_gpu_cluster(cid);
+        } else {
+            // Non-resident: use CPU k-means via IVFIndex::split_cluster(),
+            // with full MultiLevelIndex centroid/metadata bookkeeping.
+            idx_.l2_split_cluster(cid, split_threshold_);
+        }
+    }
+}
+
 void GpuCoordinator::bg_thread_fn_(int flush_ms, int maintenance_ms, int rebalance_ms) {
     using clock = std::chrono::steady_clock;
     using ms_t  = std::chrono::milliseconds;
 
-    auto last_maintenance = clock::now();
-    auto last_rebalance   = clock::now();
+    auto     last_maintenance = clock::now();
+    auto     last_rebalance   = clock::now();
+    uint64_t last_split_op    = op_count_.load(std::memory_order_relaxed);
 
     while (!stop_flag_.load()) {
         // Always: drain queues and flush buffers (highest frequency).
@@ -292,6 +314,14 @@ void GpuCoordinator::bg_thread_fn_(int flush_ms, int maintenance_ms, int rebalan
         if (std::chrono::duration_cast<ms_t>(now - last_rebalance).count() >= rebalance_ms) {
             hotspot_rebalance_();   // enqueues promotes; process_pending_ picks them up next iter
             last_rebalance = now;
+        }
+
+        if (split_every_ops_ > 0) {
+            const uint64_t cur = op_count_.load(std::memory_order_relaxed);
+            if (cur - last_split_op >= split_every_ops_) {
+                split_sweep_();
+                last_split_op = cur;
+            }
         }
 
         std::this_thread::sleep_for(ms_t(flush_ms));

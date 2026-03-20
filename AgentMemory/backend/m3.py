@@ -516,9 +516,11 @@ class M3MultiGpuBackend(MemoryBackend):
     Configurable via spec.params:
       gpu_budget_bytes  : VRAM cap in bytes       (default: 2 GB)
       insert_buf_cap    : per-cluster buffer size  (default: 128)
-      flush_ms          : buffer flush interval    (default: 50 ms)
-      maintenance_ms    : L0/L1 eviction interval  (default: 5000 ms)
-      rebalance_ms      : hotspot rebalance period (default: 500 ms)
+      flush_ms          : buffer flush interval            (default: 50 ms)
+      maintenance_ms    : L0/L1 eviction interval          (default: 5000 ms)
+      rebalance_ms      : hotspot rebalance period         (default: 500 ms)
+      split_every_ops   : run split sweep every N inserts  (default: 0 = disabled)
+      split_threshold   : split clusters exceeding N vecs  (default: 200 000)
       + all M3MultiLevelBackend centroid/config params
     """
 
@@ -579,6 +581,8 @@ class M3MultiGpuBackend(MemoryBackend):
         flush_ms         = int(params.get("flush_ms", 50))
         maintenance_ms   = int(params.get("maintenance_ms", 5000))
         rebalance_ms     = int(params.get("rebalance_ms", 500))
+        split_every_ops  = int(params.get("split_every_ops", 0))       # 0 = disabled
+        split_threshold  = int(params.get("split_threshold", 200_000))
 
         coord = GpuCoordinator(
             idx,
@@ -593,6 +597,8 @@ class M3MultiGpuBackend(MemoryBackend):
             flush_ms=flush_ms,
             maintenance_ms=maintenance_ms,
             rebalance_ms=rebalance_ms,
+            split_every_ops=split_every_ops,
+            split_threshold=split_threshold,
         )
 
         self._indices[index_id] = idx

@@ -1085,6 +1085,76 @@ void MultiLevelIndex::search_l2_clusters(const std::vector<int>& cids,
     out_scores.insert(out_scores.end(), scores[0].begin(), scores[0].end());
 }
 
+void MultiLevelIndex::l2_split_cluster(int cid, size_t threshold) {
+    // Phase 1: run the expensive k-means split WITHOUT holding topo_mu_.
+    // IVFIndex::split_cluster() takes its own exclusive topo lock internally.
+    std::shared_ptr<IVFIndex> l2_idx;
+    {
+        std::shared_lock lk(topo_mu_);
+        l2_idx = l2_.index;
+    }
+    if (!l2_idx) return;
+    if (l2_idx->cluster_live_size(cid) <= threshold) return;
+
+    const int new_cid = l2_idx->split_cluster(cid, threshold);
+    if (new_cid < 0) return;  // degenerate split or cluster not found
+
+    // Phase 2: update MultiLevelIndex routing tables and metadata under topo_mu_.
+    // Lock ordering: topo_mu_(unique) → IVFIndex::topo_mu_(shared) — consistent
+    // with all other MultiLevelIndex methods that hold topo_mu_ and then call
+    // into l2_.index / l0_.index / l1_.index.
+    std::unique_lock lk(topo_mu_);
+
+    const size_t dim_sz = static_cast<size_t>(dim_);
+
+    // a. Sync l2_.centroids: update partition-A's (possibly shifted) centroid,
+    //    then append partition-B's new centroid.
+    const float* c0_ptr = l2_idx->centroid_ptr(cid);
+    const float* c1_ptr = l2_idx->centroid_ptr(new_cid);
+
+    if (c0_ptr && static_cast<size_t>(cid) * dim_sz + dim_sz <= l2_.centroids.size()) {
+        std::copy(c0_ptr, c0_ptr + dim_sz,
+                  l2_.centroids.begin() + static_cast<size_t>(cid) * dim_sz);
+    }
+    if (c1_ptr) {
+        l2_.centroids.insert(l2_.centroids.end(), c1_ptr, c1_ptr + dim_sz);
+    }
+
+    // b. Mirror partition-B centroid into L0/L1 routing tables so future
+    //    inserts/searches see the new cluster.
+    if (c1_ptr) {
+        const std::vector<float> c1(c1_ptr, c1_ptr + dim_sz);
+        if (l0_.index) {
+            l0_.index->add_cluster(c1);
+            l0_.centroids.insert(l0_.centroids.end(), c1.begin(), c1.end());
+        }
+        if (l1_.index) {
+            l1_.index->add_cluster(c1);
+            l1_.centroids.insert(l1_.centroids.end(), c1.begin(), c1.end());
+        }
+    }
+
+    // c. Update doc_id_to_cid_ for vectors that moved to partition B.
+    std::vector<DocId> ids_b;
+    std::vector<float> vecs_b;
+    l2_idx->export_cluster_live(new_cid, ids_b, vecs_b);
+    for (DocId id : ids_b)
+        doc_id_to_cid_[id] = new_cid;
+
+    // d. Extend and update metadata (same pattern as add_l2_cluster).
+    {
+        std::lock_guard<std::mutex> ml(meta_mu_);
+        if (static_cast<size_t>(new_cid) >= metadata_.size())
+            metadata_.resize(static_cast<size_t>(new_cid) + 1);
+        metadata_[static_cast<size_t>(new_cid)].in_l2 = true;
+        metadata_[static_cast<size_t>(new_cid)].l2_vector_count = ids_b.size();
+        metadata_[static_cast<size_t>(new_cid)].access_count = 0;
+        if (static_cast<size_t>(cid) < metadata_.size())
+            metadata_[static_cast<size_t>(cid)].l2_vector_count =
+                l2_idx->cluster_live_size(cid);
+    }
+}
+
 void MultiLevelIndex::maintenance_pass() {
     if (m3_verbose) {
         fprintf(stderr, "[M3:maint] ── maintenance_pass() begin ──\n");

@@ -6,6 +6,7 @@
 #include <numeric>
 #include <queue>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 #include <mutex>
 
