@@ -6,6 +6,7 @@
 
 #include "m3_async.h"
 #include "m3_multi_level.h"
+#include "m3_fsm.h"
 
 namespace py = pybind11;
 using namespace m3;
@@ -43,7 +44,8 @@ PYBIND11_MODULE(_m3_async, m) {
         .def_readwrite("cold_time_ns", &CacheConfig::cold_time_ns)
         .def_readwrite("l0_neighborhood_k", &CacheConfig::l0_neighborhood_k)
         .def_readwrite("l1_neighborhood_k", &CacheConfig::l1_neighborhood_k)
-        .def_readwrite("max_promote_per_query", &CacheConfig::max_promote_per_query);
+        .def_readwrite("max_promote_per_query", &CacheConfig::max_promote_per_query)
+        .def_readwrite("prefetch_queue_capacity", &CacheConfig::prefetch_queue_capacity);
 
     // ----- MultiLevelIndex -----
     py::class_<MultiLevelIndex>(m, "MultiLevelIndex")
@@ -151,13 +153,69 @@ PYBIND11_MODULE(_m3_async, m) {
                                 k,
                                 nprobe,
                                 out_ids,
-                                out_scores);
+                                out_scores,
+                                nullptr);
                  }
                  return py::make_tuple(out_ids, out_scores);
              },
              py::arg("queries"),
              py::arg("k"),
              py::arg("nprobe") = -1)
+        // FSM-aware search overload: pass a RequestTrajectory to enable
+        // FSM probe reordering, trajectory tracking, and predictive prefetch.
+        .def("search",
+             [](const MultiLevelIndex& idx,
+                py::array_t<float, py::array::c_style> queries,
+                int k,
+                int nprobe,
+                RequestTrajectory* traj) {
+                 auto buf = queries.request();
+                 if (buf.ndim != 2) throw std::runtime_error("queries must be 2D [Q, D]");
+                 if (buf.shape[1] != idx.dim()) throw std::runtime_error("query dim mismatch");
+                 std::vector<std::vector<DocId>> out_ids;
+                 std::vector<std::vector<float>> out_scores;
+                 {
+                     py::gil_scoped_release _g;
+                     idx.search((const float*)buf.ptr,
+                                (size_t)buf.shape[0],
+                                k,
+                                nprobe,
+                                out_ids,
+                                out_scores,
+                                traj);
+                 }
+                 return py::make_tuple(out_ids, out_scores);
+             },
+             py::arg("queries"),
+             py::arg("k"),
+             py::arg("nprobe") = -1,
+             py::arg("traj") = nullptr,
+             "Search with optional FSM trajectory tracking.\n\n"
+             "Parameters\n"
+             "----------\n"
+             "queries : np.ndarray [Q, D] float32\n"
+             "k       : int   number of results per query\n"
+             "nprobe  : int   clusters to probe (-1 = all)\n"
+             "traj    : RequestTrajectory or None\n"
+             "    If provided: FSM predicts probe order at L0 and L1,\n"
+             "    append_step() is called automatically after each layer,\n"
+             "    and predictive prefetch is enqueued at the end.\n"
+             "    Call traj.finalize() then fsm_table().update_from_trajectory()\n"
+             "    after the full request completes.")
+        // ---- FSM accessors ----
+        .def("set_fsm_config",
+             [](MultiLevelIndex& idx, const FSMConfig& cfg) {
+                 idx.set_fsm_config(cfg);
+             },
+             py::arg("config"),
+             "Replace the FSM config in-place (patterns are preserved).")
+        .def("fsm_table",
+             [](MultiLevelIndex& idx) -> FSMTable& {
+                 return idx.fsm_table();
+             },
+             py::return_value_policy::reference_internal,
+             "Return a reference to the index's FSMTable.\n"
+             "Use this to call update_from_trajectory() and inspect patterns.")
         .def("maintenance_pass",
              [](MultiLevelIndex& idx) {
                  py::gil_scoped_release _g;
@@ -644,4 +702,235 @@ PYBIND11_MODULE(_m3_async, m) {
              [](AsyncEngine& e, int index_id) {
                  return e.nlist_of(index_id);
              });
+
+    // ==================================================================
+    // FSM types — registered in the same module so RequestTrajectory can
+    // be passed directly into MultiLevelIndex.search(traj=...) without
+    // crossing module boundaries.
+    // ==================================================================
+
+    // Helper: 1-D float32 numpy → std::vector<float>
+    auto np_to_vec = [](py::array_t<float, py::array::c_style> arr) {
+        auto buf = arr.request();
+        if (buf.ndim != 1)
+            throw std::runtime_error("embedding must be a 1-D float32 array");
+        const float* ptr = static_cast<const float*>(buf.ptr);
+        return std::vector<float>(ptr, ptr + buf.shape[0]);
+    };
+
+    // Helper: flat or 2-D float32 numpy → flat std::vector<float>
+    auto np_to_flat = [](py::array_t<float, py::array::c_style> arr) {
+        auto buf = arr.request();
+        if (buf.ndim != 1 && buf.ndim != 2)
+            throw std::runtime_error(
+                "cluster_centroids must be 1-D (nlist*dim,) or 2-D (nlist, dim) float32");
+        const float* ptr = static_cast<const float*>(buf.ptr);
+        return std::vector<float>(ptr, ptr + buf.size);
+    };
+
+    // ----- FSMLayer -----
+    py::enum_<FSMLayer>(m, "FSMLayer",
+            "Layer tag for a trajectory step (L0 or L1).\n"
+            "L0 and L1 share the same cluster-id namespace.")
+        .value("L0", FSMLayer::L0)
+        .value("L1", FSMLayer::L1)
+        .export_values();
+
+    // ----- FSMStep -----
+    py::class_<FSMStep>(m, "FSMStep",
+            "One step in a RequestTrajectory.\n\n"
+            "Attributes: cluster_id (int), layer (FSMLayer)")
+        .def(py::init<>())
+        .def_readwrite("cluster_id", &FSMStep::cluster_id)
+        .def_readwrite("layer",      &FSMStep::layer)
+        .def("__repr__", [](const FSMStep& s) {
+            return "<FSMStep cluster_id=" + std::to_string(s.cluster_id)
+                 + " layer=" + (s.layer == FSMLayer::L0 ? "L0" : "L1") + ">";
+        });
+
+    // ----- FSMConfig -----
+    py::class_<FSMConfig>(m, "FSMConfig",
+            "Tuning knobs for the FSM pattern table.\n\n"
+            "max_patterns, max_states_per_fsm, merge_threshold, match_threshold,\n"
+            "merge_dist, alpha_et (early-termination factor), dagent_window.")
+        .def(py::init<>())
+        .def_readwrite("max_patterns",       &FSMConfig::max_patterns)
+        .def_readwrite("max_states_per_fsm", &FSMConfig::max_states_per_fsm)
+        .def_readwrite("merge_threshold",    &FSMConfig::merge_threshold)
+        .def_readwrite("match_threshold",    &FSMConfig::match_threshold)
+        .def_readwrite("merge_dist",         &FSMConfig::merge_dist)
+        .def_readwrite("alpha_et",           &FSMConfig::alpha_et)
+        .def_readwrite("dagent_window",      &FSMConfig::dagent_window)
+        .def("__repr__", [](const FSMConfig& c) {
+            return "<FSMConfig max_patterns=" + std::to_string(c.max_patterns)
+                 + " alpha_et=" + std::to_string(c.alpha_et)
+                 + " match_threshold=" + std::to_string(c.match_threshold) + ">";
+        });
+
+    // ----- FSMState -----
+    py::class_<FSMState>(m, "FSMState",
+            "One state in an FSM pattern: cluster_id, delta, centroid.")
+        .def(py::init<>())
+        .def_readwrite("cluster_id", &FSMState::cluster_id)
+        .def_readwrite("delta",      &FSMState::delta)
+        .def_readwrite("centroid",   &FSMState::centroid)
+        .def("__repr__", [](const FSMState& s) {
+            return "<FSMState cluster_id=" + std::to_string(s.cluster_id)
+                 + " delta=" + std::to_string(s.delta) + ">";
+        });
+
+    // ----- FSMPattern -----
+    py::class_<FSMPattern>(m, "FSMPattern",
+            "A single FSM entry P = (S, T).\n"
+            "states: dict[int, FSMState], transitions: dict[int, set[int]]")
+        .def(py::init<>())
+        .def_readwrite("pattern_id",  &FSMPattern::pattern_id)
+        .def_readwrite("frequency",   &FSMPattern::frequency)
+        .def_readwrite("last_used",   &FSMPattern::last_used)
+        .def_readwrite("states",      &FSMPattern::states)
+        .def_readwrite("transitions", &FSMPattern::transitions)
+        .def("has_transition",       &FSMPattern::has_transition,
+             py::arg("from_cluster"), py::arg("to_cluster"))
+        .def("predict_next",         &FSMPattern::predict_next,
+             py::arg("last_cluster"))
+        .def("predict_next_ranked",  &FSMPattern::predict_next_ranked,
+             py::arg("last_cluster"),
+             "All outgoing transitions sorted by delta ascending (tightest first).")
+        .def("num_transitions",      &FSMPattern::num_transitions)
+        .def("__repr__", [](const FSMPattern& p) {
+            return "<FSMPattern id=" + std::to_string(p.pattern_id)
+                 + " states=" + std::to_string(p.states.size())
+                 + " freq=" + std::to_string(p.frequency) + ">";
+        });
+
+    // ----- RequestTrajectory -----
+    py::class_<RequestTrajectory>(m, "RequestTrajectory",
+            "Tracks the cluster-access sequence for one request.\n\n"
+            "The C++ search() fills this automatically when passed as traj=...\n"
+            "Python only needs to call finalize() then update_from_trajectory().")
+        .def(py::init([](std::string rid) {
+                 RequestTrajectory t;
+                 t.request_id = std::move(rid);
+                 return t;
+             }),
+             py::arg("request_id"))
+        .def("append_step",
+             [np_to_vec](RequestTrajectory& t,
+                py::array_t<float, py::array::c_style> embedding,
+                int cluster_id,
+                FSMLayer layer,
+                uint64_t time_ns) {
+                 t.append_step(np_to_vec(embedding), cluster_id, layer, time_ns);
+             },
+             py::arg("embedding"),
+             py::arg("cluster_id"),
+             py::arg("layer"),
+             py::arg("time_ns") = 0,
+             "Record one completed search step manually (for offline use).")
+        .def("finalize",     &RequestTrajectory::finalize,
+             "Mark complete before calling update_from_trajectory().")
+        .def("cluster_id_sequence",
+             [](const RequestTrajectory& t) { return t.cluster_id_sequence(); },
+             "Flat list of cluster ids (FSMLayer info stripped).")
+        .def_readwrite("request_id",  &RequestTrajectory::request_id)
+        .def_readwrite("steps",       &RequestTrajectory::steps)
+        .def_readwrite("is_complete", &RequestTrajectory::is_complete)
+        .def_property_readonly("length",
+             [](const RequestTrajectory& t){ return t.length(); })
+        .def_property_readonly("timestamps_ns",
+             [](const RequestTrajectory& t) -> std::vector<uint64_t> {
+                 return t.timestamps_ns;
+             })
+        .def("__repr__", [](const RequestTrajectory& t) {
+            return "<RequestTrajectory id='" + t.request_id
+                 + "' steps=" + std::to_string(t.length())
+                 + " complete=" + (t.is_complete ? "True" : "False") + ">";
+        });
+
+    // ----- PredictResult -----
+    py::class_<FSMTable::PredictResult>(m, "PredictResult",
+            "Result of FSMTable.match_and_predict().\n\n"
+            "ranked_clusters: list[int]  probe these first (empty = no prediction)\n"
+            "best_score: float\n"
+            "best_pattern_id: int")
+        .def(py::init<>())
+        .def_readwrite("ranked_clusters", &FSMTable::PredictResult::ranked_clusters)
+        .def_readwrite("best_score",      &FSMTable::PredictResult::best_score)
+        .def_readwrite("best_pattern_id", &FSMTable::PredictResult::best_pattern_id)
+        .def("__repr__", [](const FSMTable::PredictResult& r) {
+            std::string s = "<PredictResult ranked=[";
+            for (size_t i = 0; i < r.ranked_clusters.size(); ++i) {
+                if (i) s += ",";
+                s += std::to_string(r.ranked_clusters[i]);
+            }
+            return s + "] score=" + std::to_string(r.best_score) + ">";
+        });
+
+    // ----- FSMTable -----
+    py::class_<FSMTable>(m, "FSMTable",
+            "Np-capped FSM pattern table. Thread-safe.\n\n"
+            "Obtain via idx.fsm_table() rather than constructing directly.")
+        .def(py::init<>())
+        .def(py::init<FSMConfig>(), py::arg("config"))
+        .def("match_and_predict",
+             [](FSMTable& t, const RequestTrajectory& traj, FSMLayer layer) {
+                 return t.match_and_predict(traj, layer);
+             },
+             py::arg("trajectory"),
+             py::arg("layer") = FSMLayer::L0,
+             "Return PredictResult.ranked_clusters — clusters to probe first.")
+        .def("update_from_trajectory",
+             [np_to_flat](FSMTable& t,
+                const RequestTrajectory& traj,
+                py::array_t<float, py::array::c_style> centroids,
+                int dim,
+                float delta_default) {
+                 t.update_from_trajectory(traj, np_to_flat(centroids), dim, delta_default);
+             },
+             py::arg("trajectory"),
+             py::arg("cluster_centroids"),
+             py::arg("dim"),
+             py::arg("cluster_delta_default") = 1.0f,
+             "Update or create a pattern from a finalized trajectory.\n"
+             "cluster_centroids: np.ndarray float32 shape (nlist*dim,) or (nlist, dim)")
+        .def("invalidate_cluster", &FSMTable::invalidate_cluster,
+             py::arg("cluster_id"),
+             "Remove all states/transitions for cluster_id (call on topology change).")
+        .def("set_config", &FSMTable::set_config, py::arg("config"),
+             "Replace config in-place (patterns preserved).")
+        .def("compute_similarity_transitions",
+             [](FSMTable& t, const FSMPattern& pat, const std::vector<int>& seq) {
+                 return t.compute_similarity_transitions(pat, seq);
+             },
+             py::arg("pattern"), py::arg("cluster_sequence"))
+        .def("compute_similarity_full",
+             [](FSMTable& t, const FSMPattern& pat,
+                const std::vector<int>& seq,
+                py::array_t<float, py::array::c_style> emb) {
+                 auto buf = emb.request();
+                 if (buf.ndim != 2)
+                     throw std::runtime_error("embeddings must be 2-D [T, D]");
+                 const float* ptr = static_cast<const float*>(buf.ptr);
+                 std::vector<std::vector<float>> eseq(static_cast<size_t>(buf.shape[0]));
+                 for (ssize_t r = 0; r < buf.shape[0]; ++r)
+                     eseq[static_cast<size_t>(r)].assign(
+                         ptr + r * buf.shape[1], ptr + (r + 1) * buf.shape[1]);
+                 return t.compute_similarity_full(pat, seq, eseq);
+             },
+             py::arg("pattern"), py::arg("cluster_sequence"), py::arg("embeddings"))
+        .def("num_patterns",  &FSMTable::num_patterns)
+        .def("get_pattern",
+             [](FSMTable& t, int pid) -> py::object {
+                 const FSMPattern* p = t.get_pattern(pid);
+                 if (!p) return py::none();
+                 return py::cast(*p);
+             },
+             py::arg("pattern_id"))
+        .def("merge_patterns", &FSMTable::merge_patterns,
+             py::arg("pattern_id_a"), py::arg("pattern_id_b"))
+        .def("clear",  &FSMTable::clear)
+        .def("config", &FSMTable::config)
+        .def("__repr__", [](const FSMTable& t) {
+            return "<FSMTable patterns=" + std::to_string(t.num_patterns()) + ">";
+        });
 }

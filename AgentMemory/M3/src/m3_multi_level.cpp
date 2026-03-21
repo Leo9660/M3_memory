@@ -1,13 +1,14 @@
 #include "m3_multi_level.h"
+#include "m3_fsm.h"
 #include <mutex>
 #include <algorithm>
 #include <limits>
 #include <chrono>
+#include <numeric>
 
 namespace m3 {
 
 namespace {
-// Build a zero-centroid grid with nlist rows.
 static std::vector<float> make_zero_centroids(int nlist, int dim) {
     return std::vector<float>(static_cast<size_t>(nlist) * static_cast<size_t>(dim), 0.0f);
 }
@@ -22,6 +23,15 @@ MultiLevelIndex::MultiLevelIndex(int dim, Metric metric, bool normalized,
     if (dim_ <= 0) {
         throw std::invalid_argument("MultiLevelIndex: dim must be > 0");
     }
+    start_prefetch_thread_();
+}
+
+MultiLevelIndex::~MultiLevelIndex() {
+    stop_prefetch_thread_();
+}
+
+void MultiLevelIndex::set_cache_config(CacheConfig cfg) {
+    cache_config_ = std::move(cfg);
 }
 
 void MultiLevelIndex::ensure_layer_initialized_(Layer& layer, int nlist_hint) {
@@ -498,134 +508,363 @@ void MultiLevelIndex::merge_levels_(const std::vector<std::vector<DocId>>& per_l
     }
 }
 
+// ======================================================================
+// FSM accessors
+// ======================================================================
+void MultiLevelIndex::set_fsm_config(FSMConfig cfg) {
+    // FSMTable holds a mutex so it cannot be move-assigned.
+    // Update config in-place; existing patterns are preserved.
+    fsm_table_.set_config(std::move(cfg));
+}
+FSMTable& MultiLevelIndex::fsm_table() { return fsm_table_; }
+const FSMTable& MultiLevelIndex::fsm_table() const { return fsm_table_; }
+
+// ======================================================================
+// dagent rolling average helpers  (TODO-5)
+// ======================================================================
+void MultiLevelIndex::update_dagent_(float kth_score) const {
+    std::lock_guard<std::mutex> lk(dagent_mu_);
+    const int window = fsm_table_.config().dagent_window;
+    dagent_buf_.push_back(kth_score);
+    while (static_cast<int>(dagent_buf_.size()) > window)
+        dagent_buf_.pop_front();
+}
+
+float MultiLevelIndex::dagent_() const {
+    std::lock_guard<std::mutex> lk(dagent_mu_);
+    if (dagent_buf_.empty()) return std::numeric_limits<float>::infinity();
+    float sum = 0.0f;
+    for (float v : dagent_buf_) sum += v;
+    return sum / static_cast<float>(dagent_buf_.size());
+}
+
+// ======================================================================
+// build_probe_list_  (BUG-1 fix + TODO-2 bridge)
+//
+// Builds the ordered probe list for one layer:
+//   Phase 1: FSM-predicted clusters (from fsm_preferred), validated
+//            against the layer's own valid cluster set.
+//   Phase 2: Fill remaining slots with centroid-distance order.
+// ======================================================================
+std::vector<int> MultiLevelIndex::build_probe_list_(
+        const float* query,
+        const std::vector<int>& fsm_preferred,
+        const std::shared_ptr<IVFIndex>& layer_idx,
+        const std::vector<float>& layer_centroids,
+        int effective_nprobe) const {
+
+    if (!layer_idx || effective_nprobe <= 0) return {};
+
+    const int nlist    = layer_idx->nlist();
+    const size_t dim_sz = static_cast<size_t>(dim_);
+
+    std::vector<int> probe_list;
+    probe_list.reserve(static_cast<size_t>(effective_nprobe));
+    std::unordered_set<int> added;
+    added.reserve(static_cast<size_t>(effective_nprobe));
+
+    // Phase 1: FSM-predicted clusters first.
+    for (int cid : fsm_preferred) {
+        if (cid < 0 || cid >= nlist) continue;
+        if (!layer_idx->centroid_ptr(cid)) continue;  // cluster slot invalid
+        if (!added.insert(cid).second) continue;
+        probe_list.push_back(cid);
+        if (static_cast<int>(probe_list.size()) >= effective_nprobe) break;
+    }
+
+    // Phase 2: centroid-distance fill.
+    if (static_cast<int>(probe_list.size()) < effective_nprobe
+            && !layer_centroids.empty()) {
+        struct CS { int cid; float score; };
+        std::vector<CS> remaining;
+        remaining.reserve(static_cast<size_t>(nlist));
+        for (int c = 0; c < nlist; ++c) {
+            if (!layer_idx->centroid_ptr(c)) continue;
+            if (added.count(c)) continue;
+            const float* cent = layer_centroids.data() + static_cast<size_t>(c) * dim_sz;
+            float score = unified_score(query, cent, dim_, metric_, normalized_);
+            remaining.push_back({c, score});
+        }
+        std::sort(remaining.begin(), remaining.end(),
+                  [](const CS& a, const CS& b){ return a.score < b.score; });
+        for (const auto& cs : remaining) {
+            probe_list.push_back(cs.cid);
+            if (static_cast<int>(probe_list.size()) >= effective_nprobe) break;
+        }
+    }
+    return probe_list;
+}
+
+// ======================================================================
+// search_layer_ordered_
+//
+// Probes the clusters in probe_list order using search_on (which handles
+// the within-cluster top-k correctly), collects all results, then
+// picks the top-k by merging.  Returns the cluster id that contributed
+// the best-scoring result (used for trajectory recording).
+// ======================================================================
+int MultiLevelIndex::search_layer_ordered_(
+        const float* query, int k,
+        const std::vector<int>& probe_list,
+        const std::shared_ptr<IVFIndex>& layer_idx,
+        std::vector<DocId>& out_ids,
+        std::vector<float>& out_scores) const {
+
+    if (probe_list.empty() || !layer_idx) return -1;
+
+    // search_on takes a vector of cluster ids and a batch of queries.
+    // We run it with all probe_list clusters in one call so the per-cluster
+    // search_into shared-buffer pattern is used internally.
+    std::vector<std::vector<DocId>>  batch_ids(1);
+    std::vector<std::vector<float>>  batch_scores(1);
+    layer_idx->search_on(probe_list, query, 1, k, batch_ids, batch_scores);
+
+    out_ids    = std::move(batch_ids[0]);
+    out_scores = std::move(batch_scores[0]);
+
+    if (out_ids.empty()) return -1;
+
+    // Determine which cluster in probe_list contributed the top result.
+    // We do a single lookup: find which cluster contains the top-1 doc id.
+    int winning_cid = -1;
+    if (!out_ids.empty()) {
+        DocId top_id = out_ids[0];
+        for (int cid : probe_list) {
+            if (!layer_idx->centroid_ptr(cid)) continue;
+            if (layer_idx->cluster_get_vector(cid, top_id)) {
+                winning_cid = cid;
+                break;
+            }
+        }
+        // Fallback: just use the first valid cluster in the probe list.
+        if (winning_cid == -1) winning_cid = probe_list[0];
+    }
+    return winning_cid;
+}
+
+// ======================================================================
+// search()  — FSM-integrated cache path  (TODO-7)
+//
+// Flow per query (cache_enabled_ == true):
+//   1. FSM predict → build L0 probe list (FSM-first)
+//   2. Search L0 via search_layer_ordered_
+//   3. append_step(L0) into traj
+//   4. record_access_ for each probed L0 cluster   (TODO-6)
+//   5. Early-termination check: kth_score < αet * dagent → skip L1+L2
+//   6. FSM predict again (trajectory now has L0 step) → build L1 probe list
+//   7. Search L1 via search_layer_ordered_
+//   8. append_step(L1) into traj
+//   9. record_access_ for L1 clusters
+//  10. Early-termination check → skip L2
+//  11. Search L2 normally (no FSM reordering)
+//  12. Merge all layer results
+//  13. Update dagent with k-th result score
+//  14. Promote result vectors (same as before)
+// ======================================================================
 void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int nprobe,
                              std::vector<std::vector<DocId>>& out_ids,
-                             std::vector<std::vector<float>>& out_scores) const {
+                             std::vector<std::vector<float>>& out_scores,
+                             RequestTrajectory* traj) const {
     out_ids.assign(q_rows, {});
     out_scores.assign(q_rows, {});
     if (!queries || q_rows == 0 || k <= 0) return;
 
     const size_t dim_sz = static_cast<size_t>(dim_);
+    const float alpha_et = fsm_table_.config().alpha_et;
+    const bool  fsm_on   = (traj != nullptr);
 
     if (cache_enabled_()) {
-        // Snapshot only the index shared_ptrs under the lock — avoids copying the
-        // centroid vector (potentially nlist*dim floats = multi-MB) on every query.
         std::shared_ptr<IVFIndex> l0_idx, l1_idx, l2_idx;
+        std::vector<float> l0_cents, l1_cents, l2_cents;
         {
             std::shared_lock lk(topo_mu_);
-            l0_idx = l0_.index;
-            l1_idx = l1_.index;
-            l2_idx = l2_.index;
+            l0_idx   = l0_.index;
+            l1_idx   = l1_.index;
+            l2_idx   = l2_.index;
+            l0_cents = l0_.centroids;
+            l1_cents = l1_.centroids;
         }
+
         const float search_threshold = cfg_.search_threshold;
-        const bool has_threshold = search_threshold < std::numeric_limits<float>::infinity();
-
-        std::vector<int> probe_ids;
-        std::vector<std::vector<DocId>> l0_ids(1), l1_ids(1), l2_ids(1);
-        std::vector<std::vector<float>> l0_scores(1), l1_scores(1), l2_scores(1);
-        // 0 = no results, 1 = satisfied by L0 only, 2 = satisfied after L1, 3 = needed L2
+        const bool  has_threshold    = search_threshold < std::numeric_limits<float>::infinity();
+        // 0=none 1=L0 only 2=L0+L1 3=L0+L1+L2
         std::vector<int> stage(q_rows, 0);
-
-        auto kth_score_vec = [&](const std::vector<float>& s) -> float {
-            if (s.empty()) return std::numeric_limits<float>::infinity();
-            if ((int)s.size() >= k) return s[static_cast<size_t>(k - 1)];
-            return s.back();
-        };
 
         for (size_t qi = 0; qi < q_rows; ++qi) {
             const float* qptr = queries + qi * dim_sz;
-            probe_ids.clear();
-            if (l2_idx)
-                l2_idx->get_probe_ids(qptr, nprobe, probe_ids);
-            if (probe_ids.empty()) continue;
 
-            // Stage 1: search L0 only.
-            l0_ids[0].clear(); l0_scores[0].clear();
-            l1_ids[0].clear(); l1_scores[0].clear();
-            l2_ids[0].clear(); l2_scores[0].clear();
+            // ---- get L2 probe ids (geometry-based, used for L2 fallback) ----
+            std::vector<int> l2_probe_ids;
+            if (l2_idx) l2_idx->get_probe_ids(qptr, nprobe, l2_probe_ids);
 
-            if (l0_idx)
-                l0_idx->search_on(probe_ids, qptr, 1, k, l0_ids, l0_scores);
+            // Per-layer result buffers (filled by search_layer_ordered_ / search_on).
+            std::vector<DocId>  l0_ids, l1_ids, l2_ids;
+            std::vector<float>  l0_scores, l1_scores, l2_scores;
 
+            // ==============================================================
+            // Stage 1: L0 with FSM reordering
+            // ==============================================================
+            int l0_winning_cid = -1;
+            if (l0_idx) {
+                std::vector<int> fsm_pref;
+                if (fsm_on) {
+                    auto pr = fsm_table_.match_and_predict(*traj, FSMLayer::L0);
+                    fsm_pref = std::move(pr.ranked_clusters);
+                }
+                std::vector<int> l0_probe = build_probe_list_(
+                    qptr, fsm_pref, l0_idx, l0_cents,
+                    (nprobe > 0 ? nprobe : l0_idx->nlist()));
+
+                l0_winning_cid = search_layer_ordered_(
+                    qptr, k, l0_probe, l0_idx, l0_ids, l0_scores);
+
+                // record_access_ for all probed L0 clusters (TODO-6).
+                for (int cid : l0_probe) record_access_(cid);
+
+                // append L0 step to trajectory (TODO-1).
+                if (fsm_on && l0_winning_cid >= 0) {
+                    std::vector<float> emb(qptr, qptr + dim_sz);
+                    traj->append_step(std::move(emb), l0_winning_cid, FSMLayer::L0);
+                }
+                stage[qi] = 1;
+            }
+
+            // ==============================================================
+            // Early termination after L0  (TODO-5)
+            // ==============================================================
             bool satisfied = false;
-            std::vector<DocId> merged_ids;
-            std::vector<float> merged_scores;
-
-            if (has_threshold && !l0_scores[0].empty()) {
-                float ks = kth_score_vec(l0_scores[0]);
-                if (ks <= search_threshold) {
-                    merged_ids = l0_ids[0];
-                    merged_scores = l0_scores[0];
-                    satisfied = true;
-                    stage[qi] = 1;
-                }
+            {
+                float ks  = l0_scores.empty() ? std::numeric_limits<float>::infinity()
+                          : (static_cast<int>(l0_scores.size()) >= k
+                             ? l0_scores[static_cast<size_t>(k - 1)] : l0_scores.back());
+                float dag = dagent_();
+                bool et_fsm = (dag < std::numeric_limits<float>::infinity())
+                           && (ks < alpha_et * dag);
+                bool et_thr = has_threshold && (ks <= search_threshold);
+                if (et_fsm || et_thr) satisfied = true;
             }
 
-            // Stage 2: include L1 if needed.
+            // ==============================================================
+            // Stage 2: L1 with FSM reordering
+            // ==============================================================
+            int l1_winning_cid = -1;
             if (!satisfied && l1_idx) {
-                l1_idx->search_on(probe_ids, qptr, 1, k, l1_ids, l1_scores);
-                std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0]};
-                std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0]};
-                merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
-
-                if (has_threshold && !merged_scores.empty()) {
-                    float ks = kth_score_vec(merged_scores);
-                    if (ks <= search_threshold) {
-                        satisfied = true;
-                        stage[qi] = 2;
-                    }
+                std::vector<int> fsm_pref;
+                if (fsm_on) {
+                    auto pr = fsm_table_.match_and_predict(*traj, FSMLayer::L1);
+                    fsm_pref = std::move(pr.ranked_clusters);
                 }
+                std::vector<int> l1_probe = build_probe_list_(
+                    qptr, fsm_pref, l1_idx, l1_cents,
+                    (nprobe > 0 ? nprobe : l1_idx->nlist()));
+
+                l1_winning_cid = search_layer_ordered_(
+                    qptr, k, l1_probe, l1_idx, l1_ids, l1_scores);
+
+                for (int cid : l1_probe) record_access_(cid);
+
+                if (fsm_on && l1_winning_cid >= 0) {
+                    std::vector<float> emb(qptr, qptr + dim_sz);
+                    traj->append_step(std::move(emb), l1_winning_cid, FSMLayer::L1);
+                }
+                stage[qi] = 2;
+
+                // Early termination after L1.
+                std::vector<DocId>  tmp_ids; std::vector<float> tmp_sc;
+                merge_levels_({{l0_ids},{l1_ids}},{{l0_scores},{l1_scores}},k,tmp_ids,tmp_sc);
+                float ks  = tmp_sc.empty() ? std::numeric_limits<float>::infinity()
+                          : (static_cast<int>(tmp_sc.size()) >= k
+                             ? tmp_sc[static_cast<size_t>(k - 1)] : tmp_sc.back());
+                float dag = dagent_();
+                bool et_fsm = (dag < std::numeric_limits<float>::infinity())
+                           && (ks < alpha_et * dag);
+                bool et_thr = has_threshold && (ks <= search_threshold);
+                if (et_fsm || et_thr) satisfied = true;
             }
 
-            // Stage 3: include L2 if still not satisfied or no threshold.
-            if (!satisfied) {
-                if (l2_idx) {
-                    l2_idx->search_on(probe_ids, qptr, 1, k, l2_ids, l2_scores);
-                    std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0], l2_ids[0]};
-                    std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0], l2_scores[0]};
-                    merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
-                    stage[qi] = 3;
-                } else {
-                    if (merged_ids.empty() && !l0_ids[0].empty()) {
-                        merged_ids = l0_ids[0];
-                        merged_scores = l0_scores[0];
-                        if (stage[qi] == 0) stage[qi] = 1;
-                    }
-                }
+            // ==============================================================
+            // Stage 3: L2 — no FSM reordering, standard geometry order
+            // ==============================================================
+            if (!satisfied && l2_idx && !l2_probe_ids.empty()) {
+                std::vector<std::vector<DocId>>  l2b(1);
+                std::vector<std::vector<float>>  l2sb(1);
+                l2_idx->search_on(l2_probe_ids, qptr, 1, k, l2b, l2sb);
+                l2_ids    = std::move(l2b[0]);
+                l2_scores = std::move(l2sb[0]);
+                stage[qi] = 3;
             }
 
-            out_ids[qi] = std::move(merged_ids);
-            out_scores[qi] = std::move(merged_scores);
-        }
-        {
-            std::unique_lock promo_lk(topo_mu_);
-            for (size_t qi = 0; qi < q_rows; ++qi) {
-                const int st = stage[qi];
-                int limit = cache_config_.max_promote_per_query;
-                if (limit <= 0) limit = static_cast<int>(out_ids[qi].size());
-                for (int j = 0; j < limit && j < static_cast<int>(out_ids[qi].size()); ++j) {
-                    DocId doc_id = out_ids[qi][j];
+            // ==============================================================
+            // Merge all layers and emit
+            // ==============================================================
+            {
+                std::vector<std::vector<DocId>>  per_ids    = {l0_ids, l1_ids, l2_ids};
+                std::vector<std::vector<float>>  per_scores = {l0_scores, l1_scores, l2_scores};
+                merge_levels_(per_ids, per_scores, k, out_ids[qi], out_scores[qi]);
+            }
+
+            // Update dagent with k-th score.
+            if (!out_scores[qi].empty()) {
+                float ks = (static_cast<int>(out_scores[qi].size()) >= k)
+                         ? out_scores[qi][static_cast<size_t>(k - 1)]
+                         : out_scores[qi].back();
+                update_dagent_(ks);
+            }
+        }  // end per-query loop
+
+        // ================================================================
+        // Promotion + predictive prefetch (background, non-blocking)
+        //
+        // Reactive: enqueue one task per result doc_id. The worker calls
+        //   promote_vector_neighborhood_(doc_id), exactly what the old
+        //   blocking loop did, but on a background thread.
+        //
+        // Predictive: after all queries are done, ask the FSM which cluster
+        //   comes next and enqueue a centroid-anchored task for it. The
+        //   worker calls promote_cluster_centroid_(cid), which searches the
+        //   cluster centroid neighbourhood and copies the dense core into
+        //   L0/L1 before the next search arrives.
+        // ================================================================
+        for (size_t qi = 0; qi < q_rows; ++qi) {
+            const int st = stage[qi];
+            int limit = cache_config_.max_promote_per_query;
+            if (limit <= 0) limit = static_cast<int>(out_ids[qi].size());
+
+            for (int j = 0; j < limit && j < static_cast<int>(out_ids[qi].size()); ++j) {
+                DocId doc_id = out_ids[qi][j];
+                // record_access_ is cheap (just a timestamp); keep it synchronous.
+                {
+                    std::shared_lock lk(topo_mu_);
                     auto it = doc_id_to_cid_.find(doc_id);
-                    if (it == doc_id_to_cid_.end()) continue;
-                    // Always update cluster-level access time so demotion logic works.
-                    record_access_(it->second);
-                    // But if this query was fully satisfied by L0 alone (stage 1),
-                    // skip extra promotion work (results already live in the hottest tier).
-                    if (st == 1) continue;
-                    promote_vector_neighborhood_(doc_id);
+                    if (it != doc_id_to_cid_.end())
+                        record_access_(it->second);
                 }
+                // Reactive promotion: skip if already satisfied by L0 alone
+                // (vectors already in the hottest tier — no promotion needed).
+                if (st == 1) continue;
+                enqueue_prefetch_({/*cluster_id=*/-1, doc_id, /*predictive=*/false});
             }
         }
-        return;
-    }
 
-    // Non-cache path: original behavior
+        // Predictive prefetch: if FSM is active and traj has steps, predict
+        // the next cluster and enqueue a centroid-anchored warmup task.
+        if (fsm_on && traj && traj->length() > 0) {
+            auto pr = fsm_table_.match_and_predict(*traj, FSMLayer::L0);
+            for (int pred_cid : pr.ranked_clusters) {
+                enqueue_prefetch_({pred_cid, DocId{-1}, /*predictive=*/true});
+            }
+        }
+
+        return;
+    }  // end cache_enabled_ branch
+
+    // ======================================================================
+    // Non-cache path: unchanged from original
+    // ======================================================================
     Layer l0, l1, l2;
     {
         std::shared_lock lk(topo_mu_);
-        l0 = l0_;
-        l1 = l1_;
-        l2 = l2_;
+        l0 = l0_; l1 = l1_; l2 = l2_;
     }
 
     std::vector<std::vector<DocId>> l0_ids(q_rows), l1_ids(q_rows), l2_ids(q_rows);
@@ -634,9 +873,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
     auto search_level = [&](const Layer& layer,
                             std::vector<std::vector<DocId>>& ids,
                             std::vector<std::vector<float>>& scores) {
-        if (layer.index) {
-            layer.index->search_nprobe(queries, q_rows, k, nprobe, ids, scores);
-        }
+        if (layer.index) layer.index->search_nprobe(queries, q_rows, k, nprobe, ids, scores);
     };
 
     search_level(l0, l0_ids, l0_scores);
@@ -651,40 +888,31 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         return s.back();
     };
 
-    // Gate L1+L2 behind threshold check after L0.
     bool need_deeper = !has_threshold;
-    if (has_threshold) {
-        need_deeper = false;
+    if (has_threshold)
         for (size_t qi = 0; qi < q_rows; ++qi)
             if (kth_score(qi) > search_threshold) { need_deeper = true; break; }
-    }
     if (need_deeper) search_level(l1, l1_ids, l1_scores);
 
-    // After L1, re-evaluate per-query whether L2 is still needed.
     auto kth_score_after_l1 = [&](size_t qi) -> float {
         const auto& s1 = l1_scores[qi];
         if (s1.empty()) return kth_score(qi);
-        float s0 = kth_score(qi);
-        float s1k = ((int)s1.size() >= k) ? s1[static_cast<size_t>(k-1)] : s1.back();
-        return std::min(s0, s1k);
+        float s1k = ((int)s1.size() >= k) ? s1[static_cast<size_t>(k - 1)] : s1.back();
+        return std::min(kth_score(qi), s1k);
     };
 
     bool need_l2 = !has_threshold;
-    if (has_threshold && need_deeper) {
-        need_l2 = false;
+    if (has_threshold && need_deeper)
         for (size_t qi = 0; qi < q_rows; ++qi)
             if (kth_score_after_l1(qi) > search_threshold) { need_l2 = true; break; }
-    }
     if (need_l2) search_level(l2, l2_ids, l2_scores);
 
     for (size_t qi = 0; qi < q_rows; ++qi) {
         if (has_threshold && !l0_scores[qi].empty() && kth_score(qi) <= search_threshold) {
-            out_ids[qi]    = l0_ids[qi];
-            out_scores[qi] = l0_scores[qi];
-            continue;
+            out_ids[qi] = l0_ids[qi]; out_scores[qi] = l0_scores[qi]; continue;
         }
-        std::vector<std::vector<DocId>>   per_ids    = {l0_ids[qi], l1_ids[qi], l2_ids[qi]};
-        std::vector<std::vector<float>>   per_scores = {l0_scores[qi], l1_scores[qi], l2_scores[qi]};
+        std::vector<std::vector<DocId>>  per_ids    = {l0_ids[qi], l1_ids[qi], l2_ids[qi]};
+        std::vector<std::vector<float>>  per_scores = {l0_scores[qi], l1_scores[qi], l2_scores[qi]};
         merge_levels_(per_ids, per_scores, k, out_ids[qi], out_scores[qi]);
     }
 }
@@ -743,6 +971,9 @@ void MultiLevelIndex::maintenance_pass() {
             }
             if (l0_idx) l0_idx->remove_cluster(cid);
             if (l1_idx) l1_idx->remove_cluster(cid);
+            // Invalidate FSM states referencing this cluster so the FSM
+            // does not predict a cluster id that no longer exists (Q-2).
+            fsm_table_.invalidate_cluster(cid);
         }
 
         // --- Splits: new slots >= l2_nlist_before (only when nlist increased) ---
@@ -768,6 +999,8 @@ void MultiLevelIndex::maintenance_pass() {
             if (origin_cid >= 0) {
                 if (l0_idx) l0_idx->remove_cluster(origin_cid);
                 if (l1_idx) l1_idx->remove_cluster(origin_cid);
+                // Invalidate FSM states for the old cluster that was split.
+                fsm_table_.invalidate_cluster(origin_cid);
             }
 
             // Register new slot as empty placeholder in L0/L1.
@@ -1077,6 +1310,158 @@ void MultiLevelIndex::demote_cluster_(int cid) const {
         m.in_l1 = false;
         m.l1_vector_count = 0;
     }
+}
+
+// ------------------------------------------------------------
+// (search_with_ordering removed — logic absorbed into search())
+
+// ======================================================================
+// enqueue_prefetch_
+//
+// Push a PrefetchTask onto the bounded prefetch queue.
+// If the queue is full, the task is silently dropped — prefetch is
+// best-effort and correctness never depends on it completing.
+// ======================================================================
+void MultiLevelIndex::enqueue_prefetch_(PrefetchTask task) const {
+    {
+        std::lock_guard<std::mutex> lk(prefetch_mu_);
+        if (prefetch_queue_.size() >= cache_config_.prefetch_queue_capacity) {
+            return;  // drop — queue full
+        }
+        prefetch_queue_.push_back(std::move(task));
+    }
+    prefetch_cv_.notify_one();
+}
+
+// ======================================================================
+// promote_cluster_centroid_
+//
+// Predictive counterpart to promote_vector_neighborhood_.
+// Used when no specific anchor doc is known yet (predictive prefetch):
+// searches the cluster using its centroid as the query vector and copies
+// the densest core of the cluster into L0/L1.
+//
+// Must be called WITHOUT holding topo_mu_ (it acquires shared lock inside).
+// ======================================================================
+void MultiLevelIndex::promote_cluster_centroid_(int cluster_id) const {
+    if (cluster_id < 0) return;
+
+    std::shared_ptr<IVFIndex> l2_idx, l0_idx, l1_idx;
+    std::vector<float> centroid_vec;
+    {
+        std::shared_lock lk(topo_mu_);
+        l2_idx = l2_.index;
+        l0_idx = l0_.index;
+        l1_idx = l1_.index;
+        if (!l2_idx) return;
+        const float* c = l2_idx->centroid_ptr(cluster_id);
+        if (!c) return;
+        centroid_vec.assign(c, c + static_cast<size_t>(dim_));
+    }
+
+    // Search the cluster using its centroid — returns the densest core vectors.
+    const int search_k = std::max(cache_config_.l0_neighborhood_k,
+                                   cache_config_.l1_neighborhood_k);
+    std::vector<DocId>  ids_found;
+    std::vector<float>  scores_found;
+    l2_idx->search_within_cluster(cluster_id, centroid_vec.data(),
+                                   search_k, ids_found, scores_found);
+    if (ids_found.empty()) return;
+
+    // Fetch vectors in one pass.
+    const size_t dim_sz = static_cast<size_t>(dim_);
+    std::vector<float> vecs_found;
+    vecs_found.reserve(ids_found.size() * dim_sz);
+    std::vector<DocId> ids_fetched;
+    ids_fetched.reserve(ids_found.size());
+    for (DocId id : ids_found) {
+        const float* v = l2_idx->cluster_get_vector(cluster_id, id);
+        if (v) {
+            vecs_found.insert(vecs_found.end(), v, v + dim_sz);
+            ids_fetched.push_back(id);
+        }
+    }
+    if (ids_fetched.empty()) return;
+
+    // Promote into L0/L1 using unique_lock for writes.
+    std::unique_lock lk(topo_mu_);
+    const size_t l0_count = std::min(static_cast<size_t>(cache_config_.l0_neighborhood_k),
+                                      ids_fetched.size());
+    if (l0_count > 0 && l0_.index) {
+        l0_.index->ensure_cluster(cluster_id, centroid_vec);
+        l0_.index->update_batch(cluster_id, ids_fetched.data(),
+                                 vecs_found.data(), l0_count, true);
+    }
+    const size_t l1_count = std::min(static_cast<size_t>(cache_config_.l1_neighborhood_k),
+                                      ids_fetched.size());
+    if (l1_count > 0 && l1_.index) {
+        l1_.index->ensure_cluster(cluster_id, centroid_vec);
+        l1_.index->update_batch(cluster_id, ids_fetched.data(),
+                                 vecs_found.data(), l1_count, true);
+    }
+
+    std::lock_guard<std::mutex> ml(meta_mu_);
+    if (static_cast<size_t>(cluster_id) < metadata_.size()) {
+        ClusterMetadata& m = metadata_[static_cast<size_t>(cluster_id)];
+        const uint64_t now_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        m.last_access_time = now_ns;
+        if (l0_count > 0) { m.in_l0 = true; m.l0_vector_count = l0_count; }
+        if (l1_count > 0) { m.in_l1 = true; m.l1_vector_count = l1_count; }
+    }
+}
+
+// ======================================================================
+// prefetch_worker_loop_
+//
+// Background thread that drains the prefetch queue.
+// For reactive tasks (anchor_doc != -1): calls promote_vector_neighborhood_.
+// For predictive tasks (anchor_doc == -1): calls promote_cluster_centroid_.
+//
+// Both paths are identical to what the old blocking promotion loop did,
+// just decoupled from the search thread.
+// ======================================================================
+void MultiLevelIndex::prefetch_worker_loop_() {
+    while (true) {
+        PrefetchTask task;
+        {
+            std::unique_lock<std::mutex> lk(prefetch_mu_);
+            prefetch_cv_.wait(lk, [this]{
+                return !prefetch_queue_.empty() || !prefetch_running_.load();
+            });
+
+            if (!prefetch_running_.load() && prefetch_queue_.empty()) break;
+            if (prefetch_queue_.empty()) continue;
+
+            task = prefetch_queue_.front();
+            prefetch_queue_.pop_front();
+        }
+
+        // Execute outside the queue lock so searches can enqueue concurrently.
+        if (task.anchor_doc != DocId{-1}) {
+            // Reactive: promote the neighbourhood around a specific result vector.
+            promote_vector_neighborhood_(task.anchor_doc);
+        } else if (task.cluster_id >= 0) {
+            // Predictive: warm the densest core of a predicted cluster.
+            promote_cluster_centroid_(task.cluster_id);
+        }
+    }
+}
+
+// ======================================================================
+// start_prefetch_thread_ / stop_prefetch_thread_
+// ======================================================================
+void MultiLevelIndex::start_prefetch_thread_() {
+    prefetch_running_.store(true);
+    prefetch_thread_ = std::thread([this]{ prefetch_worker_loop_(); });
+}
+
+void MultiLevelIndex::stop_prefetch_thread_() {
+    prefetch_running_.store(false);
+    prefetch_cv_.notify_all();
+    if (prefetch_thread_.joinable())
+        prefetch_thread_.join();
 }
 
 } // namespace m3
