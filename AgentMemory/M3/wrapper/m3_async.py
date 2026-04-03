@@ -248,11 +248,19 @@ class GpuCoordinator:
 
     def start_background(
         self,
-        flush_ms: int = 50,
+        flush_ms: int = 500,
         maintenance_ms: int = 5000,
         rebalance_ms: int = 500,
+        split_every_ops: int = 20000,
+        split_threshold: int = 200000,
     ) -> None:
-        self._coord.start_background(int(flush_ms), int(maintenance_ms), int(rebalance_ms))
+        self._coord.start_background(
+            int(flush_ms),
+            int(maintenance_ms),
+            int(rebalance_ms),
+            int(split_every_ops),
+            int(split_threshold),
+        )
 
     def stop_background(self) -> None:
         self._coord.stop_background()

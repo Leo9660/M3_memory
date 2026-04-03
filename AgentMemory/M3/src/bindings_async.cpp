@@ -234,9 +234,11 @@ PYBIND11_MODULE(_m3_async, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("start_background",
              &GpuCoordinator::start_background,
-             py::arg("flush_ms")       = 50,
-             py::arg("maintenance_ms") = 5000,
-             py::arg("rebalance_ms")   = 500)
+             py::arg("flush_ms")        =    500,
+             py::arg("maintenance_ms")  =   5000,
+             py::arg("rebalance_ms")    =    500,
+             py::arg("split_every_ops") =  20000,
+             py::arg("split_threshold") = 200000)
         .def("stop_background",
              &GpuCoordinator::stop_background,
              py::call_guard<py::gil_scoped_release>())

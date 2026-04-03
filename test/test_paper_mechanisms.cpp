@@ -46,7 +46,7 @@
 #include "gpu_flush_coordinator.h"
 #include "m3_multi_level.h"
 #include "m3_logger.h"
-#include "split_kernel_v3.h"
+#include "kmeans_gpu_v4.h"
 
 // =============================================================================
 // Minimal test framework
