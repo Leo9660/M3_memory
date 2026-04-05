@@ -9,6 +9,32 @@ from ..types import CollectionSpec, RunResult, BackendRequest, BackendOpType, Se
 
 from AgentMemory.M3 import _m3_async as m3, rebuild_from_faiss, M3MultiLevelIndex, GpuCoordinator  # pybind module + loader
 
+def _apply_cache_config(idx: "M3MultiLevelIndex", p: Dict[str, Any]) -> None:
+    """Build a CacheConfig from resolved params dict and push it to the index."""
+    cfg = m3.CacheConfig()
+    cfg.l0_max_clusters            = int(p["l0_max_clusters"])
+    cfg.l0_max_vectors_per_cluster = int(p["l0_max_vectors_per_cluster"])
+    cfg.l1_max_clusters            = int(p["l1_max_clusters"])
+    cfg.l1_max_vectors_per_cluster = int(p["l1_max_vectors_per_cluster"])
+    cfg.l0_eviction_ratio          = float(p["l0_eviction_ratio"])
+    cfg.l1_eviction_ratio          = float(p["l1_eviction_ratio"])
+    cfg.cold_time_ns               = int(p["cold_time_ns"])
+    cfg.l1_neighborhood_k          = int(p["l1_neighborhood_k"])
+    cfg.l0_neighborhood_k          = int(p["l0_neighborhood_k"])
+    cfg.max_promote_per_query      = int(p["max_promote_per_query"])
+    cfg.l0_nprobe                  = int(p["l0_nprobe"])
+    cfg.l1_nprobe                  = int(p["l1_nprobe"])
+    cfg.alpha_et                   = float(p["alpha_et"])
+    cfg.dagent_window              = int(p["dagent_window"])
+    cfg.calibration_interval       = int(p["calibration_interval"])
+    cfg.alpha_et_adapt_rate        = float(p["alpha_et_adapt_rate"])
+    mode = p.get("dagent_mode", "cache_level_k")
+    cfg.dagent_mode = (m3.DagentUpdateMode.true_k
+                       if str(mode) == "true_k"
+                       else m3.DagentUpdateMode.cache_level_k)
+    idx.set_cache_config(cfg)
+
+
 def _metric_enum(name: str):
     s = (name or "").lower()
     if s in ("l2", "euclidean"):
@@ -517,17 +543,61 @@ class M3MultiGpuBackend(MemoryBackend):
       gpu_budget_bytes  : VRAM cap in bytes       (default: 2 GB)
       insert_buf_cap    : per-cluster buffer size  (default: 128)
       flush_ms          : buffer flush interval            (default: 50 ms)
-      maintenance_ms    : L0/L1 eviction interval          (default: 5000 ms)
+      maintenance_ms    : L0/L1 eviction interval          (default: 50 ms)
       rebalance_ms      : hotspot rebalance period         (default: 500 ms)
       split_every_ops   : run split sweep every N inserts  (default: 0 = disabled)
       split_threshold   : split clusters exceeding N vecs  (default: 200 000)
       + all M3MultiLevelBackend centroid/config params
     """
 
+    # ------------------------------------------------------------------ #
+    #  All tuneable hyperparameters in one place.                        #
+    #  Override any of these via spec.params when calling create_index.  #
+    # ------------------------------------------------------------------ #
+    DEFAULTS: Dict[str, Any] = {
+        # --- GpuCoordinator ---
+        "gpu_budget_bytes":  10 * 1024 ** 3,  # VRAM cap (10 GB)
+        "insert_buf_cap":    128,              # per-cluster insert buffer
+        "flush_ms":          50,               # GPU flush interval
+        "maintenance_ms":    50,               # L0/L1 eviction interval
+        "rebalance_ms":      500,              # GPU hotspot rebalance period
+        "split_every_ops":   0,                # cluster split sweep (0 = off)
+        "split_threshold":   200_000,          # split if cluster exceeds N vecs
+
+        # --- MultiLevelConfig ---
+        "l0_nlist":                    1,
+        "l1_nlist":                    1,
+        "l2_nlist":                    1,
+        "l0_new_cluster_threshold":    float("inf"),
+        "search_threshold":            float("inf"),
+        "l0_merge_threshold":          float("inf"),
+        "l0_max_nlist":                0,
+
+        # --- CacheConfig ---
+        "l0_max_clusters":             16,
+        "l0_max_vectors_per_cluster":  1000,
+        "l1_max_clusters":             128,
+        "l1_max_vectors_per_cluster":  10000,
+        "l0_eviction_ratio":           0.8,
+        "l1_eviction_ratio":           0.9,
+        "cold_time_ns":                60_000_000_000,  # 60 s
+        "l1_neighborhood_k":           20,
+        "l0_neighborhood_k":           5,
+        "max_promote_per_query":       0,
+        "l0_nprobe":                   0,
+        "l1_nprobe":                   0,
+        "alpha_et":                    1.0,
+        "dagent_window":               20,
+        "dagent_mode":                 "cache_level_k",  # or "true_k"
+        "calibration_interval":        10,
+        "alpha_et_adapt_rate":         0.05,
+    }
+
     def __init__(self) -> None:
         super().__init__()
         self._indices: Dict[int, M3MultiLevelIndex] = {}
         self._coordinators: Dict[int, GpuCoordinator] = {}
+        self._index_params: Dict[int, Dict[str, Any]] = {}  # resolved params per index
 
         self._meta: Dict[int, Dict[int, Optional[Dict[str, Any]]]] = {}
         self._data: Dict[int, Dict[int, Any]] = {}
@@ -555,50 +625,47 @@ class M3MultiGpuBackend(MemoryBackend):
         metric = _metric_enum(getattr(spec, "metric", "l2"))
         normalized = (metric == m3.Metric.COSINE)
 
-        params = getattr(spec, "params", {}) or {}
-        cfg_kwargs = {
-            "l0_nlist": int(params.get("l0_nlist", 1)),
-            "l1_nlist": int(params.get("l1_nlist", 1)),
-            "l2_nlist": int(params.get("l2_nlist", 1)),
-            "l0_new_cluster_threshold": float(params.get("l0_new_cluster_threshold", float("inf"))),
-            "search_threshold": float(params.get("search_threshold", float("inf"))),
-            "l0_merge_threshold": float(params.get("l0_merge_threshold", float("inf"))),
-            "l0_max_nlist": int(params.get("l0_max_nlist", 0)),
-        }
-        idx = M3MultiLevelIndex(dim=dim, metric=metric, normalized=normalized, **cfg_kwargs)
+        # Merge spec.params over DEFAULTS — single source of truth for all knobs.
+        raw = getattr(spec, "params", {}) or {}
+        p: Dict[str, Any] = {**self.DEFAULTS, **raw}
+        self._index_params[index_id] = p
 
-        centroids = params.get("centroids")
+        idx = M3MultiLevelIndex(
+            dim=dim, metric=metric, normalized=normalized,
+            l0_nlist=int(p["l0_nlist"]),
+            l1_nlist=int(p["l1_nlist"]),
+            l2_nlist=int(p["l2_nlist"]),
+            l0_new_cluster_threshold=float(p["l0_new_cluster_threshold"]),
+            search_threshold=float(p["search_threshold"]),
+            l0_merge_threshold=float(p["l0_merge_threshold"]),
+            l0_max_nlist=int(p["l0_max_nlist"]),
+        )
+
+        centroids = raw.get("centroids")
         if centroids is None:
-            centroids = np.zeros((cfg_kwargs["l0_nlist"], dim), dtype=np.float32)
+            centroids = np.zeros((int(p["l0_nlist"]), dim), dtype=np.float32)
         centroids = np.ascontiguousarray(centroids, dtype=np.float32)
         if centroids.ndim != 2 or centroids.shape[1] != dim:
             raise ValueError("centroids must be [nlist, dim]")
         idx.set_l0_centroids(centroids)
 
-        # GPU coordinator parameters.
-        gpu_budget_bytes = int(params.get("gpu_budget_bytes", 10 * 1024 ** 3))  # default 10 GB
-        insert_buf_cap   = int(params.get("insert_buf_cap", 128))
-        flush_ms         = int(params.get("flush_ms", 50))
-        maintenance_ms   = int(params.get("maintenance_ms", 5000))
-        rebalance_ms     = int(params.get("rebalance_ms", 500))
-        split_every_ops  = int(params.get("split_every_ops", 0))       # 0 = disabled
-        split_threshold  = int(params.get("split_threshold", 200_000))
+        _apply_cache_config(idx, p)
 
         coord = GpuCoordinator(
             idx,
-            gpu_budget_bytes=gpu_budget_bytes,
+            gpu_budget_bytes=int(p["gpu_budget_bytes"]),
             dim=dim,
             metric=metric,
             normalized=normalized,
-            insert_buf_cap=insert_buf_cap,
+            insert_buf_cap=int(p["insert_buf_cap"]),
         )
         idx.set_gpu_coordinator(coord)
         coord.start_background(
-            flush_ms=flush_ms,
-            maintenance_ms=maintenance_ms,
-            rebalance_ms=rebalance_ms,
-            split_every_ops=split_every_ops,
-            split_threshold=split_threshold,
+            flush_ms=int(p["flush_ms"]),
+            maintenance_ms=int(p["maintenance_ms"]),
+            rebalance_ms=int(p["rebalance_ms"]),
+            split_every_ops=int(p["split_every_ops"]),
+            split_threshold=int(p["split_threshold"]),
         )
 
         self._indices[index_id] = idx
@@ -751,6 +818,10 @@ class M3MultiGpuBackend(MemoryBackend):
         self._meta[index_id] = {}
         self._data[index_id] = {}
         self._int2ext[index_id] = {}
+
+        # Re-apply cache config after rebuild (set_l2_centroids resets internal state).
+        if index_id in self._index_params:
+            _apply_cache_config(idx, self._index_params[index_id])
 
     @staticmethod
     def _keys_to_int64(keys, err: str):

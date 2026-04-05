@@ -41,7 +41,8 @@ public:
     int    dim()        const noexcept { return dim_; }
     Metric metric()     const noexcept { return metric_; }
     bool   normalized() const noexcept { return normalized_; }
-    int    nlist()      const;   // number of clusters
+    int    nlist()      const;   // total cluster slots (including ghost slots after eviction)
+    int    live_nlist() const;   // live cluster count (valid slots only) — use for display/stats
     const float* centroid_ptr(int cluster_id) const; // nullptr if invalid
 
     // ---- Per-cluster writes (caller ensures single-writer-per-cluster) ----
@@ -94,6 +95,10 @@ public:
 
     // For one query, return the top-nprobe cluster ids by centroid distance (for cache probe set).
     void get_probe_ids(const float* query, int nprobe, std::vector<int>& out_ids) const;
+
+    // For a full batch of queries, return top-nprobe cluster ids per query in one sgemm.
+    void batch_get_probe_ids(const float* queries, size_t q_rows, int nprobe,
+                             std::vector<std::vector<int>>& out_probe_ids) const;
 
     // Search within a single cluster (query as vector); returns k nearest doc_ids and scores.
     void search_within_cluster(int cluster_id, const float* query, int k,

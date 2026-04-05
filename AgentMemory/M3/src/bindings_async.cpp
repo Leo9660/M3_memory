@@ -32,20 +32,32 @@ PYBIND11_MODULE(_m3_async, m) {
         .def_readwrite("l0_merge_threshold", &MultiLevelConfig::l0_merge_threshold)
         .def_readwrite("l0_max_nlist", &MultiLevelConfig::l0_max_nlist);
 
+    // ----- DagentUpdateMode enum -----
+    py::enum_<DagentUpdateMode>(m, "DagentUpdateMode")
+        .value("cache_level_k", DagentUpdateMode::cache_level_k)
+        .value("true_k",        DagentUpdateMode::true_k)
+        .export_values();
+
     // ----- CacheConfig -----
     py::class_<CacheConfig>(m, "CacheConfig")
         .def(py::init<>())
-        .def_readwrite("l0_max_clusters", &CacheConfig::l0_max_clusters)
+        .def_readwrite("l0_max_clusters",            &CacheConfig::l0_max_clusters)
         .def_readwrite("l0_max_vectors_per_cluster", &CacheConfig::l0_max_vectors_per_cluster)
-        .def_readwrite("l1_max_clusters", &CacheConfig::l1_max_clusters)
+        .def_readwrite("l1_max_clusters",            &CacheConfig::l1_max_clusters)
         .def_readwrite("l1_max_vectors_per_cluster", &CacheConfig::l1_max_vectors_per_cluster)
-        .def_readwrite("l0_eviction_ratio", &CacheConfig::l0_eviction_ratio)
-        .def_readwrite("l1_eviction_ratio", &CacheConfig::l1_eviction_ratio)
-        .def_readwrite("cold_time_ns", &CacheConfig::cold_time_ns)
-        .def_readwrite("l1_neighborhood_k", &CacheConfig::l1_neighborhood_k)
-        .def_readwrite("max_promote_per_query", &CacheConfig::max_promote_per_query)
-        .def_readwrite("alpha_et", &CacheConfig::alpha_et)
-        .def_readwrite("dagent_window", &CacheConfig::dagent_window);
+        .def_readwrite("l0_eviction_ratio",          &CacheConfig::l0_eviction_ratio)
+        .def_readwrite("l1_eviction_ratio",          &CacheConfig::l1_eviction_ratio)
+        .def_readwrite("cold_time_ns",               &CacheConfig::cold_time_ns)
+        .def_readwrite("l1_neighborhood_k",          &CacheConfig::l1_neighborhood_k)
+        .def_readwrite("l0_neighborhood_k",          &CacheConfig::l0_neighborhood_k)
+        .def_readwrite("max_promote_per_query",      &CacheConfig::max_promote_per_query)
+        .def_readwrite("l0_nprobe",                  &CacheConfig::l0_nprobe)
+        .def_readwrite("l1_nprobe",                  &CacheConfig::l1_nprobe)
+        .def_readwrite("alpha_et",                   &CacheConfig::alpha_et)
+        .def_readwrite("dagent_window",              &CacheConfig::dagent_window)
+        .def_readwrite("dagent_mode",                &CacheConfig::dagent_mode)
+        .def_readwrite("calibration_interval",       &CacheConfig::calibration_interval)
+        .def_readwrite("alpha_et_adapt_rate",        &CacheConfig::alpha_et_adapt_rate);
 
     // ----- MultiLevelIndex -----
     py::class_<MultiLevelIndex>(m, "MultiLevelIndex")
@@ -96,6 +108,20 @@ PYBIND11_MODULE(_m3_async, m) {
         .def("set_cache_config",
              [](MultiLevelIndex& idx, const CacheConfig& cfg) {
                  idx.set_cache_config(cfg);
+             })
+        .def("get_cache_stats",
+             [](const MultiLevelIndex& idx) {
+                 auto s = idx.get_cache_stats();
+                 py::dict d;
+                 d["l0_clusters"]       = s.l0_clusters;
+                 d["l0_total_vecs"]     = s.l0_total_vecs;
+                 d["l1_clusters"]       = s.l1_clusters;
+                 d["l1_total_vecs"]     = s.l1_total_vecs;
+                 d["l1_dedup_set_size"] = s.l1_dedup_set_size;
+                 d["l0_l1_overlap"]     = s.l0_l1_overlap;
+                 d["dagent"]            = s.dagent;
+                 d["dynamic_threshold"] = s.dynamic_threshold;
+                 return d;
              })
         .def("insert",
              [](MultiLevelIndex& idx,

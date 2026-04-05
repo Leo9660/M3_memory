@@ -42,6 +42,9 @@ class MemoryManagement:
         hash_mode: str = "none",          # "none" | "blake2b64" | "sha1_64" | "python"
         hash_prefix: str = "",
         auto_id_strategy: str = "sequential",   # "uuid" | "sequential"
+        # Milvus-specific config
+        milvus_uri: str = "./milvus.db",
+        milvus_token: str = "",
     ) -> None:
         # Backend: accept a pre-built instance or a string name
         from .backend.base import MemoryBackend as _MemoryBackend
@@ -68,6 +71,12 @@ class MemoryManagement:
         elif backend.lower() in ("diskann_cpp", "diskann"):
             from .backend.diskann import DiskANNCppBackend
             self.backend: MemoryBackend = DiskANNCppBackend()
+        elif backend.lower() == "faiss":
+            from .backend.faiss_backend import FaissBackend
+            self.backend: MemoryBackend = FaissBackend()
+        elif backend.lower() == "milvus":
+            from .backend.milvus import MilvusBackend
+            self.backend: MemoryBackend = MilvusBackend(uri=milvus_uri, token=milvus_token)
         else:
             raise ValueError(f"Unknown backend: {backend}")
 

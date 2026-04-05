@@ -155,55 +155,44 @@ public:
 
     bool is_enabled() const;
 
-    // ---- Search batch ----
-    // Called once per MultiLevelIndex::search() call (cache-mode path).
-    //   q_rows            : number of queries in the batch
-    //   probe_select_ms   : total time for get_probe_ids() across all queries
-    //   l0_ms             : total time for L0 search_on() across all queries
-    //   l0_early_exits    : number of queries satisfied by L0 alone
-    //   l1_ms             : total time for L1 search_on() across all queries
-    //   l1_early_exits    : number of queries satisfied after L0+L1
-    //   l2_gpu_clusters   : total GPU-resident clusters probed across all queries
-    //   l2_cpu_clusters   : total CPU L2 clusters probed across all queries
-    //   l2_gpu_ms         : total time for GPU collaborative_search()
-    //   l2_cpu_ms         : total time for CPU L2 search_on()
-    //   merge_ms          : total time for merge_levels_() across all queries
-    //   total_ms          : wall-clock time for the entire search() call
-    void log_search_batch(size_t q_rows,
-                          double probe_select_ms,
-                          double l0_ms,    size_t l0_early_exits,
-                          double l1_ms,    size_t l1_early_exits,
-                          size_t l2_gpu_clusters, size_t l2_cpu_clusters,
-                          double l2_gpu_ms, double l2_cpu_ms,
-                          double merge_ms,
-                          double promotion_ms,
-                          double total_ms);
+    // ---- Search row (CSV) ----
+    // One row per search() batch combining timing + cache health.
+    // Written to a timestamped CSV in the profile directory.
+    //   true_kth_avg : mean k-th distance of queries that went all the way to L2;
+    //                  negative (-1) when all queries early-exited this batch.
+    void log_search_row(size_t q_rows,
+                        double probe_ms,
+                        double l0_ms,  size_t l0_exits,
+                        double l1_ms,  size_t l1_exits,
+                        size_t l2_gpu_cls, size_t l2_cpu_cls,
+                        double l2_gpu_ms,  double l2_cpu_ms,
+                        double merge_ms, double promotion_ms, double total_ms,
+                        int l0_clusters, size_t l0_vecs,
+                        int l1_clusters, size_t l1_vecs,
+                        float dagent, float alpha_et, float true_kth_avg);
 
-    // ---- Insert batch ----
-    // Called once per MultiLevelIndex::insert() call (cache-mode path).
-    //   n_rows          : number of vectors in the batch
-    //   gpu_pending     : number of vectors routed to GPU insert buffer
-    //   assign_ms       : time for nearest_clusters() (L2 cluster assignment)
-    //   l0l2_write_ms   : time for all L0 + L2 add_batch() calls
-    //   gpu_dispatch_ms : time for the GPU pending dispatch loop
-    //   total_ms        : wall-clock time for the entire insert() call
-    void log_insert_batch(size_t n_rows,
-                          size_t gpu_pending,
-                          double assign_ms,
-                          double l0l2_write_ms,
-                          double gpu_dispatch_ms,
-                          double total_ms);
+    // ---- Insert row (CSV) ----
+    // One row per insert() batch.
+    void log_insert_row(size_t n_rows,
+                        size_t gpu_pending,
+                        double assign_ms,
+                        double l0l2_write_ms,
+                        double gpu_dispatch_ms,
+                        double total_ms);
 
 private:
     M3Profiler();
     ~M3Profiler();
 
     void write_(const char* line);
+    void write_search_(const char* line);
+    void write_insert_(const char* line);
     static void timestamp_(char* buf, size_t buf_sz);
 
     mutable std::mutex mu_;
-    FILE*              fp_      = nullptr;
-    bool               enabled_ = false;
+    FILE*              fp_search_ = nullptr;
+    FILE*              fp_insert_ = nullptr;
+    bool               enabled_   = false;
 };
 
 } // namespace m3

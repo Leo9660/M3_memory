@@ -15,6 +15,19 @@
 
 namespace m3 {
 
+// Per-call timing breakdown for search_cluster() — filled when a non-null
+// pointer is passed. All times in milliseconds (wall-clock via std::chrono).
+struct GpuSearchTiming {
+    double stream_create_ms = 0; // cudaStreamCreate
+    double malloc_ms        = 0; // cudaMalloc x2
+    double h2d_ms           = 0; // cudaMemcpyAsync H2D (query upload)
+    double kernel_ms        = 0; // distance kernel launch (host-side elapsed)
+    double d2h_ms           = 0; // cudaMemcpyAsync D2H (distances download)
+    double sync_ms          = 0; // cudaStreamSynchronize
+    double free_ms          = 0; // cudaFree x2 + cudaStreamDestroy
+    double topk_ms          = 0; // CPU top-k selection
+};
+
 // ======================================================================
 // GpuClusterIndex
 //
@@ -26,7 +39,7 @@ namespace m3 {
 // without a physical GPU.
 //
 // Coordination protocol
-// ─────────────────────
+// -────────────────────
 // 1. Call store_cluster() to upload data. The returned void* handle can
 //    be passed to GpuBudgetManager::register_cluster() as the `ptr`.
 //    GpuBudgetManager will call the caller's eviction handler when it
@@ -80,7 +93,7 @@ public:
 
     // ---- Search ----
 
-    // Append vectors to an existing cluster (CPU simulation of GPU→GPU + H2D
+    // Append vectors to an existing cluster (CPU simulation of GPU->GPU + H2D
     // copy that occurs when the insertion buffer is drained to the GPU).
     // Per the paper, when the insertion buffer is full the GPU cluster is
     // expanded in-place rather than flushed down to L2.
@@ -89,11 +102,13 @@ public:
 
     // Search one GPU-resident cluster. Appends results to out_*.
     // Returns number of results added (0 if cluster not present/empty).
+    // If `timing` is non-null, per-phase wall-clock times are written into it.
     size_t search_cluster(int cid,
                           const float* query,
                           int k,
                           std::vector<DocId>&  out_ids,
-                          std::vector<float>&  out_scores) const;
+                          std::vector<float>&  out_scores,
+                          GpuSearchTiming*     timing = nullptr) const;
 
     // Collaborative search over GPU-resident probe clusters.
     //
@@ -103,12 +118,15 @@ public:
     // + GpuCoordinator::is_gpu_resident() to partition the probe set).
     //
     // For each cid in probe_cids:
-    //   • GPU path   : runs linear-scan search_cluster() over device vectors.
-    //   • Buffer path: calls buf.scan_insert_buffer(cid) ONLY if the cluster
+    //   * GPU path   : runs linear-scan search_cluster() over device vectors.
+    //   * Buffer path: calls buf.scan_insert_buffer(cid) ONLY if the cluster
     //                  has an active insert buffer slot (GPU-resident clusters only).
     //
     // Candidates are de-duplicated by DocId (best score kept) then
     // sorted ascending. Returns top-k in out_ids / out_scores.
+    //
+    // If M3_GPU_DIAG=1 env var is set, prints a per-call phase breakdown to
+    // stderr aggregated over all clusters in this invocation.
     size_t collaborative_search(const std::vector<int>& probe_cids,
                                 const float* query,
                                 int k,
@@ -123,9 +141,9 @@ public:
 private:
     // RAII wrapper around a cudaMalloc'd device buffer.
     // Shared ownership allows search_cluster() to snapshot the pointer without
-    // holding the mutex across the kernel launch — the buffer is kept alive
+    // holding the mutex across the kernel launch -- the buffer is kept alive
     // as long as at least one shared_ptr holds it, giving zero-downtime
-    // behaviour during expand_cluster()'s allocate-new → swap → release-old.
+    // behaviour during expand_cluster()'s allocate-new -> swap -> release-old.
     struct DeviceBuffer {
         float*  ptr   = nullptr;
         size_t  bytes = 0;   // allocated size in bytes

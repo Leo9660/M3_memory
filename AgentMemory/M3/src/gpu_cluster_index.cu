@@ -27,9 +27,25 @@
 
 #include "gpu_cluster_index.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
+
+namespace {
+// Returns true once per process (checked at first collaborative_search call).
+inline bool gpu_diag_enabled() {
+    static const bool v = (std::getenv("M3_GPU_DIAG") != nullptr &&
+                           std::getenv("M3_GPU_DIAG")[0] == '1');
+    return v;
+}
+using clock_t_ = std::chrono::high_resolution_clock;
+inline double fms_(clock_t_::duration d) {
+    return std::chrono::duration<double, std::milli>(d).count();
+}
+} // anonymous namespace
 
 namespace m3 {
 
@@ -293,11 +309,13 @@ size_t GpuClusterIndex::expand_cluster(int cid,
 
 // search_cluster — GPU distance kernel + CPU top-k.
 //   Mutex held only for the brief snapshot; kernel runs outside the lock.
+//   If `timing` is non-null, per-phase wall-clock times (ms) are written into it.
 size_t GpuClusterIndex::search_cluster(int cid,
                                         const float* query,
                                         int k,
                                         std::vector<DocId>&  out_ids,
-                                        std::vector<float>&  out_scores) const
+                                        std::vector<float>&  out_scores,
+                                        GpuSearchTiming*     timing) const
 {
     // Snapshot (brief lock).
     std::shared_ptr<DeviceBuffer> buf;
@@ -315,40 +333,57 @@ size_t GpuClusterIndex::search_cluster(int cid,
 
     const size_t dim_sz = static_cast<size_t>(dim_);
 
-    // Dedicated per-call stream so we sync only this search's work,
-    // not unrelated H2D transfers happening on the flush/promote threads.
+    // cudaStreamCreate
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
+    { auto _t = clock_t_::now(); CUDA_CHECK(cudaStreamCreate(&stream));
+      if (timing) timing->stream_create_ms += fms_(clock_t_::now() - _t); }
 
-    // Allocate device temporaries.
+    // cudaMalloc x2
     float *d_query = nullptr, *d_dists = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_query, dim_sz * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_dists, n * sizeof(float)));
+    { auto _t = clock_t_::now();
+      CUDA_CHECK(cudaMalloc(&d_query, dim_sz * sizeof(float)));
+      CUDA_CHECK(cudaMalloc(&d_dists, n * sizeof(float)));
+      if (timing) timing->malloc_ms += fms_(clock_t_::now() - _t); }
 
-    // H2D: copy query on our stream.
-    CUDA_CHECK(cudaMemcpyAsync(d_query, query, dim_sz * sizeof(float),
-                               cudaMemcpyHostToDevice, stream));
+    // H2D: copy query
+    { auto _t = clock_t_::now();
+      CUDA_CHECK(cudaMemcpyAsync(d_query, query, dim_sz * sizeof(float),
+                                 cudaMemcpyHostToDevice, stream));
+      if (timing) timing->h2d_ms += fms_(clock_t_::now() - _t); }
 
-    // Launch distance kernel on our stream.
-    launch_distance_kernel(metric_, d_query, buf->ptr, d_dists,
-                           static_cast<int>(n), dim_, stream);
-
-    // D2H on the same stream (ordered after kernel), then sync only this stream.
+    // Launch distance kernel
     std::vector<float> h_dists(n);
-    CUDA_CHECK(cudaMemcpyAsync(h_dists.data(), d_dists, n * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    { auto _t = clock_t_::now();
+      launch_distance_kernel(metric_, d_query, buf->ptr, d_dists,
+                             static_cast<int>(n), dim_, stream);
+      if (timing) timing->kernel_ms += fms_(clock_t_::now() - _t); }
 
-    cudaFree(d_query);
-    cudaFree(d_dists);
-    cudaStreamDestroy(stream);
+    // D2H distances
+    { auto _t = clock_t_::now();
+      CUDA_CHECK(cudaMemcpyAsync(h_dists.data(), d_dists, n * sizeof(float),
+                                 cudaMemcpyDeviceToHost, stream));
+      if (timing) timing->d2h_ms += fms_(clock_t_::now() - _t); }
+
+    // Stream sync
+    { auto _t = clock_t_::now();
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      if (timing) timing->sync_ms += fms_(clock_t_::now() - _t); }
+
+    // Free + stream destroy
+    { auto _t = clock_t_::now();
+      cudaFree(d_query);
+      cudaFree(d_dists);
+      cudaStreamDestroy(stream);
+      if (timing) timing->free_ms += fms_(clock_t_::now() - _t); }
 
     // Top-k on CPU using the snapshotted host IDs.
+    auto _t_topk = clock_t_::now();
     std::vector<Pair> cands;
     cands.reserve(n);
     for (size_t i = 0; i < n; ++i)
         cands.push_back(Pair{h_dists[i], h_ids[i]});
     topk_smallest(cands, k);
+    if (timing) timing->topk_ms += fms_(clock_t_::now() - _t_topk);
 
     out_ids.reserve(out_ids.size() + cands.size());
     out_scores.reserve(out_scores.size() + cands.size());
@@ -374,13 +409,18 @@ size_t GpuClusterIndex::collaborative_search(
         std::vector<DocId>&  out_ids,
         std::vector<float>&  out_scores) const
 {
+    const bool diag = gpu_diag_enabled();
+    GpuSearchTiming agg;   // accumulated over all clusters in this call
+    int n_clusters_searched = 0;
+
     std::unordered_map<DocId, float> best;
 
     for (int cid : probe_cids) {
         // ── GPU path: linear scan of VRAM-resident vectors ──────────────
         std::vector<DocId>  g_ids;
         std::vector<float>  g_scores;
-        search_cluster(cid, query, k, g_ids, g_scores);
+        search_cluster(cid, query, k, g_ids, g_scores, diag ? &agg : nullptr);
+        ++n_clusters_searched;
         for (size_t i = 0; i < g_ids.size(); ++i) {
             auto [it, ins] = best.emplace(g_ids[i], g_scores[i]);
             if (!ins && g_scores[i] < it->second)
@@ -403,7 +443,24 @@ size_t GpuClusterIndex::collaborative_search(
         }
     }
 
-    // Convert map → sorted top-k.
+    // Diagnostic: print per-phase breakdown aggregated over all clusters.
+    if (diag && n_clusters_searched > 0) {
+        double total = agg.stream_create_ms + agg.malloc_ms + agg.h2d_ms
+                     + agg.kernel_ms + agg.d2h_ms + agg.sync_ms
+                     + agg.free_ms + agg.topk_ms;
+        fprintf(stderr,
+            "[M3_GPU_DIAG] clusters=%d  "
+            "stream_create=%.1fms  malloc=%.1fms  h2d=%.1fms  "
+            "kernel=%.1fms  d2h=%.1fms  sync=%.1fms  "
+            "free=%.1fms  topk=%.1fms  TOTAL=%.1fms\n",
+            n_clusters_searched,
+            agg.stream_create_ms, agg.malloc_ms, agg.h2d_ms,
+            agg.kernel_ms, agg.d2h_ms, agg.sync_ms,
+            agg.free_ms, agg.topk_ms, total);
+        fflush(stderr);
+    }
+
+    // Convert map -> sorted top-k.
     std::vector<Pair> all;
     all.reserve(best.size());
     for (const auto& [id, sc] : best)

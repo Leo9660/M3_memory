@@ -4,28 +4,58 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#ifdef __AVX2__
+#  include <immintrin.h>
+#endif
 
 namespace m3 {
 
 // ---------------- Metric helpers ----------------
 
 float l2_dist(const float* a, const float* b, int d) {
-    // Squared L2 distance
-    float s = 0.f;
-    for (int i = 0; i < d; ++i) {
-        float df = a[i] - b[i];
-        s += df * df;
+#ifdef __AVX2__
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= d; i += 8) {
+        __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i));
+        acc = _mm256_fmadd_ps(diff, diff, acc);
     }
+    // horizontal sum of 8-lane accumulator
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float s = _mm_cvtss_f32(lo);
+    // scalar tail for d not divisible by 8
+    for (; i < d; ++i) { float df = a[i] - b[i]; s += df * df; }
     return s;
+#else
+    float s = 0.f;
+    for (int i = 0; i < d; ++i) { float df = a[i] - b[i]; s += df * df; }
+    return s;
+#endif
 }
 
 float ip_score(const float* a, const float* b, int d) {
-    // Dot product
-    float s = 0.f;
-    for (int i = 0; i < d; ++i) {
-        s += a[i] * b[i];
-    }
+#ifdef __AVX2__
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= d; i += 8)
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float s = _mm_cvtss_f32(lo);
+    for (; i < d; ++i) s += a[i] * b[i];
     return s;
+#else
+    float s = 0.f;
+    for (int i = 0; i < d; ++i) s += a[i] * b[i];
+    return s;
+#endif
 }
 
 float cos_dist(const float* a, const float* b, int d) {

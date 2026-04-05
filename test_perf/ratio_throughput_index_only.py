@@ -186,7 +186,7 @@ def to_items(prefix: str, texts: List[str]) -> List[MemoryItem]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Search/insert ratio perf benchmark.")
-    parser.add_argument("--backend", choices=["placeholder", "quake", "m3", "m3multi", "m3multigpu", "diskann_cpp", "diskann"], default="m3")
+    parser.add_argument("--backend", choices=["placeholder", "quake", "m3", "m3multi", "m3multigpu", "diskann_cpp", "diskann", "faiss", "milvus"], default="m3")
     parser.add_argument("--index", default="perf-ratio", help="Index handle passed to MemoryManagement.")
     parser.add_argument("--mode", choices=["item_search_insert", "step_search_then_update", "head_search_tail_insert", "search_only", "ratio"], default="item_search_insert", help="Request scheduling pattern.")
     parser.add_argument("--dataset", choices=list(DATASET_LOADERS.keys()), default=None, help="Dataset name; when omitted, synthetic vectors are used (ratio mode).")
@@ -209,6 +209,8 @@ def main() -> None:
     parser.add_argument("--no-normalize", dest="normalize", action="store_false", help="Disable L2 normalization before sending to backend.")
     parser.add_argument("--encoder", choices=["transformer", "passthrough"], default="transformer", help="Encoder to use (transformer required for text datasets; passthrough only for synthetic).")
     parser.add_argument("--log-file", type=str, default=None, help="Optional path to append a TSV log row (mode, dataset, backend, throughput).")
+    parser.add_argument("--milvus-uri", type=str, default="./milvus.db", help="Milvus URI: local file path for Milvus Lite (e.g. ./milvus.db) or server URI (e.g. http://localhost:19530). Only used with --backend milvus.")
+    parser.add_argument("--milvus-token", type=str, default="", help="Milvus auth token (user:password or Zilliz Cloud API key). Only used with --backend milvus.")
     parser.set_defaults(normalize=True)
     args = parser.parse_args()
 
@@ -236,12 +238,14 @@ def main() -> None:
         print(f"[init] encode done in {time.perf_counter() - _enc_start:.2f}s  dim={_enc.dim}")
         items = [MemoryItem(id=it.id, data=vec) for it, vec in zip(items, _vecs)]
         encoder = VectorPassthroughEncoder(dim=_enc.dim, normalize=False)  # already normalized
-        mm = MemoryManagement(backend=args.backend, encoder=encoder, default_nprobe=args.nprobe)
+        mm = MemoryManagement(backend=args.backend, encoder=encoder, default_nprobe=args.nprobe,
+                              milvus_uri=args.milvus_uri, milvus_token=args.milvus_token)
     else:
         search_ratio, insert_ratio = parse_ratio(args.ratio)
         rng = np.random.default_rng(args.seed)
         encoder = VectorPassthroughEncoder(dim=args.dim, normalize=args.normalize)
-        mm = MemoryManagement(backend=args.backend, encoder=encoder, default_nprobe=args.nprobe)
+        mm = MemoryManagement(backend=args.backend, encoder=encoder, default_nprobe=args.nprobe,
+                              milvus_uri=args.milvus_uri, milvus_token=args.milvus_token)
         insert_mat = build_vectors(args.insert_count, args.dim, rng)
         expected_search = int(math.ceil(args.insert_count * (search_ratio / insert_ratio)))
         search_mat = build_vectors(expected_search, args.dim, rng)

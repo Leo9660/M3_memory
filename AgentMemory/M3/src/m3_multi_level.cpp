@@ -35,6 +35,9 @@ MultiLevelIndex::MultiLevelIndex(int dim, Metric metric, bool normalized,
     l0_.name = "L0";
     l1_.name = "L1";
     l2_.name = "L2";
+    // alpha_et_dynamic_ starts at the configured value; adapted at runtime when
+    // calibration_interval > 0 and alpha_et_adapt_rate > 0.
+    alpha_et_dynamic_ = cache_config_.alpha_et;
 }
 
 void MultiLevelIndex::ensure_layer_initialized_(Layer& layer, int nlist_hint) {
@@ -78,13 +81,12 @@ void MultiLevelIndex::set_l2_centroids(const std::vector<float>& centroids) {
     std::unique_lock lk(topo_mu_);
     ensure_layer_centroids_(l2_, centroids);
     if (!centroids.empty()) {
-        ensure_layer_centroids_(l0_, centroids);
-        // L1 uses its own query-centric cluster topology (not inherited from L2).
-        // Just ensure the index object exists with 0 pre-existing clusters.
-        if (!l1_.index) {
+        // L0 and L1 use their own query-centric topology — do NOT seed from L2 centroids.
+        // Just ensure both index objects exist (empty; clusters added dynamically on promotion).
+        if (!l0_.index)
+            l0_.index = std::make_shared<IVFIndex>(dim_, metric_, normalized_, l0_.name);
+        if (!l1_.index)
             l1_.index = std::make_shared<IVFIndex>(dim_, metric_, normalized_, l1_.name);
-            // l1_.centroids intentionally left empty — clusters added dynamically via add_cluster().
-        }
         const size_t nlist = centroids.size() / static_cast<size_t>(dim_);
         {
             std::lock_guard<std::mutex> ml(meta_mu_);
@@ -128,9 +130,9 @@ void MultiLevelIndex::insert(const DocId* ids, const float* vecs, size_t n_rows)
         std::vector<GpuPending> gpu_pending;
 
         // Per-cid count deltas applied to metadata after the loop (one meta_mu_ lock).
-        std::unordered_map<int, size_t> l0_delta, l2_delta;
+        std::unordered_map<int, size_t> l2_delta;
 
-        // Stage 2: L0 + L2 writes for non-GPU-resident vectors.
+        // Stage 2: L2 writes only. L0/L1 are populated exclusively via post-search promotion.
         const auto t_l0l2_0 = profiling ? clock::now() : clock::time_point{};
         for (size_t i = 0; i < n_rows; ++i) {
             int cid = cids[i];
@@ -141,23 +143,7 @@ void MultiLevelIndex::insert(const DocId* ids, const float* vecs, size_t n_rows)
                 // GPU-resident: defer to after lock release.
                 gpu_pending.push_back({cid, ids[i], i * dim_sz});
             } else {
-                // Not GPU-resident: write to L0 (recent access) and L2 (ground truth).
-                if (l0_.index) {
-                    if (m3_verbose || M3Logger::instance().is_enabled()) {
-                        const int l0n = l0_.index->nlist();
-                        const int l2n = l2_.index ? l2_.index->nlist() : -1;
-                        const int cenn = static_cast<int>(
-                            l2_.centroids.size() / static_cast<size_t>(dim_sz));
-                        const bool l2v = (cid >= 0 && cid < l2n);
-                        const bool l0v = (cid >= 0 && cid < l0n);
-                        M3Logger::instance().log_insert_routing(
-                            cid, l0n, l2n, cenn, l2v, l0v);
-                    }
-                    // allow_missing=true: if this cluster was cold-demoted from L0 since
-                    // routing, silently skip — L2 write below is the ground truth.
-                    l0_.index->add_batch(cid, &ids[i], vecs + i * dim_sz, 1, /*allow_missing=*/true);
-                    ++l0_delta[cid];
-                }
+                // Not GPU-resident: write to L2 (ground truth).
                 if (l2_.index) {
                     l2_.index->add_batch(cid, &ids[i], vecs + i * dim_sz, 1);
                     ++l2_delta[cid];
@@ -166,12 +152,9 @@ void MultiLevelIndex::insert(const DocId* ids, const float* vecs, size_t n_rows)
         }
         const double p_l0l2_ms = profiling ? fms(clock::now() - t_l0l2_0).count() : 0.0;
 
-        // Apply deltas to metadata under meta_mu_ (same ordering as record_access_: topo_mu_ → meta_mu_).
-        if (!l0_delta.empty() || !l2_delta.empty()) {
+        // Apply deltas to metadata under meta_mu_.
+        if (!l2_delta.empty()) {
             std::lock_guard<std::mutex> ml(meta_mu_);
-            for (auto& [cid, d] : l0_delta)
-                if (static_cast<size_t>(cid) < metadata_.size())
-                    metadata_[cid].l0_vector_count += d;
             for (auto& [cid, d] : l2_delta)
                 if (static_cast<size_t>(cid) < metadata_.size())
                     metadata_[cid].l2_vector_count += d;
@@ -191,7 +174,7 @@ void MultiLevelIndex::insert(const DocId* ids, const float* vecs, size_t n_rows)
 
         if (profiling) {
             const double total_ms = fms(clock::now() - t_insert_start).count();
-            M3Profiler::instance().log_insert_batch(
+            M3Profiler::instance().log_insert_row(
                 n_rows, gpu_pending.size(),
                 p_assign_ms, p_l0l2_ms, p_gpu_ms, total_ms);
         }
@@ -312,7 +295,6 @@ void MultiLevelIndex::update(const DocId* ids, const float* vecs, size_t n_rows,
                     if (cid >= 0) {
                         l2_.index->add_batch(cid, &id, vptr, 1);
                         doc_id_to_cid_[id] = cid;
-                        promote_vector_neighborhood_(id);
                     }
                 }
                 continue;
@@ -320,11 +302,19 @@ void MultiLevelIndex::update(const DocId* ids, const float* vecs, size_t n_rows,
             int cid = it->second;
             const float* vptr = vecs + i * dim_sz;
             l2_.index->update_batch(cid, &id, vptr, 1, false);
-            if (l0_.index && l0_.index->cluster_get_vector(cid, id))
-                l0_.index->update_batch(cid, &id, vptr, 1, false);
-            if (l1_.index && l1_.index->cluster_get_vector(cid, id))
-                l1_.index->update_batch(cid, &id, vptr, 1, false);
-            promote_vector_neighborhood_(id);
+            // Update L1/L0 in-place if the vector is already cached there.
+            // L0/L1 use their own query-centric cluster IDs so look up via doc_id_to_l1_cid_.
+            {
+                std::lock_guard<std::mutex> lk(l1_cache_mu_);
+                auto l1it = doc_id_to_l1_cid_.find(id);
+                if (l1it != doc_id_to_l1_cid_.end()) {
+                    const int l1cid = l1it->second;
+                    if (l1_.index && l1_.index->cluster_get_vector(l1cid, id))
+                        l1_.index->update_batch(l1cid, &id, vptr, 1, false);
+                    if (l0_.index && l0_.index->cluster_get_vector(l1cid, id))
+                        l0_.index->update_batch(l1cid, &id, vptr, 1, false);
+                }
+            }
         }
         if (l1_strategy_) l1_strategy_->on_update(ids, vecs, n_rows);
         return;
@@ -731,15 +721,17 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             l1 = l1_;
             l2 = l2_;
         }
-        // Dynamic early-termination threshold: αet · dagent (rolling mean of recent top-k distances).
-        // Falls back to the static cfg_.search_threshold when dagent is not yet populated or
-        // alpha_et is disabled (set to 0).
+        // Dynamic early-termination threshold: alpha_et_dynamic_ · dagent_.
+        // alpha_et_dynamic_ is initialised from cache_config_.alpha_et and adapted at
+        // runtime by the background calibration path. Falls back to the static
+        // cfg_.search_threshold when dagent_ is not yet populated or alpha_et is 0.
         float search_threshold;
         bool has_threshold;
         {
             std::lock_guard<std::mutex> dlk(dagent_mu_);
-            if (cache_config_.alpha_et > 0.f && dagent_ > 0.f) {
-                search_threshold = cache_config_.alpha_et * dagent_;
+            std::lock_guard<std::mutex> alk(alpha_et_mu_);
+            if (alpha_et_dynamic_ > 0.f && dagent_ > 0.f) {
+                search_threshold = alpha_et_dynamic_ * dagent_;
                 has_threshold = true;
             } else {
                 search_threshold = cfg_.search_threshold;
@@ -747,14 +739,26 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             }
         }
 
+        // Profile accumulators (only populated when profiling is enabled).
+        double p_probe_ms = 0, p_l0_ms = 0, p_l1_ms = 0;
+
+        // Batch probe selection: one sgemm across all queries instead of q_rows scalar loops.
+        std::vector<std::vector<int>> all_probe_ids(q_rows);
+        {
+            const auto t0 = profiling ? clock::now() : clock::time_point{};
+            if (l2.index)
+                l2.index->batch_get_probe_ids(queries, q_rows, nprobe, all_probe_ids);
+            if (profiling) p_probe_ms = fms(clock::now() - t0).count();
+        }
+
         std::vector<int> probe_ids;
         std::vector<std::vector<DocId>> l0_ids(1), l1_ids(1), l2_ids(1);
         std::vector<std::vector<float>> l0_scores(1), l1_scores(1), l2_scores(1);
         // 0 = no results, 1 = satisfied by L0 only, 2 = satisfied after L1, 3 = needed L2
-        std::vector<int> stage(q_rows, 0);
-
-        // Profile accumulators (only populated when profiling is enabled).
-        double p_probe_ms = 0, p_l0_ms = 0, p_l1_ms = 0;
+        std::vector<int>   stage(q_rows, 0);
+        // k-th distance at the point of early exit for each query (inf if no early exit).
+        // Used by the background calibration path to compute r = true_kth / early_kth.
+        std::vector<float> early_exit_kths(q_rows, std::numeric_limits<float>::infinity());
         double p_l2_gpu_ms = 0, p_l2_cpu_ms = 0, p_merge_ms = 0;
         size_t p_l0_exits = 0, p_l1_exits = 0;
         size_t p_l2_gpu_clusters = 0, p_l2_cpu_clusters = 0;
@@ -769,23 +773,26 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             const float* qptr = queries + qi * dim_sz;
             probe_ids.clear();
 
-            {
-                const auto t0 = profiling ? clock::now() : clock::time_point{};
-                if (l2.index)
-                    l2.index->get_probe_ids(qptr, nprobe, probe_ids);
-                if (profiling) p_probe_ms += fms(clock::now() - t0).count();
-            }
+            probe_ids = all_probe_ids[qi];
             if (probe_ids.empty()) continue;
 
             // Stage 1: search L0 only.
+            // L0 uses query-centric cluster IDs (same space as L1, independent of L2).
+            // Must use search_nprobe over L0's own centroids, NOT L2 probe_ids.
             l0_ids[0].clear(); l0_scores[0].clear();
             l1_ids[0].clear(); l1_scores[0].clear();
             l2_ids[0].clear(); l2_scores[0].clear();
 
             {
                 const auto t0 = profiling ? clock::now() : clock::time_point{};
-                if (l0.index)
-                    l0.index->search_on(probe_ids, qptr, 1, k, l0_ids, l0_scores);
+                if (l0.index) {
+                    const int l0_nlist = l0.index->nlist();
+                    const int l0_nprobe_eff = (cache_config_.l0_nprobe > 0)
+                                                  ? cache_config_.l0_nprobe
+                                                  : std::min(nprobe, l0_nlist);
+                    if (l0_nprobe_eff > 0)
+                        l0.index->search_nprobe(qptr, 1, k, l0_nprobe_eff, l0_ids, l0_scores);
+                }
                 if (profiling) p_l0_ms += fms(clock::now() - t0).count();
             }
 
@@ -793,7 +800,25 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             std::vector<DocId> merged_ids;
             std::vector<float> merged_scores;
 
-            if (has_threshold && !l0_scores[0].empty()) {
+            if (m3_verbose) {
+                const float l0_kth = l0_scores[0].empty()
+                    ? std::numeric_limits<float>::infinity()
+                    : kth_score_vec(l0_scores[0]);
+                fprintf(stderr,
+                    "[M3:search qi=%zu] L0_clusters=%d L0_vecs_returned=%zu "
+                    "L0_kth=%.4f  threshold=%s(%.4f)  "
+                    "has_threshold=%s  dagent=%.4f\n",
+                    qi,
+                    l0.index ? l0.index->nlist() : 0,
+                    l0_ids[0].size(),
+                    l0_kth,
+                    has_threshold ? "active" : "inactive",
+                    search_threshold,
+                    has_threshold ? "yes" : "no",
+                    dagent_);
+            }
+
+            if (has_threshold && (int)l0_scores[0].size() >= k) {
                 float ks = kth_score_vec(l0_scores[0]);
                 if (ks <= search_threshold) {
                     // L0 alone is good enough; no need to touch L1/L2.
@@ -801,6 +826,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     merged_scores = l0_scores[0];
                     satisfied = true;
                     stage[qi] = 1;
+                    early_exit_kths[qi] = ks;
                     if (profiling) ++p_l0_exits;
                 }
             }
@@ -812,11 +838,11 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             if (!satisfied && l1.index) {
                 {
                     const auto t0 = profiling ? clock::now() : clock::time_point{};
-                    const int l1_nprobe = (cache_config_.l1_nprobe > 0)
-                                              ? cache_config_.l1_nprobe
-                                              : l1.index->nlist();  // 0 → scan all
-                    if (l1_nprobe > 0)
-                        l1.index->search_nprobe(qptr, 1, k, l1_nprobe, l1_ids, l1_scores);
+                    const int l1_nprobe_eff = (cache_config_.l1_nprobe > 0)
+                                                  ? cache_config_.l1_nprobe
+                                                  : std::min(nprobe, l1.index->nlist());
+                    if (l1_nprobe_eff > 0)
+                        l1.index->search_nprobe(qptr, 1, k, l1_nprobe_eff, l1_ids, l1_scores);
                     if (profiling) p_l1_ms += fms(clock::now() - t0).count();
                 }
                 {
@@ -832,6 +858,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     if (ks <= search_threshold) {
                         satisfied = true;
                         stage[qi] = 2;
+                        early_exit_kths[qi] = ks;
                         if (profiling) ++p_l1_exits;
                     }
                 }
@@ -919,19 +946,21 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                 float kth = out_scores[qi].empty() ? -1.f
                           : ((int)out_scores[qi].size() >= k ? out_scores[qi][static_cast<size_t>(k-1)]
                                                              : out_scores[qi].back());
-                float cur_dagent, cur_thresh;
+                float cur_dagent, cur_thresh, cur_alpha_et;
                 {
                     std::lock_guard<std::mutex> dlk(dagent_mu_);
-                    cur_dagent = dagent_;
-                    cur_thresh = (cache_config_.alpha_et > 0.f && dagent_ > 0.f)
-                                     ? cache_config_.alpha_et * dagent_
-                                     : cfg_.search_threshold;
+                    std::lock_guard<std::mutex> alk(alpha_et_mu_);
+                    cur_dagent   = dagent_;
+                    cur_alpha_et = alpha_et_dynamic_;
+                    cur_thresh   = (cur_alpha_et > 0.f && cur_dagent > 0.f)
+                                       ? cur_alpha_et * cur_dagent
+                                       : cfg_.search_threshold;
                 }
                 fprintf(stderr,
                         "[M3:search] qi=%zu  stage=%-22s  kth=%.4f  "
                         "thresh=%.4f (αet=%.2f × dagent=%.4f)  results=%zu\n",
                         qi, sname, kth, cur_thresh,
-                        cache_config_.alpha_et, cur_dagent,
+                        cur_alpha_et, cur_dagent,
                         out_ids[qi].size());
             }
         }
@@ -957,9 +986,6 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     if (it == doc_id_to_cid_.end()) continue;
                     // Always update cluster-level access time so demotion logic works.
                     record_access_(it->second);
-                    // If satisfied by L0 alone (stage 1), skip promotion (already in hottest tier).
-                    if (st == 1) continue;
-                    promote_vector_neighborhood_(doc_id);  // L0 only
                 }
                 // L1: per-query promotion — top-k' results form one new query-centric cluster.
                 if (st != 1 && !out_ids[qi].empty()) {
@@ -969,20 +995,126 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             }
         }
 
-        // Emit one profile line per batch — includes promotion since it runs on this thread.
+        // Compute true_kth_avg: mean k-th distance from queries that reached L2.
+        // Used to detect dagent drift when alpha_et is tuned aggressively.
+        float p_true_kth_avg = -1.f;
         if (profiling) {
-            const double p_promo_ms = fms(clock::now() - t_promo_start).count();
-            const double total_ms   = fms(clock::now() - t_search_start).count();
-            M3Profiler::instance().log_search_batch(
+            float kth_sum = 0.f; int kth_n = 0;
+            for (size_t qi = 0; qi < q_rows; ++qi) {
+                if (stage[qi] == 3 && !out_scores[qi].empty()) {
+                    const auto& sc = out_scores[qi];
+                    kth_sum += ((int)sc.size() >= k) ? sc[static_cast<size_t>(k-1)] : sc.back();
+                    ++kth_n;
+                }
+            }
+            if (kth_n > 0) p_true_kth_avg = kth_sum / static_cast<float>(kth_n);
+        }
+        // Timing for promotion (runs on this thread, included in total_ms).
+        const double p_promo_ms = profiling ? fms(clock::now() - t_promo_start).count() : 0.0;
+        const double p_total_ms = profiling ? fms(clock::now() - t_search_start).count() : 0.0;
+        // Update dagent_ rolling average.
+        // cache_level_k: use all queries regardless of stage.
+        // true_k: use only full-search (stage==3) queries; early-exit queries are skipped
+        //         here — ground truth is injected by the background calibration path instead.
+        if (cache_config_.dagent_mode == DagentUpdateMode::cache_level_k) {
+            update_dagent_(out_scores, k);
+        } else {
+            std::vector<std::vector<float>> full_scores;
+            full_scores.reserve(q_rows);
+            for (size_t qi = 0; qi < q_rows; ++qi)
+                if (stage[qi] == 3) full_scores.push_back(out_scores[qi]);
+            if (!full_scores.empty())
+                update_dagent_(full_scores, k);
+        }
+
+        // Background calibration: every calibration_interval ops, when at least one query
+        // exited early, dispatch a full L0→L1→L2 search for one sampled query.
+        // The result is used to compute r = true_kth / early_kth and adapt alpha_et_dynamic_.
+        // In true_k mode the true k-th distance is also fed into dagent_.
+        const uint64_t op = search_op_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (cache_config_.calibration_interval > 0
+            && (op % cache_config_.calibration_interval) == 0) {
+
+            // Find the first query that had an early exit this batch.
+            int qi_sample = -1;
+            for (size_t qi = 0; qi < q_rows; ++qi) {
+                if (stage[qi] == 1 || stage[qi] == 2) { qi_sample = (int)qi; break; }
+            }
+
+            if (qi_sample >= 0) {
+                // Capture everything the background thread needs by value.
+                const float early_kth_sample = early_exit_kths[qi_sample];
+                std::vector<float> qvec(queries + qi_sample * dim_sz,
+                                        queries + qi_sample * dim_sz + dim_sz);
+                Layer l0_snap = l0, l1_snap = l1, l2_snap = l2;
+                const int nprobe_snap = nprobe;
+                const int k_snap     = k;
+                const bool true_k_mode =
+                    (cache_config_.dagent_mode == DagentUpdateMode::true_k);
+
+                (void)std::async(std::launch::async,
+                    [this, qvec = std::move(qvec), early_kth_sample,
+                     l0_snap = std::move(l0_snap), l1_snap = std::move(l1_snap),
+                     l2_snap = std::move(l2_snap),
+                     nprobe_snap, k_snap, true_k_mode]() {
+
+                        std::vector<DocId> full_ids;
+                        std::vector<float> full_scores;
+                        search_one_full_(qvec.data(), k_snap, nprobe_snap,
+                                         l0_snap, l1_snap, l2_snap,
+                                         full_ids, full_scores);
+
+                        if (full_scores.empty()) return;
+
+                        const float true_kth = ((int)full_scores.size() >= k_snap)
+                            ? full_scores[static_cast<size_t>(k_snap - 1)]
+                            : full_scores.back();
+
+                        // r = true_kth / early_kth ∈ (0, 1]:
+                        //   r ≈ 1 → early exit was accurate
+                        //   r << 1 → full search found closer results; early exit too aggressive
+                        if (early_kth_sample > 0.f) {
+                            const float r = true_kth / early_kth_sample;
+                            update_alpha_et_(r);
+                        }
+
+                        if (true_k_mode)
+                            update_dagent_single_(true_kth);
+                    });
+            }
+        }
+
+        // Combined search + cache stats CSV row.
+        if (profiling) {
+            int l0_live = 0, l1_live = 0;
+            size_t l0_total = 0, l1_total = 0;
+            {
+                std::shared_lock lk(topo_mu_);
+                l0_live = l0_.index ? l0_.index->live_nlist() : 0;
+                l1_live = l1_.index ? l1_.index->live_nlist() : 0;
+                const int l0_slots = l0_.index ? l0_.index->nlist() : 0;
+                const int l1_slots = l1_.index ? l1_.index->nlist() : 0;
+                for (int c = 0; c < l0_slots; ++c) l0_total += l0_.index->cluster_live_size(c);
+                for (int c = 0; c < l1_slots; ++c) l1_total += l1_.index->cluster_live_size(c);
+            }
+            float cur_dagent, cur_alpha_et;
+            {
+                std::lock_guard<std::mutex> dlk(dagent_mu_);
+                std::lock_guard<std::mutex> alk(alpha_et_mu_);
+                cur_dagent   = dagent_;
+                cur_alpha_et = alpha_et_dynamic_;
+            }
+            M3Profiler::instance().log_search_row(
                 q_rows,
                 p_probe_ms, p_l0_ms, p_l0_exits,
                 p_l1_ms,    p_l1_exits,
                 p_l2_gpu_clusters, p_l2_cpu_clusters,
                 p_l2_gpu_ms, p_l2_cpu_ms,
-                p_merge_ms, p_promo_ms, total_ms);
+                p_merge_ms, p_promo_ms, p_total_ms,
+                l0_live, l0_total,
+                l1_live, l1_total,
+                cur_dagent, cur_alpha_et, p_true_kth_avg);
         }
-        // Update dagent rolling average with this batch so the next call can use αet·dagent.
-        update_dagent_(out_scores, k);
         return;
     }
 
@@ -1012,8 +1144,9 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
     bool has_threshold;
     {
         std::lock_guard<std::mutex> dlk(dagent_mu_);
-        if (cache_config_.alpha_et > 0.f && dagent_ > 0.f) {
-            search_threshold = cache_config_.alpha_et * dagent_;
+        std::lock_guard<std::mutex> alk(alpha_et_mu_);
+        if (alpha_et_dynamic_ > 0.f && dagent_ > 0.f) {
+            search_threshold = alpha_et_dynamic_ * dagent_;
             has_threshold = true;
         } else {
             search_threshold = cfg_.search_threshold;
@@ -1249,68 +1382,58 @@ void MultiLevelIndex::maintenance_pass() {
         }
     }
 
-    // ===== 4) Recompute live vector counts for L0 (L1 has its own topology) =====
-    std::vector<size_t> l0_counts(nlist, 0);
-    if (l0_idx) {
-        const int n0 = l0_idx->nlist();
-        const int limit = std::min<int>(static_cast<int>(nlist), n0);
-        for (int cid = 0; cid < limit; ++cid) {
-            l0_counts[static_cast<size_t>(cid)] = l0_idx->cluster_live_size(cid);
-        }
-    }
-
-    // ===== 5) L0 cluster-count demotion (LRU, based on metadata) =====
-    std::vector<uint8_t> removed_l0(nlist, 0);
+    // ===== 5) L0 + L1 cluster-count demotion (LRU, keyed by shared L1 cluster IDs) =====
+    // L0 and L1 share the same query-centric cluster ID space. Eviction is driven by
+    // l1_cluster_access_time_ for both layers. L0 is a subset of L1, so when an L1
+    // cluster is evicted it is also removed from L0.
     const int l0_max_clusters = cache_config_.l0_max_clusters;
     const int l1_max_clusters = cache_config_.l1_max_clusters;
+    {
+        std::lock_guard<std::mutex> lk(l1_cache_mu_);
 
-    if (l0_idx && l0_max_clusters > 0) {
-        std::vector<std::pair<uint64_t, int>> by_time;
-        by_time.reserve(nlist);
-        for (size_t cid = 0; cid < nlist; ++cid) {
-            if (l0_counts[cid] > 0)
-                by_time.emplace_back(meta_snap[cid].last_access_time, static_cast<int>(cid));
-        }
-        int excess = static_cast<int>(by_time.size()) - l0_max_clusters;
-        if (m3_verbose) {
-            fprintf(stderr,
-                    "[M3:maint] cluster-count check  L0: active_clusters=%d  max=%d  "
-                    "excess_to_demote=%d\n",
-                    (int)by_time.size(), l0_max_clusters, std::max(0, excess));
-        }
-        if (excess > 0) {
-            std::sort(by_time.begin(), by_time.end());
-            for (int i = 0; i < excess; ++i) {
-                int cid = by_time[static_cast<size_t>(i)].second;
-                l0_idx->remove_cluster(cid);
-                removed_l0[static_cast<size_t>(cid)] = 1;
-                l0_counts[static_cast<size_t>(cid)] = 0;
-                if (m3_verbose) {
-                    fprintf(stderr,
-                            "[M3:maint] cluster-count demotion  L0 cid=%d removed (LRU)\n", cid);
+        // L0 cluster-count demotion: evict oldest L0 clusters (not necessarily L1).
+        if (l0_idx && l0_max_clusters > 0) {
+            std::vector<std::pair<uint64_t, int>> by_time;
+            by_time.reserve(l1_cluster_access_time_.size());
+            for (const auto& [cid, t] : l1_cluster_access_time_) {
+                if (l0_idx->cluster_live_size(cid) > 0)
+                    by_time.emplace_back(t, cid);
+            }
+            int excess = static_cast<int>(by_time.size()) - l0_max_clusters;
+            if (m3_verbose) {
+                fprintf(stderr,
+                        "[M3:maint] cluster-count check  L0: active=%d  max=%d  excess=%d\n",
+                        (int)by_time.size(), l0_max_clusters, std::max(0, excess));
+            }
+            if (excess > 0) {
+                std::sort(by_time.begin(), by_time.end());
+                for (int i = 0; i < excess; ++i) {
+                    int cid = by_time[static_cast<size_t>(i)].second;
+                    l0_idx->remove_cluster(cid);
+                    if (m3_verbose)
+                        fprintf(stderr,
+                                "[M3:maint] cluster-count demotion  L0 cid=%d removed (LRU)\n", cid);
                 }
             }
         }
-    }
 
-    // ===== 5b) L1 cluster-count demotion (LRU, based on l1_cluster_access_time_) =====
-    // L1 now has its own query-centric cluster topology; evict by LRU access time.
-    if (l1_idx && l1_max_clusters > 0) {
-        std::lock_guard<std::mutex> lk(l1_cache_mu_);
-        while (static_cast<int>(l1_cluster_access_time_.size()) > l1_max_clusters) {
-            auto lru_it = std::min_element(
-                l1_cluster_access_time_.begin(), l1_cluster_access_time_.end(),
-                [](const auto& a, const auto& b) { return a.second < b.second; });
-            int lru_cid = lru_it->first;
-            std::vector<DocId> evicted_ids;
-            std::vector<float> evicted_vecs;
-            l1_idx->export_cluster_live(lru_cid, evicted_ids, evicted_vecs);
-            for (DocId id : evicted_ids) l1_cached_ids_.erase(id);
-            l1_idx->remove_cluster(lru_cid);
-            l1_cluster_access_time_.erase(lru_it);
-            if (m3_verbose) {
-                fprintf(stderr,
-                        "[M3:maint] cluster-count demotion  L1 cid=%d removed (LRU)\n", lru_cid);
+        // L1 cluster-count demotion: evict oldest L1 clusters, also remove from L0.
+        if (l1_idx && l1_max_clusters > 0) {
+            while (static_cast<int>(l1_cluster_access_time_.size()) > l1_max_clusters) {
+                auto lru_it = std::min_element(
+                    l1_cluster_access_time_.begin(), l1_cluster_access_time_.end(),
+                    [](const auto& a, const auto& b) { return a.second < b.second; });
+                int lru_cid = lru_it->first;
+                std::vector<DocId> evicted_ids;
+                std::vector<float> evicted_vecs;
+                l1_idx->export_cluster_live(lru_cid, evicted_ids, evicted_vecs);
+                for (DocId id : evicted_ids) { l1_cached_ids_.erase(id); doc_id_to_l1_cid_.erase(id); }
+                l1_idx->remove_cluster(lru_cid);
+                if (l0_idx) l0_idx->remove_cluster(lru_cid);
+                l1_cluster_access_time_.erase(lru_it);
+                if (m3_verbose)
+                    fprintf(stderr,
+                            "[M3:maint] cluster-count demotion  L1+L0 cid=%d removed (LRU)\n", lru_cid);
             }
         }
     }
@@ -1321,27 +1444,8 @@ void MultiLevelIndex::maintenance_pass() {
             std::chrono::steady_clock::now().time_since_epoch()).count());
     const uint64_t cold = cache_config_.cold_time_ns;
 
-    // L0: cold demotion by L2-cluster-aligned metadata.
-    for (size_t cid = 0; cid < nlist; ++cid) {
-        const ClusterMetadata& m = meta_snap[cid];
-        const uint64_t elapsed = (now_ns >= m.last_access_time)
-                                     ? (now_ns - m.last_access_time) : 0;
-        if (elapsed <= cold) continue;
-        if (l0_idx && l0_counts[cid] > 0) {
-            l0_idx->remove_cluster(static_cast<int>(cid));
-            removed_l0[cid] = 1;
-            l0_counts[cid] = 0;
-            if (m3_verbose) {
-                fprintf(stderr,
-                        "[M3:maint] cold-cluster demotion  L0 cid=%zu  "
-                        "(elapsed=%.3fs > cold_threshold=%.3fs)\n",
-                        cid, static_cast<double>(elapsed) / 1e9,
-                        static_cast<double>(cold) / 1e9);
-            }
-        }
-    }
-
-    // L1: cold demotion by l1_cluster_access_time_ (independent of L2 cluster IDs).
+    // L0 + L1: cold demotion by l1_cluster_access_time_ (shared cluster ID space).
+    // Removing an L1 cluster also removes it from L0.
     if (l1_idx) {
         std::lock_guard<std::mutex> lk(l1_cache_mu_);
         std::vector<int> cold_cids;
@@ -1353,36 +1457,124 @@ void MultiLevelIndex::maintenance_pass() {
             std::vector<DocId> evicted_ids;
             std::vector<float> evicted_vecs;
             l1_idx->export_cluster_live(cid, evicted_ids, evicted_vecs);
-            for (DocId id : evicted_ids) l1_cached_ids_.erase(id);
+            for (DocId id : evicted_ids) { l1_cached_ids_.erase(id); doc_id_to_l1_cid_.erase(id); }
             l1_idx->remove_cluster(cid);
+            if (l0_idx) l0_idx->remove_cluster(cid);
             l1_cluster_access_time_.erase(cid);
             if (m3_verbose) {
                 fprintf(stderr,
-                        "[M3:maint] cold-cluster demotion  L1 cid=%d removed\n", cid);
+                        "[M3:maint] cold-cluster demotion  L1+L0 cid=%d removed\n", cid);
             }
         }
     }
 
-    // ===== 7) Apply L0 metadata updates under meta_mu_ =====
+}
+
+MultiLevelIndex::CacheStats MultiLevelIndex::get_cache_stats() const {
+    CacheStats s;
     {
-        std::lock_guard<std::mutex> ml(meta_mu_);
-        if (metadata_.size() != nlist) return; // topology changed concurrently
-        for (size_t cid = 0; cid < nlist; ++cid) {
-            ClusterMetadata& m = metadata_[cid];
-            if (removed_l0[cid]) {
-                m.in_l0 = false;
-                m.l0_vector_count = 0;
-            } else {
-                m.l0_vector_count = l0_counts[cid];
-            }
-            // in_l1 / l1_vector_count are no longer tracked per-L2-cluster
-            // since L1 has its own query-centric topology.
+        std::shared_lock lk(topo_mu_);
+        s.l0_clusters = l0_.index ? l0_.index->live_nlist() : 0;
+        s.l1_clusters = l1_.index ? l1_.index->live_nlist() : 0;
+        // Iterate all slots (nlist()) for vec/overlap counting: invalid slots
+        // return 0 from cluster_live_size and empty from export_cluster_live.
+        const int l0_slots = l0_.index ? l0_.index->nlist() : 0;
+        const int l1_slots = l1_.index ? l1_.index->nlist() : 0;
+        for (int c = 0; c < l0_slots; ++c)
+            s.l0_total_vecs += l0_.index->cluster_live_size(c);
+        for (int c = 0; c < l1_slots; ++c)
+            s.l1_total_vecs += l1_.index->cluster_live_size(c);
+        // Overlap: same cluster ID, doc ID present in both layers.
+        for (int c = 0; c < l0_slots; ++c) {
+            std::vector<DocId> docs; std::vector<float> vecs;
+            l0_.index->export_cluster_live(c, docs, vecs);
+            for (DocId id : docs)
+                if (l1_.index && l1_.index->cluster_get_vector(c, id)) ++s.l0_l1_overlap;
         }
     }
+    {
+        std::lock_guard<std::mutex> clk(l1_cache_mu_);
+        s.l1_dedup_set_size = l1_cached_ids_.size();
+    }
+    {
+        std::lock_guard<std::mutex> dlk(dagent_mu_);
+        std::lock_guard<std::mutex> alk(alpha_et_mu_);
+        s.dagent = dagent_;
+        s.dynamic_threshold = alpha_et_dynamic_ * dagent_;
+    }
+    return s;
+}
+
+void MultiLevelIndex::update_dagent_single_(float kth) const {
+    std::lock_guard<std::mutex> dlk(dagent_mu_);
+    // alpha_et_mu_ acquired after dagent_mu_ — maintain consistent lock order everywhere.
+    std::lock_guard<std::mutex> alk(alpha_et_mu_);
+    const int win = cache_config_.dagent_window > 0 ? cache_config_.dagent_window : 20;
+    dagent_history_.push_back(kth);
+    while ((int)dagent_history_.size() > win)
+        dagent_history_.pop_front();
+    float sum = 0.f;
+    for (float d : dagent_history_) sum += d;
+    dagent_ = sum / static_cast<float>(dagent_history_.size());
+}
+
+void MultiLevelIndex::update_alpha_et_(float r) const {
+    if (cache_config_.alpha_et_adapt_rate <= 0.f) return;
+    std::lock_guard<std::mutex> lk(alpha_et_mu_);
+    // EMA toward the observed quality ratio r = true_kth / early_kth ∈ (0, 1].
+    // r ≈ 1: early exit was accurate → αet nudges up (more aggressive).
+    // r << 1: full search found much closer results → αet nudges down (more conservative).
+    alpha_et_dynamic_ += cache_config_.alpha_et_adapt_rate * (r - alpha_et_dynamic_);
+    // Clamp to [0.3, 1.0] — consistent with paper's αet = 0.6–0.8 with headroom.
+    if (alpha_et_dynamic_ < 0.3f) alpha_et_dynamic_ = 0.3f;
+    if (alpha_et_dynamic_ > 1.0f) alpha_et_dynamic_ = 1.0f;
+    if (m3_verbose) {
+        fprintf(stderr,
+                "[M3:alpha_et] r=%.4f  alpha_et_dynamic=%.4f\n",
+                r, alpha_et_dynamic_);
+    }
+}
+
+void MultiLevelIndex::search_one_full_(const float* qptr, int k, int nprobe,
+                                       const Layer& l0, const Layer& l1, const Layer& l2,
+                                       std::vector<DocId>& out_ids,
+                                       std::vector<float>& out_scores) const {
+    // Full L0→L1→L2 search with no early exit and no side-effects (no dagent_/alpha_et_
+    // updates, no promotion, no calibration dispatch). Used by background calibration only.
+    std::vector<std::vector<DocId>> ids0(1), ids1(1), ids2(1);
+    std::vector<std::vector<float>> sc0(1), sc1(1), sc2(1);
+
+    if (l0.index) {
+        const int l0_nlist = l0.index->nlist();
+        const int l0_nprobe_eff = (cache_config_.l0_nprobe > 0)
+                                      ? cache_config_.l0_nprobe
+                                      : std::min(nprobe, l0_nlist);
+        if (l0_nprobe_eff > 0)
+            l0.index->search_nprobe(qptr, 1, k, l0_nprobe_eff, ids0, sc0);
+    }
+    if (l1.index) {
+        const int l1_nprobe_eff = (cache_config_.l1_nprobe > 0)
+                                      ? cache_config_.l1_nprobe
+                                      : std::min(nprobe, l1.index->nlist());
+        if (l1_nprobe_eff > 0)
+            l1.index->search_nprobe(qptr, 1, k, l1_nprobe_eff, ids1, sc1);
+    }
+    if (l2.index) {
+        std::vector<int> probe_ids;
+        l2.index->get_probe_ids(qptr, nprobe, probe_ids);
+        if (!probe_ids.empty())
+            l2.index->search_on(probe_ids, qptr, 1, k, ids2, sc2);
+    }
+
+    std::vector<std::vector<DocId>> per_ids  = {ids0[0], ids1[0], ids2[0]};
+    std::vector<std::vector<float>> per_sc   = {sc0[0],  sc1[0],  sc2[0]};
+    merge_levels_(per_ids, per_sc, k, out_ids, out_scores);
 }
 
 void MultiLevelIndex::update_dagent_(const std::vector<std::vector<float>>& out_scores, int k) const {
     std::lock_guard<std::mutex> dlk(dagent_mu_);
+    // alpha_et_mu_ acquired after dagent_mu_ — maintain consistent lock order everywhere.
+    std::lock_guard<std::mutex> alk(alpha_et_mu_);
     const int win = cache_config_.dagent_window > 0 ? cache_config_.dagent_window : 20;
     for (const auto& s : out_scores) {
         if (s.empty()) continue;
@@ -1401,8 +1593,8 @@ void MultiLevelIndex::update_dagent_(const std::vector<std::vector<float>>& out_
                 "[M3:dagent] updated dagent=%.4f  window=%d/%d  "
                 "-> next dynamic threshold = αet(%.2f) × dagent = %.4f\n",
                 dagent_, (int)dagent_history_.size(), cache_config_.dagent_window,
-                cache_config_.alpha_et,
-                cache_config_.alpha_et * dagent_);
+                alpha_et_dynamic_,
+                alpha_et_dynamic_ * dagent_);
     }
 }
 
@@ -1426,44 +1618,6 @@ void MultiLevelIndex::record_access_(int cid) const {
     ++m.access_count;
 }
 
-void MultiLevelIndex::promote_vector_neighborhood_(DocId doc_id) const {
-    // L0 only: insert the directly accessed vector (temporal locality).
-    // L1 is populated per-query by promote_query_to_l1_(), not per-result-vector.
-    auto it = doc_id_to_cid_.find(doc_id);
-    if (it == doc_id_to_cid_.end()) return;
-    const int cid = it->second;
-    if (!l2_.index || static_cast<size_t>(cid) >= metadata_.size()) return;
-
-    const float* vec = l2_.index->cluster_get_vector(cid, doc_id);
-    if (!vec) return;
-
-    const size_t dim_sz = static_cast<size_t>(dim_);
-    const size_t nlist = l2_.centroids.size() / dim_sz;
-    if (static_cast<size_t>(cid) >= nlist) return;
-
-    std::vector<float> cent(l2_.centroids.begin() + cid * dim_sz,
-                            l2_.centroids.begin() + (cid + 1) * dim_sz);
-
-    if (l0_.index) {
-        l0_.index->ensure_cluster(cid, cent);
-        l0_.index->update_batch(cid, &doc_id, vec, 1, /*insert_if_absent=*/true);
-    }
-
-    if (m3_verbose) {
-        fprintf(stderr,
-                "[M3:promote] doc_id=%ld  cid=%d  L0 <- 1 vec\n",
-                (long)doc_id, cid);
-    }
-
-    std::lock_guard<std::mutex> ml(meta_mu_);
-    if (static_cast<size_t>(cid) < metadata_.size()) {
-        ClusterMetadata& m = metadata_[static_cast<size_t>(cid)];
-        m.last_access_time = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-        if (l0_.index) { m.in_l0 = true; m.l0_vector_count = l0_.index->cluster_live_size(cid); }
-    }
-}
 
 void MultiLevelIndex::promote_query_to_l1_(const float* query,
                                             const std::vector<DocId>& result_ids,
@@ -1503,8 +1657,16 @@ void MultiLevelIndex::promote_query_to_l1_(const float* query,
     }
     if (new_ids.empty()) return;
 
-    // Step 3: evict LRU L1 cluster(s) if at capacity, then create new query-centric cluster.
+    // Step 3: evict + create + register atomically so concurrent promotions cannot
+    // each pass the eviction check before any of them has registered their new cluster.
+    // (Race: with two separate lock acquisitions, batch_size threads can all sneak past
+    //  the "size >= l1_max" guard before any of them updates l1_cluster_access_time_.)
     const int l1_max = cache_config_.l1_max_clusters;
+    std::vector<float> query_cent(query, query + dim_sz);
+    int l1_cid = -1;
+    const uint64_t now_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
     {
         std::lock_guard<std::mutex> lk(l1_cache_mu_);
 
@@ -1520,40 +1682,51 @@ void MultiLevelIndex::promote_query_to_l1_(const float* query,
                 std::vector<DocId> evicted_ids;
                 std::vector<float> evicted_vecs;
                 l1_.index->export_cluster_live(lru_cid, evicted_ids, evicted_vecs);
-                for (DocId eid : evicted_ids) l1_cached_ids_.erase(eid);
+                for (DocId eid : evicted_ids) { l1_cached_ids_.erase(eid); doc_id_to_l1_cid_.erase(eid); }
                 l1_.index->remove_cluster(lru_cid);
+                if (l0_.index) l0_.index->remove_cluster(lru_cid);
                 l1_cluster_access_time_.erase(lru_it);
-                if (m3_verbose) {
-                    fprintf(stderr,
-                            "[M3:promote] L1 LRU evict cluster cid=%d\n", lru_cid);
-                }
             }
         }
 
         // Register new DocIds in dedup set.
         for (DocId id : new_ids) l1_cached_ids_.insert(id);
+
+        l1_cid = l1_.index->add_cluster(query_cent);
+        if (l1_cid >= 0) {
+            l1_cluster_access_time_[l1_cid] = now_ns;
+            for (DocId id : new_ids) doc_id_to_l1_cid_[id] = l1_cid;
+        }
     }
-
-    // Create new L1 cluster with centroid = query vector.
-    std::vector<float> query_cent(query, query + dim_sz);
-    int l1_cid = l1_.index->add_cluster(query_cent);
     if (l1_cid < 0) return;
-    l1_.index->add_batch(l1_cid, new_ids.data(), new_vecs.data(), new_ids.size());
 
-    // Record access time for future LRU eviction.
-    const uint64_t now_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-    {
-        std::lock_guard<std::mutex> lk(l1_cache_mu_);
-        l1_cluster_access_time_[l1_cid] = now_ns;
+    // Add vector data outside the lock — add_batch uses IVFIndex's internal mutex.
+    l1_.index->add_batch(l1_cid, new_ids.data(), new_vecs.data(), new_ids.size());
+    l1_.centroids.resize((static_cast<size_t>(l1_cid) + 1) * dim_sz, 0.0f);
+    std::copy(query_cent.begin(), query_cent.end(),
+              l1_.centroids.begin() + l1_cid * dim_sz);
+
+    // Populate L0 with the top-k'' subset using the same cluster ID.
+    if (l0_.index) {
+        int l0_k = cache_config_.l0_neighborhood_k;
+        if (l0_k <= 0) l0_k = 1;
+        const size_t n_l0 = std::min(static_cast<size_t>(l0_k), new_ids.size());
+        l0_.index->ensure_cluster(l1_cid, query_cent);
+        l0_.centroids.resize((static_cast<size_t>(l1_cid) + 1) * dim_sz, 0.0f);
+        std::copy(query_cent.begin(), query_cent.end(),
+                  l0_.centroids.begin() + l1_cid * dim_sz);
+        l0_.index->add_batch(l1_cid, new_ids.data(), new_vecs.data(), n_l0,
+                             /*allow_missing=*/true);
     }
 
     if (m3_verbose) {
         fprintf(stderr,
-                "[M3:promote] L1 query-cluster cid=%d  cached=%zu/%d (k')  "
-                "total_l1_clusters=%d\n",
-                l1_cid, new_ids.size(), l1_k, l1_.index->nlist());
+                "[M3:promote] L1 query-cluster cid=%d  l1_vecs=%zu/%d (k')  "
+                "l0_vecs=%zu/%d (k'')  total_l1_clusters=%d\n",
+                l1_cid, new_ids.size(), l1_k,
+                std::min(static_cast<size_t>(cache_config_.l0_neighborhood_k), new_ids.size()),
+                cache_config_.l0_neighborhood_k,
+                l1_.index->nlist());
     }
 }
 
@@ -1570,11 +1743,7 @@ void MultiLevelIndex::demote_cluster_(int cid) const {
     const uint64_t cold = cache_config_.cold_time_ns;
     const uint64_t elapsed = (now_ns >= m.last_access_time) ? (now_ns - m.last_access_time) : 0;
 
-    if (m.in_l0 && elapsed > cold && l0_.index) {
-        l0_.index->remove_cluster(cid);
-        m.in_l0 = false;
-        m.l0_vector_count = 0;
-    }
+    // L0/L1 cold demotion is handled via l1_cluster_access_time_ in run_maintenance_.
 }
 
 void MultiLevelIndex::run_vector_eviction_per_level_() const {
@@ -1604,11 +1773,7 @@ void MultiLevelIndex::run_vector_eviction_per_level_() const {
             }
         }
     }
-    std::lock_guard<std::mutex> ml(meta_mu_);
-    for (size_t cid = 0; cid < metadata_.size(); ++cid) {
-        if (l0_.index) metadata_[cid].l0_vector_count = l0_.index->cluster_live_size(static_cast<int>(cid));
-        if (l1_.index) metadata_[cid].l1_vector_count = l1_.index->cluster_live_size(static_cast<int>(cid));
-    }
+    // L0/L1 vector counts are no longer tracked in L2-indexed metadata.
 }
 
 void MultiLevelIndex::run_cluster_count_demotion_() const {
@@ -1617,40 +1782,7 @@ void MultiLevelIndex::run_cluster_count_demotion_() const {
     const int nlist = static_cast<int>(metadata_.size());
     std::vector<std::pair<uint64_t, int>> by_time;
     by_time.reserve(static_cast<size_t>(nlist));
-    if (l0_.index) {
-        by_time.clear();
-        for (int cid = 0; cid < nlist; ++cid) {
-            if (l0_.index->cluster_live_size(cid) > 0)
-                by_time.emplace_back(metadata_[static_cast<size_t>(cid)].last_access_time, cid);
-        }
-        int excess = static_cast<int>(by_time.size()) - cache_config_.l0_max_clusters;
-        if (excess > 0) {
-            std::sort(by_time.begin(), by_time.end());
-            for (int i = 0; i < excess; ++i) {
-                int cid = by_time[i].second;
-                l0_.index->remove_cluster(cid);
-                metadata_[static_cast<size_t>(cid)].in_l0 = false;
-                metadata_[static_cast<size_t>(cid)].l0_vector_count = 0;
-            }
-        }
-    }
-    if (l1_.index) {
-        by_time.clear();
-        for (int cid = 0; cid < nlist; ++cid) {
-            if (l1_.index->cluster_live_size(cid) > 0)
-                by_time.emplace_back(metadata_[static_cast<size_t>(cid)].last_access_time, cid);
-        }
-        int excess = static_cast<int>(by_time.size()) - cache_config_.l1_max_clusters;
-        if (excess > 0) {
-            std::sort(by_time.begin(), by_time.end());
-            for (int i = 0; i < excess; ++i) {
-                int cid = by_time[i].second;
-                l1_.index->remove_cluster(cid);
-                metadata_[static_cast<size_t>(cid)].in_l1 = false;
-                metadata_[static_cast<size_t>(cid)].l1_vector_count = 0;
-            }
-        }
-    }
+    // L0/L1 cluster-count demotion is handled via l1_cluster_access_time_ in run_maintenance_.
 }
 
 } // namespace m3

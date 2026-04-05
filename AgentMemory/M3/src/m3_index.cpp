@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <utility>
 #include <mutex>
+#include <cblas.h>
 
 namespace m3 {
 
@@ -232,6 +233,11 @@ void IVFIndex::set_centroid(int cluster_id, const std::vector<float>& centroid) 
 int IVFIndex::nlist() const {
     std::shared_lock lk(topo_mu_);
     return (int)clusters_.size();
+}
+
+int IVFIndex::live_nlist() const {
+    std::shared_lock lk(topo_mu_);
+    return (int)std::count(valid_.begin(), valid_.end(), true);
 }
 
 const float* IVFIndex::centroid_ptr(int cluster_id) const {
@@ -631,35 +637,106 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
         valid_snap = valid_;
     }
 
-    const int nlist = (int)clusters_snap.size();
-    if (nlist == 0) return;
+    const size_t D = static_cast<size_t>(dim_);
 
-    if (nprobe <= 0) nprobe = nlist;
-    const int real_nprobe = std::min(nprobe, nlist);
+    // Build a compact view of only live (valid) clusters so the BLAS GEMM
+    // operates on live_nlist centroids rather than all slots ever allocated.
+    // Ghost slots (removed clusters) inflate clusters_.size() but hold no data;
+    // skipping them keeps GEMM cost proportional to live cluster count.
+    std::vector<float> compact_centroids;
+    std::vector<int>   compact_to_orig;   // compact index → original cluster id
+    {
+        const size_t total_slots = clusters_snap.size();
+        compact_centroids.reserve(total_slots * D);
+        compact_to_orig.reserve(total_slots);
+        for (size_t ci = 0; ci < total_slots; ++ci) {
+            if (ci < valid_snap.size() && valid_snap[ci] && clusters_snap[ci]) {
+                compact_centroids.insert(compact_centroids.end(),
+                    centroids_snap.data() + ci * D,
+                    centroids_snap.data() + ci * D + D);
+                compact_to_orig.push_back((int)ci);
+            }
+        }
+    }
+    const int live_nlist = (int)compact_to_orig.size();
+    if (live_nlist == 0) return;
 
-    // Reusable buffer for selected cluster ids (per query)
-    std::vector<int> chosen;
-    chosen.reserve(real_nprobe);
+    if (nprobe <= 0) nprobe = live_nlist;
+    const int real_nprobe = std::min(nprobe, live_nlist);
 
-    // print cluster_snap for debug
-    // for (int ci = 0; ci < nlist; ++ci) {
-    //     auto c = clusters_snap[ci];
-    //     if (c) {
-    //         printf("Cluster %d: size=%zu live=%zu\n", ci, c->size(), c->live_size());
-    //     } else {
-    //         printf("Cluster %d: <null>\n", ci);
-    //     }
-    // }
+    // ---------------------------------------------------------------
+    // Batched centroid selection via BLAS sgemm over live clusters only.
+    //
+    // scores = alpha * Q_mat @ C_compact^T  (shape: Q × live_nlist)
+    //
+    // For IP/COSINE-normalized: score = -dot(q,c)  → alpha = -1
+    // For L2:  score = ||q||^2 - 2*dot(q,c) + ||c||^2  → alpha = -2
+    // ---------------------------------------------------------------
+    const size_t NL = static_cast<size_t>(live_nlist);
 
-    // return;
+    std::vector<float> scores_mat(q_rows * NL);
+
+    if (metric_ == Metric::L2) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)q_rows, live_nlist, dim_,
+                    -2.0f,
+                    queries,                    dim_,
+                    compact_centroids.data(),   dim_,
+                    0.0f,
+                    scores_mat.data(),          live_nlist);
+
+        std::vector<float> c_norms(NL);
+        for (size_t ci = 0; ci < NL; ++ci)
+            c_norms[ci] = cblas_sdot(dim_, compact_centroids.data() + ci * D, 1,
+                                           compact_centroids.data() + ci * D, 1);
+
+        for (size_t qi = 0; qi < q_rows; ++qi) {
+            const float* q = queries + qi * D;
+            float q_norm = cblas_sdot(dim_, q, 1, q, 1);
+            float* row   = scores_mat.data() + qi * NL;
+            for (size_t ci = 0; ci < NL; ++ci)
+                row[ci] += q_norm + c_norms[ci];
+        }
+    } else {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)q_rows, live_nlist, dim_,
+                    -1.0f,
+                    queries,                    dim_,
+                    compact_centroids.data(),   dim_,
+                    0.0f,
+                    scores_mat.data(),          live_nlist);
+        if (metric_ == Metric::COSINE && normalized_) {
+            for (float& s : scores_mat) s += 1.0f;
+        }
+    }
+
+    // Per-query: pick top-nprobe clusters and search them.
+    std::vector<std::pair<float, int>> row_tmp;
+    row_tmp.reserve(NL);
 
     for (size_t qi = 0; qi < q_rows; ++qi) {
-        const float* q = queries + qi * (size_t)dim_;
+        const float* q         = queries + qi * D;
+        const float* score_row = scores_mat.data() + qi * NL;
 
-        // 1) pick top-nprobe clusters by centroid distance (only valid)
-        chosen.clear();
-        select_nprobe_for_query(q, centroids_snap, valid_snap, real_nprobe, chosen);
-        // chosen.size() <= real_nprobe
+        // 1) pick top-nprobe compact indices by centroid distance
+        row_tmp.clear();
+        for (size_t ci = 0; ci < NL; ++ci)
+            row_tmp.emplace_back(score_row[ci], (int)ci);
+
+        std::vector<int> chosen;
+        chosen.reserve(real_nprobe);
+        if (real_nprobe >= (int)row_tmp.size()) {
+            std::sort(row_tmp.begin(), row_tmp.end(),
+                      [](const auto& a, const auto& b){ return a.first < b.first; });
+            for (auto& p : row_tmp) chosen.push_back(compact_to_orig[p.second]);
+        } else {
+            std::nth_element(row_tmp.begin(), row_tmp.begin() + real_nprobe, row_tmp.end(),
+                             [](const auto& a, const auto& b){ return a.first < b.first; });
+            row_tmp.resize(real_nprobe);
+            std::sort(row_tmp.begin(), row_tmp.end(),
+                      [](const auto& a, const auto& b){ return a.first < b.first; });
+            for (auto& p : row_tmp) chosen.push_back(compact_to_orig[p.second]);
+        }
 
         // print chosen for debug
         // printf("Query %zu: chosen clusters:", qi);
@@ -741,6 +818,104 @@ void IVFIndex::get_probe_ids(const float* query, int nprobe, std::vector<int>& o
         valid_snap = valid_;
     }
     select_nprobe_for_query(query, centroids_snap, valid_snap, nprobe, out_ids);
+}
+
+void IVFIndex::batch_get_probe_ids(const float* queries, size_t q_rows, int nprobe,
+                                    std::vector<std::vector<int>>& out_probe_ids) const {
+    out_probe_ids.assign(q_rows, {});
+    if (!queries || q_rows == 0 || nprobe <= 0) return;
+
+    std::vector<float> centroids_snap;
+    std::vector<bool>  valid_snap;
+    {
+        std::shared_lock lk(topo_mu_);
+        centroids_snap = centroids_;
+        valid_snap     = valid_;
+    }
+
+    const size_t D = static_cast<size_t>(dim_);
+
+    // Compact: skip ghost slots so sgemm cost scales with live clusters only.
+    std::vector<float> compact_centroids;
+    std::vector<int>   compact_to_orig;
+    {
+        const size_t total_slots = centroids_snap.size() / D;
+        compact_centroids.reserve(total_slots * D);
+        compact_to_orig.reserve(total_slots);
+        for (size_t ci = 0; ci < total_slots; ++ci) {
+            if (ci < valid_snap.size() && valid_snap[ci]) {
+                compact_centroids.insert(compact_centroids.end(),
+                    centroids_snap.data() + ci * D,
+                    centroids_snap.data() + ci * D + D);
+                compact_to_orig.push_back((int)ci);
+            }
+        }
+    }
+
+    const int live_nlist  = (int)compact_to_orig.size();
+    if (live_nlist == 0) return;
+    const int real_nprobe = std::min(nprobe, live_nlist);
+    const size_t NL       = static_cast<size_t>(live_nlist);
+
+    // One sgemm: scores[q_rows × NL]
+    std::vector<float> scores_mat(q_rows * NL);
+
+    if (metric_ == Metric::L2) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)q_rows, live_nlist, dim_,
+                    -2.0f,
+                    queries,                  dim_,
+                    compact_centroids.data(), dim_,
+                    0.0f,
+                    scores_mat.data(),        live_nlist);
+
+        std::vector<float> c_norms(NL);
+        for (size_t ci = 0; ci < NL; ++ci)
+            c_norms[ci] = cblas_sdot(dim_, compact_centroids.data() + ci * D, 1,
+                                           compact_centroids.data() + ci * D, 1);
+        for (size_t qi = 0; qi < q_rows; ++qi) {
+            float q_norm = cblas_sdot(dim_, queries + qi * D, 1, queries + qi * D, 1);
+            float* row   = scores_mat.data() + qi * NL;
+            for (size_t ci = 0; ci < NL; ++ci)
+                row[ci] += q_norm + c_norms[ci];
+        }
+    } else {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    (int)q_rows, live_nlist, dim_,
+                    -1.0f,
+                    queries,                  dim_,
+                    compact_centroids.data(), dim_,
+                    0.0f,
+                    scores_mat.data(),        live_nlist);
+        if (metric_ == Metric::COSINE && normalized_)
+            for (float& s : scores_mat) s += 1.0f;
+    }
+
+    // Per-query top-nprobe selection from the score matrix.
+    std::vector<std::pair<float, int>> row_tmp;
+    row_tmp.reserve(NL);
+
+    for (size_t qi = 0; qi < q_rows; ++qi) {
+        const float* score_row = scores_mat.data() + qi * NL;
+        row_tmp.clear();
+        for (size_t ci = 0; ci < NL; ++ci)
+            row_tmp.emplace_back(score_row[ci], (int)ci);
+
+        auto& chosen = out_probe_ids[qi];
+        chosen.reserve(real_nprobe);
+        if (real_nprobe >= (int)row_tmp.size()) {
+            std::sort(row_tmp.begin(), row_tmp.end(),
+                      [](const auto& a, const auto& b){ return a.first < b.first; });
+            for (auto& p : row_tmp) chosen.push_back(compact_to_orig[p.second]);
+        } else {
+            std::nth_element(row_tmp.begin(), row_tmp.begin() + real_nprobe, row_tmp.end(),
+                             [](const auto& a, const auto& b){ return a.first < b.first; });
+            row_tmp.resize(real_nprobe);
+            std::sort(row_tmp.begin(), row_tmp.end(),
+                      [](const auto& a, const auto& b){ return a.first < b.first; });
+            for (auto& p : row_tmp) chosen.push_back(compact_to_orig[p.second]);
+        }
+    }
 }
 
 void IVFIndex::search_within_cluster(int cluster_id, const float* query, int k,

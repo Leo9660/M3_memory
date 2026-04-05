@@ -21,6 +21,21 @@ class GpuCoordinator;
 // Cache configuration: thresholds for L0/L1 sizes, eviction,
 // promotion/demotion, and L1 neighborhood caching.
 // ================================================================
+
+// Controls which search results feed dagent_ (the rolling mean of k-th distances
+// used to compute the early-exit threshold αet × dagent_).
+//
+//   cache_level_k — dagent_ is updated from whatever level returned results
+//                   (L0, L1, or full L2). Reflects hot-path quality but is
+//                   biased low when early exit fires frequently.
+//
+//   true_k        — dagent_ is updated ONLY from full L0→L1→L2 searches
+//                   (either because early exit never fired, or via the
+//                   background calibration path). Keeps dagent_ anchored to
+//                   ground-truth distances but may go stale if early exit
+//                   fires on almost every query.
+enum class DagentUpdateMode { cache_level_k, true_k };
+
 struct CacheConfig {
     // L0 limits
     int l0_max_clusters = 16;
@@ -38,22 +53,51 @@ struct CacheConfig {
     uint64_t cold_time_ns = 60'000'000'000ULL;  // 60s in nanoseconds
 
     // k' for L1 promotion: top-k' results (across clusters) from a query are cached as one
-    // new query-centric L1 cluster. L0 still stores only the directly accessed vector.
+    // new query-centric L1 cluster.
     int l1_neighborhood_k = 20;
+
+    // k'' for L0 promotion: top-k'' subset of the L1 promotion set also written to L0
+    // using the same L1 cluster ID. Must be <= l1_neighborhood_k.
+    int l0_neighborhood_k = 5;
 
     // Max result vectors to promote per query (0 = all)
     int max_promote_per_query = 0;
 
+    // nprobe for L0 search over L0's own query-centric clusters.
+    // 0 (default) = use the runtime nprobe passed to search() (capped at l0 nlist).
+    // >0 = always search only the top-l0_nprobe L0 clusters by centroid distance.
+    int l0_nprobe = 0;
+
     // nprobe for L1 search over L1's own query-centric clusters.
-    // 0 (default) = linear scan all L1 clusters (recommended for small L1).
-    // >0 = search only the top-l1_nprobe L1 clusters by centroid distance.
+    // 0 (default) = use the runtime nprobe passed to search() (capped at l1 nlist).
+    // >0 = always search only the top-l1_nprobe L1 clusters by centroid distance.
     int l1_nprobe = 0;
 
-    // Early-termination: dynamic threshold = alpha_et * dagent.
+    // Early-termination: initial αet value. The live value (alpha_et_dynamic_) is
+    // initialised from this and then adapted at runtime when calibration is enabled.
     // Set to 0 to disable dynamic threshold and fall back to MultiLevelConfig::search_threshold.
     float alpha_et = 0.7f;
     // Rolling window size (number of recent queries) used to compute dagent.
     int dagent_window = 20;
+
+    // ---- αet calibration (background full-search verification) ----
+
+    // Controls which results feed dagent_. See DagentUpdateMode above.
+    DagentUpdateMode dagent_mode = DagentUpdateMode::cache_level_k;
+
+    // How often (in search-batch ops) to dispatch a background full-search to
+    // calibrate αet and (when dagent_mode == true_k) dagent_.
+    // 0 = disabled. Recommended starting value: 10.
+    uint64_t calibration_interval = 10;
+
+    // Learning rate for αet adaptation.
+    // alpha_et_dynamic_ is updated as an EMA toward the observed quality ratio r:
+    //   alpha_et_dynamic_ += adapt_rate * (r - alpha_et_dynamic_)
+    // where r = true_kth / early_kth ∈ (0, 1].
+    // Too high → αet oscillates on noisy single-sample calibration events.
+    // Too low  → adaptation barely responds to quality drift.
+    // Values to test: 0.01 (slow/stable), 0.05 (default), 0.1 (fast/noisy).
+    float alpha_et_adapt_rate = 0.05f;
 };
 
 // ================================================================
@@ -61,23 +105,20 @@ struct CacheConfig {
 // cluster-level promotion/demotion and to know which levels
 // contain this cluster.
 // ================================================================
+// Per-cluster metadata indexed by L2 cluster ID.
+// L0/L1 have their own independent query-centric topology and are not tracked here.
 struct ClusterMetadata {
-    bool in_l0 = false;
-    bool in_l1 = false;
     bool in_l2 = true;   // L2 always has the cluster once it exists
 
     uint64_t last_access_time = 0;
     uint64_t access_count = 0;
 
-    size_t l0_vector_count = 0;
-    size_t l1_vector_count = 0;
     size_t l2_vector_count = 0;
-
-    uint64_t l0_last_eviction_time = 0;
 };
 
-// L0 and L1 are IVFIndex with same nlist as L2; valid_[cid]=false and
-// remove_cluster(cid) indicate uncached/invalidated slots.
+// L0 and L1 share a query-centric cluster topology (same cluster IDs, independent of L2).
+// L0 holds a smaller subset of each L1 cluster (l0_neighborhood_k <= l1_neighborhood_k).
+// remove_cluster(cid) evicts a cluster from the respective layer.
 
 class L1Strategy {
 public:
@@ -116,7 +157,25 @@ public:
     void set_l0_centroids(const std::vector<float>& centroids);
     void set_l1_centroids(const std::vector<float>& centroids);
     void set_l2_centroids(const std::vector<float>& centroids);
-    void set_cache_config(CacheConfig cfg) { cache_config_ = std::move(cfg); }
+    void set_cache_config(CacheConfig cfg) {
+        cache_config_ = std::move(cfg);
+        // Re-sync live αet so the new config takes effect immediately.
+        std::lock_guard<std::mutex> lk(alpha_et_mu_);
+        alpha_et_dynamic_ = cache_config_.alpha_et;
+    }
+
+    // ---- cache diagnostics ----
+    struct CacheStats {
+        int    l0_clusters = 0;
+        size_t l0_total_vecs = 0;
+        int    l1_clusters = 0;
+        size_t l1_total_vecs = 0;
+        size_t l1_dedup_set_size = 0;  // doc IDs tracked in l1_cached_ids_
+        size_t l0_l1_overlap = 0;      // doc IDs present in both layers (same cluster ID)
+        float  dagent = 0.f;
+        float  dynamic_threshold = 0.f;
+    };
+    CacheStats get_cache_stats() const;
 
     // Wire in a GpuCoordinator so search/insert can route GPU-resident clusters
     // through the GPU tier. Pass nullptr to disable GPU routing.
@@ -232,9 +291,8 @@ private:
                        std::vector<DocId>& out_ids,
                        std::vector<float>& out_scores) const;
 
-    // Promotion: on access, promote single vector to L0 (temporal locality).
-    void promote_vector_neighborhood_(DocId doc_id) const;
-    // Promotion: per-query, cache top-k' results as a new query-centric L1 cluster.
+    // Promotion: per-query, cache top-k' results as a new query-centric L1 cluster,
+    // and top-k'' subset into L0 with the same cluster ID.
     void promote_query_to_l1_(const float* query,
                                const std::vector<DocId>& result_ids,
                                const std::vector<float>& result_scores) const;
@@ -246,14 +304,33 @@ private:
     // Update the dagent rolling average with the k-th distances from a completed search batch.
     void update_dagent_(const std::vector<std::vector<float>>& out_scores, int k) const;
 
+    // Feed a single k-th distance into the dagent_ rolling average.
+    // Used by the background calibration path.
+    void update_dagent_single_(float kth) const;
+
+    // Run a full L0→L1→L2 search for one query with no early exit and no
+    // calibration side-effects. Used exclusively by the background calibration thread.
+    // Layer snapshots are passed by value so the caller's shared-lock is not held
+    // across the async boundary.
+    void search_one_full_(const float* qptr, int k, int nprobe,
+                          const Layer& l0, const Layer& l1, const Layer& l2,
+                          std::vector<DocId>& out_ids,
+                          std::vector<float>& out_scores) const;
+
+    // Adjust alpha_et_dynamic_ given the quality ratio r = true_kth / early_kth.
+    // r ∈ (0, 1]: 1.0 = early exit was perfect; <1 = full search found closer results.
+    // Update rule: alpha_et_dynamic_ += adapt_rate * (r - alpha_et_dynamic_)
+    // Clamped to [0.3, 1.0] (consistent with the paper's αet = 0.6–0.8 range).
+    void update_alpha_et_(float r) const;
+
 private:
     const int    dim_;
     const Metric metric_;
     const bool   normalized_;
     MultiLevelConfig cfg_;
 
-    Layer l0_;
-    Layer l1_;
+    mutable Layer l0_;
+    mutable Layer l1_;
     Layer l2_;
     std::shared_ptr<L1Strategy> l1_strategy_;
 
@@ -271,13 +348,24 @@ private:
     mutable float             dagent_ = 0.0f;
     mutable std::mutex        dagent_mu_;            // protects dagent_history_ and dagent_
 
-    // L1 query-centric cluster tracking (new topology, independent of L2 cluster IDs).
+    // Live αet value — initialised from cache_config_.alpha_et and adapted at runtime
+    // by the background calibration path. Protected by alpha_et_mu_.
+    mutable float             alpha_et_dynamic_ = 0.7f;
+    mutable std::mutex        alpha_et_mu_;
+
+    // Counts search() calls (cache path only). Used to decide when to dispatch
+    // the next background calibration full-search.
+    mutable std::atomic<uint64_t> search_op_count_{0};
+
+    // L1/L0 query-centric cluster tracking (independent of L2 cluster IDs).
     // l1_cached_ids_: DocIds currently stored in L1 (for fast dedup on promotion).
     // l1_cluster_access_time_: L1 cluster_id → last access timestamp (for LRU eviction).
-    // l1_cache_mu_: protects both of the above.
-    mutable std::unordered_set<DocId>       l1_cached_ids_;
+    // doc_id_to_l1_cid_: DocId → L1 cluster ID (needed for in-place update of cached vectors).
+    // l1_cache_mu_: protects all of the above.
+    mutable std::unordered_set<DocId>         l1_cached_ids_;
     mutable std::unordered_map<int, uint64_t> l1_cluster_access_time_;
-    mutable std::mutex                      l1_cache_mu_;
+    mutable std::unordered_map<DocId, int>    doc_id_to_l1_cid_;
+    mutable std::mutex                        l1_cache_mu_;
 };
 
 } // namespace m3

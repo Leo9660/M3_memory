@@ -257,22 +257,52 @@ void M3Logger::log_maint_topology(int l0_nlist, int l1_nlist,
 M3Profiler::M3Profiler() {
     const char* env = std::getenv("M3_PROFILE");
     if (!env) return;
-    const char* path_env = std::getenv("M3_PROFILE_LOG");
-    const char* path = path_env ? path_env : "m3_profile.log";
-    fp_ = fopen(path, "a");   // append so restarts don't wipe history
-    if (!fp_) {
-        fprintf(stderr, "[M3Profiler] WARN: could not open profile log '%s'\n", path);
+
+    const char* dir = std::getenv("M3_PROFILE_DIR");
+    if (!dir) dir = "profile";
+    time_t now = time(nullptr);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    char base[256];
+    snprintf(base, sizeof(base), "%s/m3_%04d%02d%02d_%02d%02d%02d",
+             dir,
+             tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+
+    char path[280];
+    snprintf(path, sizeof(path), "%s_search.csv", base);
+    fp_search_ = fopen(path, "w");
+    if (!fp_search_) {
+        fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
         return;
     }
+    fprintf(fp_search_,
+        "timestamp,batch,"
+        "probe_ms,l0_ms,l0_exits,l1_ms,l1_exits,"
+        "l2_gpu_cls,l2_cpu_cls,l2_gpu_ms,l2_cpu_ms,"
+        "merge_ms,promotion_ms,total_ms,"
+        "l0_clusters,l0_vecs,l1_clusters,l1_vecs,"
+        "dagent,alpha_et,true_kth_avg\n");
+    fflush(fp_search_);
+
+    snprintf(path, sizeof(path), "%s_insert.csv", base);
+    fp_insert_ = fopen(path, "w");
+    if (!fp_insert_) {
+        fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
+        fclose(fp_search_); fp_search_ = nullptr;
+        return;
+    }
+    fprintf(fp_insert_,
+        "timestamp,batch,total_ms,gpu_pending,assign_ms,l0l2_write_ms,gpu_dispatch_ms\n");
+    fflush(fp_insert_);
+
     enabled_ = true;
-    fprintf(fp_, "# M3 Profile Log  (M3_PROFILE_LOG=%s)\n", path);
-    fprintf(fp_, "# Fields: [timestamp]  EVENT  key=value ...\n#\n");
-    fflush(fp_);
 }
 
 M3Profiler::~M3Profiler() {
     std::lock_guard<std::mutex> lk(mu_);
-    if (fp_) { fflush(fp_); fclose(fp_); fp_ = nullptr; }
+    if (fp_search_) { fflush(fp_search_); fclose(fp_search_); fp_search_ = nullptr; }
+    if (fp_insert_) { fflush(fp_insert_); fclose(fp_insert_); fp_insert_ = nullptr; }
 }
 
 M3Profiler& M3Profiler::instance() {
@@ -299,71 +329,74 @@ void M3Profiler::timestamp_(char* buf, size_t buf_sz) {
 #endif
     char base[32];
     strftime(base, sizeof(base), "%Y-%m-%d %H:%M:%S", &tm_buf);
-    snprintf(buf, buf_sz, "[%s.%03lld]", base, static_cast<long long>(ms));
+    snprintf(buf, buf_sz, "%s.%03lld", base, static_cast<long long>(ms));
 }
 
 void M3Profiler::write_(const char* line) {
-    char ts[40];
-    timestamp_(ts, sizeof(ts));
-    std::lock_guard<std::mutex> lk(mu_);
-    if (!enabled_ || !fp_) return;
-    fprintf(fp_, "%s  %s\n", ts, line);
-    fflush(fp_);
+    // Unused — kept to satisfy any future generic use.
+    (void)line;
 }
 
-void M3Profiler::log_search_batch(size_t q_rows,
-                                   double probe_select_ms,
-                                   double l0_ms,    size_t l0_early_exits,
-                                   double l1_ms,    size_t l1_early_exits,
-                                   size_t l2_gpu_clusters, size_t l2_cpu_clusters,
-                                   double l2_gpu_ms, double l2_cpu_ms,
-                                   double merge_ms,
-                                   double promotion_ms,
-                                   double total_ms) {
+void M3Profiler::write_search_(const char* line) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!enabled_ || !fp_search_) return;
+    fprintf(fp_search_, "%s\n", line);
+    fflush(fp_search_);
+}
+
+void M3Profiler::write_insert_(const char* line) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!enabled_ || !fp_insert_) return;
+    fprintf(fp_insert_, "%s\n", line);
+    fflush(fp_insert_);
+}
+
+void M3Profiler::log_search_row(size_t q_rows,
+                                 double probe_ms,
+                                 double l0_ms,  size_t l0_exits,
+                                 double l1_ms,  size_t l1_exits,
+                                 size_t l2_gpu_cls, size_t l2_cpu_cls,
+                                 double l2_gpu_ms,  double l2_cpu_ms,
+                                 double merge_ms, double promotion_ms, double total_ms,
+                                 int l0_clusters, size_t l0_vecs,
+                                 int l1_clusters, size_t l1_vecs,
+                                 float dagent, float alpha_et, float true_kth_avg) {
     if (!enabled_) return;
+    char ts[32]; timestamp_(ts, sizeof(ts));
+    char kth[16];
+    if (true_kth_avg < 0.f) kth[0] = '\0';
+    else snprintf(kth, sizeof(kth), "%.6f", static_cast<double>(true_kth_avg));
     char buf[512];
     snprintf(buf, sizeof(buf),
-        "PROFILE_SEARCH_BATCH"
-        "  batch=%-4zu"
-        "  probe_select_ms=%-8.3f"
-        "  l0_ms=%-8.3f  l0_early_exits=%-4zu"
-        "  l1_ms=%-8.3f  l1_early_exits=%-4zu"
-        "  l2_gpu_clusters=%-4zu  l2_cpu_clusters=%-4zu"
-        "  l2_gpu_ms=%-8.3f  l2_cpu_ms=%-8.3f"
-        "  merge_ms=%-8.3f"
-        "  promotion_ms=%-8.3f"
-        "  total_ms=%-8.3f",
-        q_rows,
-        probe_select_ms,
-        l0_ms, l0_early_exits,
-        l1_ms, l1_early_exits,
-        l2_gpu_clusters, l2_cpu_clusters,
-        l2_gpu_ms, l2_cpu_ms,
-        merge_ms,
-        promotion_ms,
-        total_ms);
-    write_(buf);
+        "%s,%zu,"
+        "%.3f,%.3f,%zu,%.3f,%zu,"
+        "%zu,%zu,%.3f,%.3f,"
+        "%.3f,%.3f,%.3f,"
+        "%d,%zu,%d,%zu,"
+        "%.6f,%.6f,%s",
+        ts, q_rows,
+        probe_ms, l0_ms, l0_exits, l1_ms, l1_exits,
+        l2_gpu_cls, l2_cpu_cls, l2_gpu_ms, l2_cpu_ms,
+        merge_ms, promotion_ms, total_ms,
+        l0_clusters, l0_vecs, l1_clusters, l1_vecs,
+        static_cast<double>(dagent), static_cast<double>(alpha_et), kth);
+    write_search_(buf);
 }
 
-void M3Profiler::log_insert_batch(size_t n_rows,
-                                   size_t gpu_pending,
-                                   double assign_ms,
-                                   double l0l2_write_ms,
-                                   double gpu_dispatch_ms,
-                                   double total_ms) {
+void M3Profiler::log_insert_row(size_t n_rows,
+                                 size_t gpu_pending,
+                                 double assign_ms,
+                                 double l0l2_write_ms,
+                                 double gpu_dispatch_ms,
+                                 double total_ms) {
     if (!enabled_) return;
+    char ts[32]; timestamp_(ts, sizeof(ts));
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "PROFILE_INSERT_BATCH"
-        "  batch=%-6zu"
-        "  gpu_pending=%-6zu"
-        "  assign_ms=%-8.3f"
-        "  l0l2_write_ms=%-8.3f"
-        "  gpu_dispatch_ms=%-8.3f"
-        "  total_ms=%-8.3f",
-        n_rows, gpu_pending,
-        assign_ms, l0l2_write_ms, gpu_dispatch_ms, total_ms);
-    write_(buf);
+        "%s,%zu,%.3f,%zu,%.3f,%.3f,%.3f",
+        ts, n_rows, total_ms,
+        gpu_pending, assign_ms, l0l2_write_ms, gpu_dispatch_ms);
+    write_insert_(buf);
 }
 
 } // namespace m3
