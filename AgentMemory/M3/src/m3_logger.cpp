@@ -269,31 +269,55 @@ M3Profiler::M3Profiler() {
              tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
              tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
 
-    char path[280];
-    snprintf(path, sizeof(path), "%s_search.csv", base);
-    fp_search_ = fopen(path, "w");
-    if (!fp_search_) {
+    // ---- search_profile.csv ----
+    char path[288];
+    snprintf(path, sizeof(path), "%s_search_profile.csv", base);
+    fp_search_profile_ = fopen(path, "w");
+    if (!fp_search_profile_) {
         fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
         return;
     }
-    fprintf(fp_search_,
+    fprintf(fp_search_profile_,
         "timestamp,batch,"
-        "probe_ms,l0_ms,l0_exits,l1_ms,l1_exits,"
-        "l2_gpu_cls,l2_cpu_cls,l2_gpu_ms,l2_cpu_ms,"
-        "merge_ms,promotion_ms,total_ms,"
+        "probe_sgemm_ms,probe_topk_ms,"
+        "l0_ms,l0_centroid_ms,l0_scan_ms,"
+        "l1_ms,l1_centroid_ms,l1_scan_ms,"
+        "l2_gpu_ms,l2_cpu_ms,"
+        "gpu_h2d_ms,gpu_kernel_ms,gpu_sync_d2h_ms,gpu_topk_ms,"
+        "merge_ms,promotion_ms,total_ms\n");
+    fflush(fp_search_profile_);
+
+    // ---- search_stats.csv ----
+    snprintf(path, sizeof(path), "%s_search_stats.csv", base);
+    fp_search_stats_ = fopen(path, "w");
+    if (!fp_search_stats_) {
+        fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
+        fclose(fp_search_profile_); fp_search_profile_ = nullptr;
+        return;
+    }
+    fprintf(fp_search_stats_,
+        "timestamp,batch,"
+        "l0_exits,l0_exit_avg_ms,l0_exit_total_ms,"
+        "l1_exits,l1_exit_avg_ms,l1_exit_total_ms,"
+        "l2_reach_avg_ms,l2_reach_total_ms,"
+        "promo_avg_ms,"
         "l0_clusters,l0_vecs,l1_clusters,l1_vecs,"
         "dagent,alpha_et,true_kth_avg\n");
-    fflush(fp_search_);
+    fflush(fp_search_stats_);
 
+    // ---- insert.csv ----
     snprintf(path, sizeof(path), "%s_insert.csv", base);
     fp_insert_ = fopen(path, "w");
     if (!fp_insert_) {
         fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
-        fclose(fp_search_); fp_search_ = nullptr;
+        fclose(fp_search_profile_); fp_search_profile_ = nullptr;
+        fclose(fp_search_stats_);   fp_search_stats_   = nullptr;
         return;
     }
     fprintf(fp_insert_,
-        "timestamp,batch,total_ms,gpu_pending,assign_ms,l0l2_write_ms,gpu_dispatch_ms\n");
+        "timestamp,batch,total_ms,gpu_pending,"
+        "assign_ms,assign_sgemm_ms,assign_topk_ms,"
+        "l0l2_write_ms,gpu_dispatch_ms\n");
     fflush(fp_insert_);
 
     enabled_ = true;
@@ -301,8 +325,9 @@ M3Profiler::M3Profiler() {
 
 M3Profiler::~M3Profiler() {
     std::lock_guard<std::mutex> lk(mu_);
-    if (fp_search_) { fflush(fp_search_); fclose(fp_search_); fp_search_ = nullptr; }
-    if (fp_insert_) { fflush(fp_insert_); fclose(fp_insert_); fp_insert_ = nullptr; }
+    if (fp_search_profile_) { fflush(fp_search_profile_); fclose(fp_search_profile_); fp_search_profile_ = nullptr; }
+    if (fp_search_stats_)   { fflush(fp_search_stats_);   fclose(fp_search_stats_);   fp_search_stats_   = nullptr; }
+    if (fp_insert_)         { fflush(fp_insert_);         fclose(fp_insert_);         fp_insert_         = nullptr; }
 }
 
 M3Profiler& M3Profiler::instance() {
@@ -332,16 +357,18 @@ void M3Profiler::timestamp_(char* buf, size_t buf_sz) {
     snprintf(buf, buf_sz, "%s.%03lld", base, static_cast<long long>(ms));
 }
 
-void M3Profiler::write_(const char* line) {
-    // Unused — kept to satisfy any future generic use.
-    (void)line;
+void M3Profiler::write_search_profile_(const char* line) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!enabled_ || !fp_search_profile_) return;
+    fprintf(fp_search_profile_, "%s\n", line);
+    fflush(fp_search_profile_);
 }
 
-void M3Profiler::write_search_(const char* line) {
+void M3Profiler::write_search_stats_(const char* line) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (!enabled_ || !fp_search_) return;
-    fprintf(fp_search_, "%s\n", line);
-    fflush(fp_search_);
+    if (!enabled_ || !fp_search_stats_) return;
+    fprintf(fp_search_stats_, "%s\n", line);
+    fflush(fp_search_stats_);
 }
 
 void M3Profiler::write_insert_(const char* line) {
@@ -351,41 +378,74 @@ void M3Profiler::write_insert_(const char* line) {
     fflush(fp_insert_);
 }
 
-void M3Profiler::log_search_row(size_t q_rows,
-                                 double probe_ms,
-                                 double l0_ms,  size_t l0_exits,
-                                 double l1_ms,  size_t l1_exits,
-                                 size_t l2_gpu_cls, size_t l2_cpu_cls,
-                                 double l2_gpu_ms,  double l2_cpu_ms,
-                                 double merge_ms, double promotion_ms, double total_ms,
-                                 int l0_clusters, size_t l0_vecs,
-                                 int l1_clusters, size_t l1_vecs,
-                                 float dagent, float alpha_et, float true_kth_avg) {
+void M3Profiler::log_search_profile(size_t q_rows,
+                                     double probe_sgemm_ms, double probe_topk_ms,
+                                     double l0_ms, double l0_centroid_ms, double l0_scan_ms,
+                                     double l1_ms, double l1_centroid_ms, double l1_scan_ms,
+                                     double l2_gpu_ms, double l2_cpu_ms,
+                                     double gpu_h2d_ms, double gpu_kernel_ms,
+                                     double gpu_sync_d2h_ms, double gpu_topk_ms,
+                                     double merge_ms, double promotion_ms, double total_ms) {
+    if (!enabled_) return;
+    char ts[32]; timestamp_(ts, sizeof(ts));
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "%s,%zu,"
+        "%.3f,%.3f,"
+        "%.3f,%.3f,%.3f,"
+        "%.3f,%.3f,%.3f,"
+        "%.3f,%.3f,"
+        "%.3f,%.3f,%.3f,%.3f,"
+        "%.3f,%.3f,%.3f",
+        ts, q_rows,
+        probe_sgemm_ms, probe_topk_ms,
+        l0_ms, l0_centroid_ms, l0_scan_ms,
+        l1_ms, l1_centroid_ms, l1_scan_ms,
+        l2_gpu_ms, l2_cpu_ms,
+        gpu_h2d_ms, gpu_kernel_ms, gpu_sync_d2h_ms, gpu_topk_ms,
+        merge_ms, promotion_ms, total_ms);
+    write_search_profile_(buf);
+}
+
+void M3Profiler::log_search_stats(size_t q_rows,
+                                   size_t l0_exits,
+                                   double l0_exit_avg_ms, double l0_exit_total_ms,
+                                   size_t l1_exits,
+                                   double l1_exit_avg_ms, double l1_exit_total_ms,
+                                   double l2_reach_avg_ms, double l2_reach_total_ms,
+                                   double promo_avg_ms,
+                                   int l0_clusters, size_t l0_vecs,
+                                   int l1_clusters, size_t l1_vecs,
+                                   float dagent, float alpha_et, float true_kth_avg) {
     if (!enabled_) return;
     char ts[32]; timestamp_(ts, sizeof(ts));
     char kth[16];
-    if (true_kth_avg < 0.f) kth[0] = '\0';
+    if (true_kth_avg < 0.f) snprintf(kth, sizeof(kth), "");
     else snprintf(kth, sizeof(kth), "%.6f", static_cast<double>(true_kth_avg));
     char buf[512];
     snprintf(buf, sizeof(buf),
         "%s,%zu,"
-        "%.3f,%.3f,%zu,%.3f,%zu,"
-        "%zu,%zu,%.3f,%.3f,"
-        "%.3f,%.3f,%.3f,"
+        "%zu,%.3f,%.3f,"
+        "%zu,%.3f,%.3f,"
+        "%.3f,%.3f,"
+        "%.3f,"
         "%d,%zu,%d,%zu,"
         "%.6f,%.6f,%s",
         ts, q_rows,
-        probe_ms, l0_ms, l0_exits, l1_ms, l1_exits,
-        l2_gpu_cls, l2_cpu_cls, l2_gpu_ms, l2_cpu_ms,
-        merge_ms, promotion_ms, total_ms,
+        l0_exits, l0_exit_avg_ms, l0_exit_total_ms,
+        l1_exits, l1_exit_avg_ms, l1_exit_total_ms,
+        l2_reach_avg_ms, l2_reach_total_ms,
+        promo_avg_ms,
         l0_clusters, l0_vecs, l1_clusters, l1_vecs,
         static_cast<double>(dagent), static_cast<double>(alpha_et), kth);
-    write_search_(buf);
+    write_search_stats_(buf);
 }
 
 void M3Profiler::log_insert_row(size_t n_rows,
                                  size_t gpu_pending,
                                  double assign_ms,
+                                 double assign_sgemm_ms,
+                                 double assign_topk_ms,
                                  double l0l2_write_ms,
                                  double gpu_dispatch_ms,
                                  double total_ms) {
@@ -393,9 +453,10 @@ void M3Profiler::log_insert_row(size_t n_rows,
     char ts[32]; timestamp_(ts, sizeof(ts));
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "%s,%zu,%.3f,%zu,%.3f,%.3f,%.3f",
+        "%s,%zu,%.3f,%zu,%.3f,%.3f,%.3f,%.3f,%.3f",
         ts, n_rows, total_ms,
-        gpu_pending, assign_ms, l0l2_write_ms, gpu_dispatch_ms);
+        gpu_pending, assign_ms, assign_sgemm_ms, assign_topk_ms,
+        l0l2_write_ms, gpu_dispatch_ms);
     write_insert_(buf);
 }
 

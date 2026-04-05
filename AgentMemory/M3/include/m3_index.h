@@ -89,16 +89,24 @@ public:
     // Select top-nprobe clusters per query by centroid distance, then search on them.
     // Selection strategy: for each query, compute unified_score(query, centroid)
     // and take the nprobe smallest centroids.
+    // out_centroid_ms: time for sgemm + top-nprobe selection (centroid scoring phase).
+    // out_scan_ms:     time for cluster vector scans (search_into loop).
     void search_nprobe(const float* queries, size_t q_rows, int k, int nprobe,
                        std::vector<std::vector<DocId>>& out_ids,
-                       std::vector<std::vector<float>>& out_scores) const;
+                       std::vector<std::vector<float>>& out_scores,
+                       double* out_centroid_ms = nullptr,
+                       double* out_scan_ms     = nullptr) const;
 
     // For one query, return the top-nprobe cluster ids by centroid distance (for cache probe set).
     void get_probe_ids(const float* query, int nprobe, std::vector<int>& out_ids) const;
 
     // For a full batch of queries, return top-nprobe cluster ids per query in one sgemm.
+    // out_sgemm_ms: time for the BLAS matrix multiply (centroid scoring across all queries).
+    // out_topk_ms:  time for per-query top-nprobe selection from the score matrix.
     void batch_get_probe_ids(const float* queries, size_t q_rows, int nprobe,
-                             std::vector<std::vector<int>>& out_probe_ids) const;
+                             std::vector<std::vector<int>>& out_probe_ids,
+                             double* out_sgemm_ms = nullptr,
+                             double* out_topk_ms  = nullptr) const;
 
     // Search within a single cluster (query as vector); returns k nearest doc_ids and scores.
     void search_within_cluster(int cluster_id, const float* query, int k,

@@ -174,9 +174,12 @@ void MultiLevelIndex::insert(const DocId* ids, const float* vecs, size_t n_rows)
 
         if (profiling) {
             const double total_ms = fms(clock::now() - t_insert_start).count();
+            // nearest_clusters uses scalar unified_score scan (no BLAS); assign_ms IS the
+            // centroid scan with no separate topk step (running-best-so-far), so assign_topk_ms=0.
             M3Profiler::instance().log_insert_row(
                 n_rows, gpu_pending.size(),
-                p_assign_ms, p_l0l2_ms, p_gpu_ms, total_ms);
+                p_assign_ms, p_assign_ms, 0.0,
+                p_l0l2_ms, p_gpu_ms, total_ms);
         }
 
         if (strat) strat->on_insert(ids, vecs, n_rows);
@@ -740,14 +743,24 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         }
 
         // Profile accumulators (only populated when profiling is enabled).
-        double p_probe_ms = 0, p_l0_ms = 0, p_l1_ms = 0;
+        double p_probe_ms = 0, p_probe_sgemm_ms = 0, p_probe_topk_ms = 0;
+        double p_l0_ms = 0, p_l0_centroid_ms = 0, p_l0_scan_ms = 0;
+        double p_l1_ms = 0, p_l1_centroid_ms = 0, p_l1_scan_ms = 0;
+
+        // Per-stage query timing buckets (total wall time per query, by exit stage).
+        double p_l0_exit_total_ms = 0, p_l1_exit_total_ms = 0, p_l2_reach_total_ms = 0;
+
+        // GPU sub-phase timing (accumulated across all L2-reaching queries).
+        GpuCollabTiming p_gpu_timing;
 
         // Batch probe selection: one sgemm across all queries instead of q_rows scalar loops.
         std::vector<std::vector<int>> all_probe_ids(q_rows);
         {
             const auto t0 = profiling ? clock::now() : clock::time_point{};
             if (l2.index)
-                l2.index->batch_get_probe_ids(queries, q_rows, nprobe, all_probe_ids);
+                l2.index->batch_get_probe_ids(queries, q_rows, nprobe, all_probe_ids,
+                                              profiling ? &p_probe_sgemm_ms : nullptr,
+                                              profiling ? &p_probe_topk_ms  : nullptr);
             if (profiling) p_probe_ms = fms(clock::now() - t0).count();
         }
 
@@ -776,6 +789,9 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             probe_ids = all_probe_ids[qi];
             if (probe_ids.empty()) continue;
 
+            // Per-query wall-clock start (used to bucket by exit stage).
+            const auto t_query_start = profiling ? clock::now() : clock::time_point{};
+
             // Stage 1: search L0 only.
             // L0 uses query-centric cluster IDs (same space as L1, independent of L2).
             // Must use search_nprobe over L0's own centroids, NOT L2 probe_ids.
@@ -790,8 +806,12 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     const int l0_nprobe_eff = (cache_config_.l0_nprobe > 0)
                                                   ? cache_config_.l0_nprobe
                                                   : std::min(nprobe, l0_nlist);
+                    double l0c = 0, l0s = 0;
                     if (l0_nprobe_eff > 0)
-                        l0.index->search_nprobe(qptr, 1, k, l0_nprobe_eff, l0_ids, l0_scores);
+                        l0.index->search_nprobe(qptr, 1, k, l0_nprobe_eff, l0_ids, l0_scores,
+                                                profiling ? &l0c : nullptr,
+                                                profiling ? &l0s : nullptr);
+                    if (profiling) { p_l0_centroid_ms += l0c; p_l0_scan_ms += l0s; }
                 }
                 if (profiling) p_l0_ms += fms(clock::now() - t0).count();
             }
@@ -827,7 +847,10 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     satisfied = true;
                     stage[qi] = 1;
                     early_exit_kths[qi] = ks;
-                    if (profiling) ++p_l0_exits;
+                    if (profiling) {
+                        ++p_l0_exits;
+                        p_l0_exit_total_ms += fms(clock::now() - t_query_start).count();
+                    }
                 }
             }
 
@@ -841,9 +864,12 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     const int l1_nprobe_eff = (cache_config_.l1_nprobe > 0)
                                                   ? cache_config_.l1_nprobe
                                                   : std::min(nprobe, l1.index->nlist());
+                    double l1c = 0, l1s = 0;
                     if (l1_nprobe_eff > 0)
-                        l1.index->search_nprobe(qptr, 1, k, l1_nprobe_eff, l1_ids, l1_scores);
-                    if (profiling) p_l1_ms += fms(clock::now() - t0).count();
+                        l1.index->search_nprobe(qptr, 1, k, l1_nprobe_eff, l1_ids, l1_scores,
+                                                profiling ? &l1c : nullptr,
+                                                profiling ? &l1s : nullptr);
+                    if (profiling) { p_l1_ms += fms(clock::now() - t0).count(); p_l1_centroid_ms += l1c; p_l1_scan_ms += l1s; }
                 }
                 {
                     const auto t0 = profiling ? clock::now() : clock::time_point{};
@@ -859,7 +885,10 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                         satisfied = true;
                         stage[qi] = 2;
                         early_exit_kths[qi] = ks;
-                        if (profiling) ++p_l1_exits;
+                        if (profiling) {
+                            ++p_l1_exits;
+                            p_l1_exit_total_ms += fms(clock::now() - t_query_start).count();
+                        }
                     }
                 }
             }
@@ -892,7 +921,8 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                         auto gpu_fut = !gpu_cids.empty()
                             ? std::async(std::launch::async, [&]() {
                                   gpu_coord_->search(gpu_cids, qptr, k,
-                                                     gpu_l2_ids, gpu_l2_scores);
+                                                     gpu_l2_ids, gpu_l2_scores,
+                                                     profiling ? &p_gpu_timing : nullptr);
                               })
                             : std::future<void>{};
 
@@ -925,6 +955,8 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                         if (profiling) p_merge_ms += fms(clock::now() - t0).count();
                     }
                     stage[qi] = 3;
+                    if (profiling)
+                        p_l2_reach_total_ms += fms(clock::now() - t_query_start).count();
                 } else {
                     // No L2; if we haven't merged yet (e.g. no L1), fallback to L0-only.
                     if (merged_ids.empty() && !l0_ids[0].empty()) {
@@ -1104,13 +1136,34 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                 cur_dagent   = dagent_;
                 cur_alpha_et = alpha_et_dynamic_;
             }
-            M3Profiler::instance().log_search_row(
+            // Compute per-stage averages.
+            const size_t p_l2_reach = q_rows - p_l0_exits - p_l1_exits;
+            const double p_l0_exit_avg = p_l0_exits > 0
+                ? p_l0_exit_total_ms / static_cast<double>(p_l0_exits) : 0.0;
+            const double p_l1_exit_avg = p_l1_exits > 0
+                ? p_l1_exit_total_ms / static_cast<double>(p_l1_exits) : 0.0;
+            const double p_l2_reach_avg = p_l2_reach > 0
+                ? p_l2_reach_total_ms / static_cast<double>(p_l2_reach) : 0.0;
+            const size_t p_promo_queries = p_l1_exits + p_l2_reach;
+            const double p_promo_avg = p_promo_queries > 0
+                ? p_promo_ms / static_cast<double>(p_promo_queries) : 0.0;
+
+            M3Profiler::instance().log_search_profile(
                 q_rows,
-                p_probe_ms, p_l0_ms, p_l0_exits,
-                p_l1_ms,    p_l1_exits,
-                p_l2_gpu_clusters, p_l2_cpu_clusters,
+                p_probe_sgemm_ms, p_probe_topk_ms,
+                p_l0_ms, p_l0_centroid_ms, p_l0_scan_ms,
+                p_l1_ms, p_l1_centroid_ms, p_l1_scan_ms,
                 p_l2_gpu_ms, p_l2_cpu_ms,
-                p_merge_ms, p_promo_ms, p_total_ms,
+                p_gpu_timing.h2d_ms, p_gpu_timing.kernel_ms,
+                p_gpu_timing.sync_d2h_ms, p_gpu_timing.topk_ms,
+                p_merge_ms, p_promo_ms, p_total_ms);
+
+            M3Profiler::instance().log_search_stats(
+                q_rows,
+                p_l0_exits, p_l0_exit_avg, p_l0_exit_total_ms,
+                p_l1_exits, p_l1_exit_avg, p_l1_exit_total_ms,
+                p_l2_reach_avg, p_l2_reach_total_ms,
+                p_promo_avg,
                 l0_live, l0_total,
                 l1_live, l1_total,
                 cur_dagent, cur_alpha_et, p_true_kth_avg);

@@ -169,7 +169,8 @@ public:
     size_t search(const std::vector<int>& probe_cids,
                   const float* query, int k,
                   std::vector<DocId>&  out_ids,
-                  std::vector<float>&  out_scores);
+                  std::vector<float>&  out_scores,
+                  GpuCollabTiming*     timing = nullptr);
 
     // ---- Cluster lifecycle ----
 

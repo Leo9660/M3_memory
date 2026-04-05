@@ -155,27 +155,68 @@ public:
 
     bool is_enabled() const;
 
-    // ---- Search row (CSV) ----
-    // One row per search() batch combining timing + cache health.
-    // Written to a timestamped CSV in the profile directory.
-    //   true_kth_avg : mean k-th distance of queries that went all the way to L2;
-    //                  negative (-1) when all queries early-exited this batch.
-    void log_search_row(size_t q_rows,
-                        double probe_ms,
-                        double l0_ms,  size_t l0_exits,
-                        double l1_ms,  size_t l1_exits,
-                        size_t l2_gpu_cls, size_t l2_cpu_cls,
-                        double l2_gpu_ms,  double l2_cpu_ms,
-                        double merge_ms, double promotion_ms, double total_ms,
-                        int l0_clusters, size_t l0_vecs,
-                        int l1_clusters, size_t l1_vecs,
-                        float dagent, float alpha_et, float true_kth_avg);
+    // ---- Search profile row (CSV) ----
+    // One row per search() batch. Captures wall time for each pipeline stage
+    // in execution order — use to see which stage dominates as the cache warms.
+    //   probe_sgemm_ms  : BLAS sgemm for L2 centroid scoring across all queries
+    //   probe_topk_ms   : per-query top-nprobe selection from score matrix
+    //   l0_ms           : cumulative L0 search time (centroid + scan)
+    //   l0_centroid_ms  : L0 centroid scoring + nprobe selection (sgemm+topk over L0 clusters)
+    //   l0_scan_ms      : L0 cluster vector scan (search_into loop)
+    //   l1_ms           : cumulative L1 search time (centroid + scan)
+    //   l1_centroid_ms  : L1 centroid scoring + nprobe selection
+    //   l1_scan_ms      : L1 cluster vector scan
+    //   l2_gpu_ms       : wall time for GPU L2 search (async, overlaps cpu)
+    //   l2_cpu_ms       : wall time for CPU L2 search (overlaps gpu)
+    //   gpu_h2d_ms      : query H2D upload inside collaborative_search
+    //   gpu_kernel_ms   : CUDA kernel execution time
+    //   gpu_sync_d2h_ms : cudaStreamSynchronize (kernel exec wait) + D2H download
+    //   gpu_topk_ms     : CPU top-k merge after D2H
+    //   merge_ms        : merge_levels_ de-duplication
+    //   promotion_ms    : post-search L0/L1 promotion
+    //   total_ms        : end-to-end batch wall time
+    void log_search_profile(size_t q_rows,
+                            double probe_sgemm_ms, double probe_topk_ms,
+                            double l0_ms, double l0_centroid_ms, double l0_scan_ms,
+                            double l1_ms, double l1_centroid_ms, double l1_scan_ms,
+                            double l2_gpu_ms, double l2_cpu_ms,
+                            double gpu_h2d_ms, double gpu_kernel_ms,
+                            double gpu_sync_d2h_ms, double gpu_topk_ms,
+                            double merge_ms, double promotion_ms, double total_ms);
+
+    // ---- Search stats row (CSV) ----
+    // One row per search() batch. Captures per-stage exit distribution and
+    // derived metrics — use to answer "where are throughput gains".
+    //   l0_exits           : queries satisfied by L0 alone
+    //   l0_exit_avg_ms     : avg total query time for L0-exit queries
+    //   l0_exit_total_ms   : total wall time on all L0-exit queries
+    //   l1_exits           : queries satisfied at L0+L1
+    //   l1_exit_avg_ms     : avg total query time for L1-exit queries
+    //   l1_exit_total_ms   : total wall time on all L1-exit queries
+    //   l2_reach_avg_ms    : avg total query time for L2-reaching queries
+    //   l2_reach_total_ms  : total wall time on all L2-reaching queries
+    //   promo_avg_ms       : avg promotion time per non-L0-exit query
+    //   true_kth_avg       : mean k-th distance of L2 queries; -1 if none reached L2
+    void log_search_stats(size_t q_rows,
+                          size_t l0_exits,
+                          double l0_exit_avg_ms, double l0_exit_total_ms,
+                          size_t l1_exits,
+                          double l1_exit_avg_ms, double l1_exit_total_ms,
+                          double l2_reach_avg_ms, double l2_reach_total_ms,
+                          double promo_avg_ms,
+                          int l0_clusters, size_t l0_vecs,
+                          int l1_clusters, size_t l1_vecs,
+                          float dagent, float alpha_et, float true_kth_avg);
 
     // ---- Insert row (CSV) ----
     // One row per insert() batch.
+    //   assign_sgemm_ms : BLAS matrix multiply for centroid assignment
+    //   assign_topk_ms  : per-vector top-1 selection from score matrix
     void log_insert_row(size_t n_rows,
                         size_t gpu_pending,
                         double assign_ms,
+                        double assign_sgemm_ms,
+                        double assign_topk_ms,
                         double l0l2_write_ms,
                         double gpu_dispatch_ms,
                         double total_ms);
@@ -184,15 +225,16 @@ private:
     M3Profiler();
     ~M3Profiler();
 
-    void write_(const char* line);
-    void write_search_(const char* line);
+    void write_search_profile_(const char* line);
+    void write_search_stats_(const char* line);
     void write_insert_(const char* line);
     static void timestamp_(char* buf, size_t buf_sz);
 
     mutable std::mutex mu_;
-    FILE*              fp_search_ = nullptr;
-    FILE*              fp_insert_ = nullptr;
-    bool               enabled_   = false;
+    FILE*              fp_search_profile_ = nullptr;
+    FILE*              fp_search_stats_   = nullptr;
+    FILE*              fp_insert_         = nullptr;
+    bool               enabled_           = false;
 };
 
 } // namespace m3

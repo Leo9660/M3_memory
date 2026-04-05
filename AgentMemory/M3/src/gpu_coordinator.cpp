@@ -118,9 +118,10 @@ BufferResult GpuCoordinator::insert(int cid, DocId id, const float* vec) {
 size_t GpuCoordinator::search(const std::vector<int>& probe_cids,
                                const float* query, int k,
                                std::vector<DocId>&  out_ids,
-                               std::vector<float>&  out_scores) {
+                               std::vector<float>&  out_scores,
+                               GpuCollabTiming*     timing) {
     return gpu_idx_.collaborative_search(probe_cids, query, k,
-                                         insert_buf_, out_ids, out_scores);
+                                         insert_buf_, out_ids, out_scores, timing);
 }
 
 bool GpuCoordinator::promote_to_gpu(int cid) {

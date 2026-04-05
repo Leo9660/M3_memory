@@ -27,9 +27,11 @@
 
 #include "gpu_cluster_index.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -61,6 +63,14 @@ static void cuda_check_(cudaError_t err, const char* file, int line) {
     }
 }
 #define CUDA_CHECK(expr) cuda_check_((expr), __FILE__, __LINE__)
+
+static void cublas_check_(cublasStatus_t st, const char* file, int line) {
+    if (st != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error(
+            std::string("[M3 cuBLAS] status ") + std::to_string(static_cast<int>(st)) +
+            " at " + file + ":" + std::to_string(line));
+}
+#define CUBLAS_CHECK(expr) cublas_check_((expr), __FILE__, __LINE__)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Distance kernels
@@ -115,6 +125,31 @@ __global__ void k_ip_distances(
     dists[i] = -acc;   // negate: top-k smallest = highest inner product
 }
 
+// Compute squared L2 norm for each of N row-vectors of dimension dim.
+// Used to convert cuBLAS inner-product output to L2 distances.
+__global__ void k_squared_norms(const float* __restrict__ vecs,
+                                 float*       __restrict__ norms,
+                                 int N, int dim)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    const float* v = vecs + (size_t)i * dim;
+    float acc = 0.f;
+    for (int d = 0; d < dim; ++d) acc += v[d] * v[d];
+    norms[i] = acc;
+}
+
+// Convert inner-product output to squared L2 distance in-place:
+//   dists[i] = qnorm + norms[i] - 2 * dists[i]
+__global__ void k_l2_from_ip(float*       __restrict__ dists,
+                               const float* __restrict__ norms,
+                               float qnorm, int N)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    dists[i] = qnorm + norms[i] - 2.f * dists[i];
+}
+
 static void launch_distance_kernel(Metric metric,
                                    const float* d_query,
                                    const float* d_vecs,
@@ -142,6 +177,58 @@ static void launch_distance_kernel(Metric metric,
 
 GpuClusterIndex::GpuClusterIndex(int dim, Metric metric, bool normalized)
     : dim_(dim), metric_(metric), normalized_(normalized) {}
+
+GpuClusterIndex::~GpuClusterIndex() {
+    if (cublas_handle_)   { cublasDestroy(cublas_handle_);        cublas_handle_   = nullptr; }
+    if (search_stream_)   { cudaStreamDestroy(search_stream_);    search_stream_   = nullptr; }
+    if (d_query_scratch_) { cudaFree(d_query_scratch_);           d_query_scratch_ = nullptr; }
+    if (d_dist_scratch_)  { cudaFree(d_dist_scratch_);            d_dist_scratch_  = nullptr; }
+    if (d_norms_scratch_) { cudaFree(d_norms_scratch_);           d_norms_scratch_ = nullptr; }
+    if (h_dist_scratch_)  { cudaFreeHost(h_dist_scratch_);        h_dist_scratch_  = nullptr; }
+    if (d_vecs_packed_)   { cudaFree(d_vecs_packed_);             d_vecs_packed_   = nullptr; }
+    scratch_cap_     = 0;
+    vecs_packed_cap_ = 0;
+}
+
+// ensure_scratch_ — lazily create persistent stream/cuBLAS handle/query buffer;
+// grow distance and norms scratch to hold at least `need` floats.
+// Must be called under scratch_mu_.
+void GpuClusterIndex::ensure_scratch_(size_t need) const {
+    // One-time: create stream, query buffer, and cuBLAS handle.
+    if (!search_stream_) {
+        CUDA_CHECK(cudaStreamCreate(&search_stream_));
+        CUDA_CHECK(cudaMalloc(&d_query_scratch_,
+                              static_cast<size_t>(dim_) * sizeof(float)));
+        CUBLAS_CHECK(cublasCreate(&cublas_handle_));
+        CUBLAS_CHECK(cublasSetStream(cublas_handle_, search_stream_));
+    }
+    if (need <= scratch_cap_) return;
+
+    // Grow to at least 2× current capacity (minimum 4096 floats = 16 KB).
+    size_t new_cap = std::max(need, scratch_cap_ * 2);
+    new_cap = std::max(new_cap, size_t(4096));
+
+    if (d_dist_scratch_)  { cudaFree(d_dist_scratch_);     d_dist_scratch_  = nullptr; }
+    if (d_norms_scratch_) { cudaFree(d_norms_scratch_);    d_norms_scratch_ = nullptr; }
+    if (h_dist_scratch_)  { cudaFreeHost(h_dist_scratch_); h_dist_scratch_  = nullptr; }
+
+    CUDA_CHECK(cudaMalloc    (&d_dist_scratch_,  new_cap * sizeof(float)));
+    CUDA_CHECK(cudaMalloc    (&d_norms_scratch_, new_cap * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&h_dist_scratch_,  new_cap * sizeof(float)));
+    scratch_cap_ = new_cap;
+}
+
+// ensure_vecs_scratch_ — grow the contiguous device packing buffer.
+// Must be called under scratch_mu_.
+void GpuClusterIndex::ensure_vecs_scratch_(size_t need_floats) const {
+    if (need_floats <= vecs_packed_cap_) return;
+    size_t new_cap = std::max(need_floats, vecs_packed_cap_ * 2);
+    new_cap = std::max(new_cap, size_t(65536)); // minimum 256 KB
+
+    if (d_vecs_packed_) { cudaFree(d_vecs_packed_); d_vecs_packed_ = nullptr; }
+    CUDA_CHECK(cudaMalloc(&d_vecs_packed_, new_cap * sizeof(float)));
+    vecs_packed_cap_ = new_cap;
+}
 
 // store_cluster — H2D upload; replaces any existing data for cid.
 // Returns the device pointer as an opaque handle for GpuBudgetManager.
@@ -394,42 +481,150 @@ size_t GpuClusterIndex::search_cluster(int cid,
     return cands.size();
 }
 
-// collaborative_search — GPU cluster scan + CPU insert-buffer scan, merged.
+// collaborative_search — batched GPU cluster scan + CPU insert-buffer scan.
 //
-// The insert buffer is only active for GPU-resident clusters (activated on
-// promotion, deactivated on eviction). For any cid in probe_cids, if there is
-// no active buffer slot, buf.scan_insert_buffer() returns 0 immediately, so the
-// loop is always correct. The explicit has_cluster() guard makes the intent
-// visible and avoids the hash-table lookup for non-resident cids.
+// Optimisation pipeline:
+//   1. Snapshot all cluster VRAM pointers under one brief lock pass.
+//   2. Upload query once (H2D) to persistent d_query_scratch_.
+//   3. D2D-pack all cluster vectors into contiguous d_vecs_packed_ (GPU→GPU,
+//      same stream, ~400 GB/s — avoids host round-trip).
+//   4. cuBLAS SGEMV: one highly-parallelised matrix-vector multiply computes
+//      all inner products in a single kernel launch (replaces N tiny kernels).
+//   5. Two small correction kernels convert inner products → L2 distances
+//      (or cublasSscal negates for IP/cosine metric).
+//   6. One cudaStreamSynchronize + one D2H into pinned h_dist_scratch_.
+//   7. CPU top-k per cluster, then merge + insert-buffer scan.
 size_t GpuClusterIndex::collaborative_search(
         const std::vector<int>& probe_cids,
         const float* query,
         int k,
         const ClusterInsertBuffer& buf,
         std::vector<DocId>&  out_ids,
-        std::vector<float>&  out_scores) const
+        std::vector<float>&  out_scores,
+        GpuCollabTiming*     timing) const
 {
     const bool diag = gpu_diag_enabled();
-    GpuSearchTiming agg;   // accumulated over all clusters in this call
-    int n_clusters_searched = 0;
 
-    std::unordered_map<DocId, float> best;
-
+    // ── 1. Snapshot all resident clusters (brief lock per cluster) ────────
+    struct Snap {
+        std::shared_ptr<DeviceBuffer> vbuf;
+        std::vector<DocId>            h_ids;
+        size_t                        n;
+        size_t                        offset; // offset into scratch buffer
+        int                           cid;
+    };
+    std::vector<Snap> snaps;
+    snaps.reserve(probe_cids.size());
+    size_t total_n = 0;
     for (int cid : probe_cids) {
-        // ── GPU path: linear scan of VRAM-resident vectors ──────────────
-        std::vector<DocId>  g_ids;
-        std::vector<float>  g_scores;
-        search_cluster(cid, query, k, g_ids, g_scores, diag ? &agg : nullptr);
-        ++n_clusters_searched;
-        for (size_t i = 0; i < g_ids.size(); ++i) {
-            auto [it, ins] = best.emplace(g_ids[i], g_scores[i]);
-            if (!ins && g_scores[i] < it->second)
-                it->second = g_scores[i];
+        std::shared_ptr<DeviceBuffer> vbuf;
+        std::vector<DocId>            h_ids;
+        size_t                        n = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = clusters_.find(cid);
+            if (it == clusters_.end()) continue;
+            vbuf  = it->second.vecs_buf;
+            h_ids = it->second.h_ids;
+            n     = it->second.n;
+        }
+        if (!vbuf || !vbuf->ptr || n == 0) continue;
+        snaps.push_back({std::move(vbuf), std::move(h_ids), n, total_n, cid});
+        total_n += n;
+    }
+
+    // ── 2. Acquire scratch and ensure capacity ────────────────────────────
+    std::lock_guard<std::mutex> slk(scratch_mu_);
+    if (total_n > 0) ensure_scratch_(total_n);
+
+    auto t_h2d = clock_t_::now();
+
+    // ── 3. Upload query once ──────────────────────────────────────────────
+    const size_t dim_sz = static_cast<size_t>(dim_);
+    if (total_n > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(d_query_scratch_, query,
+                                   dim_sz * sizeof(float),
+                                   cudaMemcpyHostToDevice, search_stream_));
+    }
+
+    auto t_kernels = clock_t_::now();
+
+    // ── 4. cuBLAS SGEMV path ──────────────────────────────────────────────
+    if (total_n > 0) {
+        // 4a. Pack all cluster VRAM buffers into one contiguous slab (D2D, same stream).
+        ensure_vecs_scratch_(total_n * dim_sz);
+        for (const auto& s : snaps) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                d_vecs_packed_ + s.offset * dim_sz,
+                s.vbuf->ptr,
+                s.n * dim_sz * sizeof(float),
+                cudaMemcpyDeviceToDevice, search_stream_));
         }
 
-        // ── CPU insert-buffer path: scan staged inserts ──────────────────
-        // Only GPU-resident clusters have an active buffer slot; check
-        // explicitly so non-resident cids skip the lookup.
+        // 4b. SGEMV: y[i] = dot(vec_i, query) for all i in [0, total_n).
+        //     d_vecs_packed_ is row-major [total_n × dim], which cuBLAS sees as
+        //     a column-major [dim × total_n] matrix (lda = dim).
+        //     OP_T transposes it → y = A^T * x computes one dot-product per row.
+        const float alpha = 1.f, beta = 0.f;
+        CUBLAS_CHECK(cublasSgemv(cublas_handle_, CUBLAS_OP_T,
+            static_cast<int>(dim_sz), static_cast<int>(total_n),
+            &alpha, d_vecs_packed_, static_cast<int>(dim_sz),
+            d_query_scratch_, 1,
+            &beta, d_dist_scratch_, 1));
+
+        // 4c. Convert inner products to the requested distance metric.
+        const int thr = 256;
+        const int blk = (static_cast<int>(total_n) + thr - 1) / thr;
+        if (metric_ == Metric::L2) {
+            // ||q - v||² = ||q||² + ||v||² - 2·q·v
+            k_squared_norms<<<blk, thr, 0, search_stream_>>>(
+                d_vecs_packed_, d_norms_scratch_,
+                static_cast<int>(total_n), static_cast<int>(dim_sz));
+            CUDA_CHECK(cudaGetLastError());
+
+            float qnorm = 0.f;
+            for (int d = 0; d < dim_; ++d) qnorm += query[d] * query[d];
+
+            k_l2_from_ip<<<blk, thr, 0, search_stream_>>>(
+                d_dist_scratch_, d_norms_scratch_, qnorm,
+                static_cast<int>(total_n));
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            // IP / cosine: negate so smallest score = best match.
+            const float neg_one = -1.f;
+            CUBLAS_CHECK(cublasSscal(cublas_handle_,
+                static_cast<int>(total_n), &neg_one, d_dist_scratch_, 1));
+        }
+    }
+
+    auto t_sync = clock_t_::now();
+
+    // ── 5. Single sync + single D2H (pinned — no staging latency) ─────────
+    if (total_n > 0) {
+        CUDA_CHECK(cudaStreamSynchronize(search_stream_));
+        CUDA_CHECK(cudaMemcpy(h_dist_scratch_, d_dist_scratch_,
+                              total_n * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+
+    auto t_topk = clock_t_::now();
+
+    // ── 6. CPU top-k per cluster, then merge ─────────────────────────────
+    std::unordered_map<DocId, float> best;
+    for (const auto& s : snaps) {
+        const float* dists = h_dist_scratch_ + s.offset;
+        std::vector<Pair> cands;
+        cands.reserve(s.n);
+        for (size_t i = 0; i < s.n; ++i)
+            cands.push_back(Pair{dists[i], s.h_ids[i]});
+        topk_smallest(cands, k);
+        for (const auto& p : cands) {
+            auto [it, ins] = best.emplace(p.id, p.score);
+            if (!ins && p.score < it->second) it->second = p.score;
+        }
+    }
+
+    // ── 7. CPU insert-buffer scan (unchanged) ─────────────────────────────
+    for (int cid : probe_cids) {
         if (buf.has_cluster(cid)) {
             std::vector<DocId>  b_ids;
             std::vector<float>  b_scores;
@@ -437,37 +632,41 @@ size_t GpuClusterIndex::collaborative_search(
                                    b_ids, b_scores);
             for (size_t i = 0; i < b_ids.size(); ++i) {
                 auto [it, ins] = best.emplace(b_ids[i], b_scores[i]);
-                if (!ins && b_scores[i] < it->second)
-                    it->second = b_scores[i];
+                if (!ins && b_scores[i] < it->second) it->second = b_scores[i];
             }
         }
     }
 
-    // Diagnostic: print per-phase breakdown aggregated over all clusters.
-    if (diag && n_clusters_searched > 0) {
-        double total = agg.stream_create_ms + agg.malloc_ms + agg.h2d_ms
-                     + agg.kernel_ms + agg.d2h_ms + agg.sync_ms
-                     + agg.free_ms + agg.topk_ms;
+    auto t_end = clock_t_::now();
+
+    if (timing) {
+        timing->h2d_ms    += fms_(t_kernels - t_h2d);
+        timing->kernel_ms += fms_(t_sync    - t_kernels);
+        timing->sync_d2h_ms += fms_(t_topk  - t_sync);
+        timing->topk_ms   += fms_(t_end     - t_topk);
+    }
+
+    if (diag && !snaps.empty()) {
         fprintf(stderr,
-            "[M3_GPU_DIAG] clusters=%d  "
-            "stream_create=%.1fms  malloc=%.1fms  h2d=%.1fms  "
-            "kernel=%.1fms  d2h=%.1fms  sync=%.1fms  "
-            "free=%.1fms  topk=%.1fms  TOTAL=%.1fms\n",
-            n_clusters_searched,
-            agg.stream_create_ms, agg.malloc_ms, agg.h2d_ms,
-            agg.kernel_ms, agg.d2h_ms, agg.sync_ms,
-            agg.free_ms, agg.topk_ms, total);
+            "[M3_GPU_DIAG] clusters=%d  total_vecs=%zu  "
+            "h2d=%.2fms  kernels=%.2fms  sync+d2h=%.2fms  topk=%.2fms  TOTAL=%.2fms\n",
+            (int)snaps.size(), total_n,
+            fms_(t_kernels - t_h2d),
+            fms_(t_sync    - t_kernels),
+            fms_(t_topk    - t_sync),
+            fms_(t_end     - t_topk),
+            fms_(t_end     - t_h2d));
         fflush(stderr);
     }
 
-    // Convert map -> sorted top-k.
+    // ── 8. Convert map -> sorted top-k ───────────────────────────────────
     std::vector<Pair> all;
     all.reserve(best.size());
     for (const auto& [id, sc] : best)
         all.push_back(Pair{sc, id});
     topk_smallest(all, k);
 
-    out_ids.clear();   out_ids.reserve(all.size());
+    out_ids.clear();    out_ids.reserve(all.size());
     out_scores.clear(); out_scores.reserve(all.size());
     for (const auto& p : all) {
         out_ids.push_back(p.id);

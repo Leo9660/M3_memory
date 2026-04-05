@@ -2,6 +2,7 @@
 #include "m3_logger.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <numeric>
 #include <queue>
@@ -10,6 +11,13 @@
 #include <utility>
 #include <mutex>
 #include <cblas.h>
+
+namespace {
+using idx_clock = std::chrono::steady_clock;
+inline double idx_fms(idx_clock::duration d) {
+    return std::chrono::duration<double, std::milli>(d).count();
+}
+} // anonymous namespace
 
 namespace m3 {
 
@@ -621,7 +629,8 @@ void IVFIndex::search_on(const std::vector<int>& cluster_ids,
 
 void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int nprobe,
                              std::vector<std::vector<DocId>>& out_ids,
-                             std::vector<std::vector<float>>& out_scores) const {
+                             std::vector<std::vector<float>>& out_scores,
+                             double* out_centroid_ms, double* out_scan_ms) const {
     out_ids.assign(q_rows, {});
     out_scores.assign(q_rows, {});
     if (!queries || q_rows == 0 || k <= 0) return;
@@ -676,6 +685,10 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
 
     std::vector<float> scores_mat(q_rows * NL);
 
+    double centroid_acc = 0.0;
+    double scan_acc     = 0.0;
+    const auto t_sgemm0 = (out_centroid_ms || out_scan_ms) ? idx_clock::now() : idx_clock::time_point{};
+
     if (metric_ == Metric::L2) {
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     (int)q_rows, live_nlist, dim_,
@@ -710,6 +723,8 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
         }
     }
 
+    if (out_centroid_ms || out_scan_ms) centroid_acc += idx_fms(idx_clock::now() - t_sgemm0);
+
     // Per-query: pick top-nprobe clusters and search them.
     std::vector<std::pair<float, int>> row_tmp;
     row_tmp.reserve(NL);
@@ -717,6 +732,8 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
     for (size_t qi = 0; qi < q_rows; ++qi) {
         const float* q         = queries + qi * D;
         const float* score_row = scores_mat.data() + qi * NL;
+
+        const auto t_topk0 = (out_centroid_ms || out_scan_ms) ? idx_clock::now() : idx_clock::time_point{};
 
         // 1) pick top-nprobe compact indices by centroid distance
         row_tmp.clear();
@@ -738,35 +755,23 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
             for (auto& p : row_tmp) chosen.push_back(compact_to_orig[p.second]);
         }
 
-        // print chosen for debug
-        // printf("Query %zu: chosen clusters:", qi);
-        // for (int cid : chosen) {
-        //     printf(" %d", cid);
-        // }
-        // printf("\n");
+        if (out_centroid_ms || out_scan_ms) centroid_acc += idx_fms(idx_clock::now() - t_topk0);
 
         // 2) prepare a single top-k buffer for THIS query
         std::vector<DocId> top_ids(k, (DocId)-1);
         std::vector<float> top_scores(k, std::numeric_limits<float>::infinity());
 
+        const auto t_scan0 = (out_centroid_ms || out_scan_ms) ? idx_clock::now() : idx_clock::time_point{};
+
         // 3) let each selected cluster try to improve this buffer
         for (int cid : chosen) {
-            // printf(" Searching cluster %d\n", cid);
-
             if (cid < 0 || cid >= (int)clusters_snap.size()) continue;
             auto c = clusters_snap[cid];
             if (!c) continue;
             c->search_into(q, k, top_ids, top_scores);
-
-            // printf("  After cluster %d: top_scores =", cid);
-            // for (float s : top_scores) {
-            //     printf(", %.4f", s);
-            // }
-            // for (DocId id : top_ids) {
-            //     printf(", %ld", id);
-            // }
-            // printf("\n");
         }
+
+        if (out_centroid_ms || out_scan_ms) scan_acc += idx_fms(idx_clock::now() - t_scan0);
 
         // 4) compact and sort final results (remove empty -1 slots)
         std::vector<int> idx;
@@ -801,12 +806,9 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
             os[i] = top_scores[idx[i]];
         }
 
-        // printf(" Query %zu: final results:", qi);
-        // for (size_t i = 0; i < oi.size(); ++i) {
-        //     printf(" (id=%ld, score=%.4f)", oi[i], os[i]);
-        // }
-        // printf("\n");
     }
+    if (out_centroid_ms) *out_centroid_ms = centroid_acc;
+    if (out_scan_ms)     *out_scan_ms     = scan_acc;
 }
 
 void IVFIndex::get_probe_ids(const float* query, int nprobe, std::vector<int>& out_ids) const {
@@ -821,7 +823,8 @@ void IVFIndex::get_probe_ids(const float* query, int nprobe, std::vector<int>& o
 }
 
 void IVFIndex::batch_get_probe_ids(const float* queries, size_t q_rows, int nprobe,
-                                    std::vector<std::vector<int>>& out_probe_ids) const {
+                                    std::vector<std::vector<int>>& out_probe_ids,
+                                    double* out_sgemm_ms, double* out_topk_ms) const {
     out_probe_ids.assign(q_rows, {});
     if (!queries || q_rows == 0 || nprobe <= 0) return;
 
@@ -860,6 +863,8 @@ void IVFIndex::batch_get_probe_ids(const float* queries, size_t q_rows, int npro
     // One sgemm: scores[q_rows × NL]
     std::vector<float> scores_mat(q_rows * NL);
 
+    const auto t_sgemm_start = (out_sgemm_ms || out_topk_ms) ? idx_clock::now() : idx_clock::time_point{};
+
     if (metric_ == Metric::L2) {
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     (int)q_rows, live_nlist, dim_,
@@ -891,6 +896,8 @@ void IVFIndex::batch_get_probe_ids(const float* queries, size_t q_rows, int npro
             for (float& s : scores_mat) s += 1.0f;
     }
 
+    const auto t_topk_start = (out_sgemm_ms || out_topk_ms) ? idx_clock::now() : idx_clock::time_point{};
+
     // Per-query top-nprobe selection from the score matrix.
     std::vector<std::pair<float, int>> row_tmp;
     row_tmp.reserve(NL);
@@ -916,6 +923,9 @@ void IVFIndex::batch_get_probe_ids(const float* queries, size_t q_rows, int npro
             for (auto& p : row_tmp) chosen.push_back(compact_to_orig[p.second]);
         }
     }
+
+    if (out_sgemm_ms) *out_sgemm_ms = idx_fms(t_topk_start  - t_sgemm_start);
+    if (out_topk_ms)  *out_topk_ms  = idx_fms(idx_clock::now() - t_topk_start);
 }
 
 void IVFIndex::search_within_cluster(int cluster_id, const float* query, int k,

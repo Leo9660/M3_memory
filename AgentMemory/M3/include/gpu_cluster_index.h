@@ -11,6 +11,7 @@
 
 #ifdef HAVE_CUDA
 #  include <cuda_runtime.h>
+#  include <cublas_v2.h>
 #endif
 
 namespace m3 {
@@ -26,6 +27,16 @@ struct GpuSearchTiming {
     double sync_ms          = 0; // cudaStreamSynchronize
     double free_ms          = 0; // cudaFree x2 + cudaStreamDestroy
     double topk_ms          = 0; // CPU top-k selection
+};
+
+// Per-call timing breakdown for collaborative_search() — filled when a non-null
+// pointer is passed. Phases correspond to the batched multi-cluster search path.
+// All times in milliseconds (wall-clock via std::chrono).
+struct GpuCollabTiming {
+    double h2d_ms    = 0; // query H2D upload (cudaMemcpyAsync into d_query_scratch_)
+    double kernel_ms = 0; // all CUDA distance kernels (async launch, host-side elapsed)
+    double sync_d2h_ms = 0; // cudaStreamSynchronize (kernel exec wait) + D2H copy
+    double topk_ms   = 0; // CPU top-k per cluster + merge + insert-buffer scan
 };
 
 // ======================================================================
@@ -132,13 +143,21 @@ public:
                                 int k,
                                 const ClusterInsertBuffer& buf,
                                 std::vector<DocId>&  out_ids,
-                                std::vector<float>&  out_scores) const;
+                                std::vector<float>&  out_scores,
+                                GpuCollabTiming*     timing = nullptr) const;
 
     int    dim()        const { return dim_; }
     Metric metric()     const { return metric_; }
     bool   normalized() const { return normalized_; }
 
+    // Destructor frees persistent GPU/pinned scratch buffers.
+    ~GpuClusterIndex();
+
 private:
+    // Grows persistent distance/norm scratch buffers (in floats). scratch_mu_ must be held.
+    void ensure_scratch_(size_t need) const;
+    // Grows persistent vector-pack scratch buffer (in floats). scratch_mu_ must be held.
+    void ensure_vecs_scratch_(size_t need_floats) const;
     // RAII wrapper around a cudaMalloc'd device buffer.
     // Shared ownership allows search_cluster() to snapshot the pointer without
     // holding the mutex across the kernel launch -- the buffer is kept alive
@@ -175,6 +194,21 @@ private:
 
     mutable std::mutex                    mu_;
     std::unordered_map<int, ClusterData>  clusters_;
+
+    // Persistent search scratch — allocated lazily on first collaborative_search,
+    // grown as needed. Protected by scratch_mu_.
+    mutable std::mutex   scratch_mu_;
+    mutable float*       d_query_scratch_ = nullptr; // GPU: [dim_] floats
+    mutable float*       d_dist_scratch_  = nullptr; // GPU: [scratch_cap_] — cuBLAS output / L2 dists
+    mutable float*       d_norms_scratch_ = nullptr; // GPU: [scratch_cap_] — squared vector norms (L2)
+    mutable float*       h_dist_scratch_  = nullptr; // pinned host: [scratch_cap_]
+    mutable size_t       scratch_cap_     = 0;
+    mutable float*       d_vecs_packed_   = nullptr; // GPU: [vecs_packed_cap_] — contiguous packed vecs
+    mutable size_t       vecs_packed_cap_ = 0;       // capacity in floats
+#ifdef HAVE_CUDA
+    mutable cudaStream_t   search_stream_  = nullptr;
+    mutable cublasHandle_t cublas_handle_  = nullptr;
+#endif
 };
 
 } // namespace m3
