@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import csv
+import os
+import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
 
@@ -12,6 +17,72 @@ from ..types import (
     RunResult,
     SearchHit,
 )
+
+
+class _FaissProfiler:
+    """
+    Writes per-batch timing CSVs when FAISS_PROFILE_DIR is set.
+
+    Two files are created at construction time:
+      <dir>/faiss_<timestamp>_search_profile.csv
+      <dir>/faiss_<timestamp>_insert_profile.csv
+    """
+
+    SEARCH_COLS = ["timestamp", "batch", "nprobe", "ef_search", "prep_ms", "faiss_search_ms", "result_build_ms", "total_ms"]
+    INSERT_COLS = ["timestamp", "batch", "prep_ms", "id_map_ms", "faiss_add_ms", "total_ms"]
+
+    def __init__(self, profile_dir: str) -> None:
+        p = Path(profile_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._search_path = p / f"faiss_{ts}_search_profile.csv"
+        self._insert_path = p / f"faiss_{ts}_insert_profile.csv"
+        self._search_f = self._search_path.open("w", newline="", encoding="utf-8")
+        self._insert_f = self._insert_path.open("w", newline="", encoding="utf-8")
+        self._search_w = csv.writer(self._search_f)
+        self._insert_w = csv.writer(self._insert_f)
+        self._search_w.writerow(self.SEARCH_COLS)
+        self._insert_w.writerow(self.INSERT_COLS)
+        self._search_f.flush()
+        self._insert_f.flush()
+        print(f"[FaissProfiler] search  → {self._search_path}")
+        print(f"[FaissProfiler] insert  → {self._insert_path}")
+
+    def log_search(self, batch: int, nprobe: int, ef_search: int, prep_ms: float, faiss_ms: float, result_ms: float) -> None:
+        total = prep_ms + faiss_ms + result_ms
+        self._search_w.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            batch,
+            nprobe,
+            ef_search,
+            f"{prep_ms:.3f}",
+            f"{faiss_ms:.3f}",
+            f"{result_ms:.3f}",
+            f"{total:.3f}",
+        ])
+        self._search_f.flush()
+
+    def log_insert(self, batch: int, prep_ms: float, id_map_ms: float, faiss_add_ms: float) -> None:
+        total = prep_ms + id_map_ms + faiss_add_ms
+        self._insert_w.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            batch,
+            f"{prep_ms:.3f}",
+            f"{id_map_ms:.3f}",
+            f"{faiss_add_ms:.3f}",
+            f"{total:.3f}",
+        ])
+        self._insert_f.flush()
+
+    def close(self) -> None:
+        self._search_f.close()
+        self._insert_f.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _import_faiss() -> Any:
@@ -49,6 +120,10 @@ class FaissBackend(MemoryBackend):
         self._metas: Dict[int, Dict[str, Optional[dict]]] = {}
         self._payloads: Dict[int, Dict[str, Any]] = {}
         self._next_int_id: Dict[int, int] = {}
+
+        # Profiler — defaults to ./profile, override with FAISS_PROFILE_DIR env var
+        _profile_dir = os.environ.get("FAISS_PROFILE_DIR", "profile").strip()
+        self._profiler = _FaissProfiler(_profile_dir)
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                           #
@@ -180,8 +255,11 @@ class FaissBackend(MemoryBackend):
         meta_store = self._metas[index_id]
         payload_store = self._payloads[index_id]
 
+        t0 = time.perf_counter()
         vecs = self._prep_vectors(index_id, vectors)
+        prep_ms = (time.perf_counter() - t0) * 1e3
 
+        t1 = time.perf_counter()
         int_ids = np.empty(len(ext_ids), dtype=np.int64)
         for i, ext_id in enumerate(ext_ids):
             key = str(ext_id) if ext_id is not None else "None"
@@ -198,8 +276,14 @@ class FaissBackend(MemoryBackend):
             meta_store[key] = metas[i]
             payload_store[key] = payloads[i]
             int_ids[i] = np.int64(new_id)
+        id_map_ms = (time.perf_counter() - t1) * 1e3
 
+        t2 = time.perf_counter()
         idx.add_with_ids(vecs, int_ids)
+        faiss_add_ms = (time.perf_counter() - t2) * 1e3
+
+        if self._profiler is not None:
+            self._profiler.log_insert(len(ext_ids), prep_ms, id_map_ms, faiss_add_ms)
 
     def _delete_ids(self, index_id: int, ext_ids: List[Any]) -> int:
         if not ext_ids:
@@ -247,18 +331,40 @@ class FaissBackend(MemoryBackend):
         if ntotal == 0:
             return [[] for _ in range(queries.shape[0])]
 
-        # Set nprobe on IVF indices; attribute is ignored on flat indices.
-        if hasattr(idx, "nprobe"):
-            idx.nprobe = nprobe
+        # Set nprobe on IVF indices (must go through extract_index_ivf —
+        # IndexIDMap2 wraps the sub-index and does not expose nprobe directly).
+        actual_nprobe = 0
+        try:
+            ivf = self._faiss.extract_index_ivf(idx)
+            ivf.nprobe = nprobe
+            actual_nprobe = ivf.nprobe  # read back to confirm
+        except Exception:
+            pass  # flat / HNSW index — nprobe has no meaning
+
+        # Set efSearch on HNSW indices (controls beam width during graph traversal).
+        actual_ef_search = 0
+        try:
+            hnsw = self._faiss.downcast_index(idx)
+            if hasattr(hnsw, "hnsw"):
+                hnsw.hnsw.efSearch = nprobe  # reuse nprobe arg as efSearch
+                actual_ef_search = hnsw.hnsw.efSearch
+        except Exception:
+            pass
 
         effective_k = min(k, ntotal)
+        t0 = time.perf_counter()
         qvecs = self._prep_vectors(index_id, queries)
+        prep_ms = (time.perf_counter() - t0) * 1e3
+
+        t1 = time.perf_counter()
         distances, ids = idx.search(qvecs, effective_k)
+        faiss_search_ms = (time.perf_counter() - t1) * 1e3
 
         int2ext = self._int2ext[index_id]
         meta_store = self._metas[index_id]
         payload_store = self._payloads[index_id]
 
+        t2 = time.perf_counter()
         results: List[List[SearchHit]] = []
         for qi in range(ids.shape[0]):
             hits: List[SearchHit] = []
@@ -271,6 +377,11 @@ class FaissBackend(MemoryBackend):
                 score = self._score(spec.metric, dist)
                 hits.append(SearchHit(id=key, score=score, metadata=meta))
             results.append(hits)
+        result_build_ms = (time.perf_counter() - t2) * 1e3
+
+        if self._profiler is not None:
+            self._profiler.log_search(queries.shape[0], actual_nprobe, actual_ef_search, prep_ms, faiss_search_ms, result_build_ms)
+
         return results
 
     # ------------------------------------------------------------------ #

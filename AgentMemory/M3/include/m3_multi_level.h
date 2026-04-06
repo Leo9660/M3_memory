@@ -293,9 +293,14 @@ private:
 
     // Promotion: per-query, cache top-k' results as a new query-centric L1 cluster,
     // and top-k'' subset into L0 with the same cluster ID.
+    // k_caller: the search k used by the caller — L0 is additionally capped at this
+    // so that L0 never holds more vectors per cluster than the caller requested.
+    // L1 is capped only by l1_neighborhood_k from CacheConfig (may exceed k_caller
+    // when L2 was searched with a wider k_promo = l1_neighborhood_k).
     void promote_query_to_l1_(const float* query,
                                const std::vector<DocId>& result_ids,
-                               const std::vector<float>& result_scores) const;
+                               const std::vector<float>& result_scores,
+                               int k_caller) const;
     void record_access_(int cid) const;
     void demote_cluster_(int cid) const;
     void run_vector_eviction_per_level_() const;

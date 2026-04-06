@@ -169,6 +169,15 @@ void IVFIndex::set_centroids(const std::vector<float>& centroids) {
     valid_.assign(static_cast<size_t>(nlist), true);
     centroids_ = centroids;
 
+    // Rebuild compact view from scratch — all slots are valid after set_centroids.
+    compact_centroids_ = centroids;
+    compact_to_orig_.resize(static_cast<size_t>(nlist));
+    orig_to_compact_.resize(static_cast<size_t>(nlist));
+    for (int cid = 0; cid < nlist; ++cid) {
+        compact_to_orig_[static_cast<size_t>(cid)] = cid;
+        orig_to_compact_[static_cast<size_t>(cid)] = cid;
+    }
+
     for (int cid = 0; cid < nlist; ++cid) {
         if (!clusters_[cid]) {
             // create empty cluster with this centroid
@@ -202,6 +211,15 @@ int IVFIndex::add_cluster(const std::vector<float>& centroid) {
     clusters_.push_back(std::make_shared<Cluster>(dim_, metric_, normalized_, cid, centroid));
     centroids_.insert(centroids_.end(), centroid.begin(), centroid.end());
     valid_.push_back(true);
+
+    // Append to compact view.
+    const int compact_idx = (int)compact_to_orig_.size();
+    compact_centroids_.insert(compact_centroids_.end(), centroid.begin(), centroid.end());
+    compact_to_orig_.push_back(cid);
+    if ((int)orig_to_compact_.size() <= cid)
+        orig_to_compact_.resize(static_cast<size_t>(cid + 1), -1);
+    orig_to_compact_[static_cast<size_t>(cid)] = compact_idx;
+
     return cid;
 }
 
@@ -211,6 +229,27 @@ void IVFIndex::remove_cluster_nolock_(int cluster_id) {
     if (cluster_id < 0 || cluster_id >= (int)clusters_.size()) return;
     valid_[static_cast<size_t>(cluster_id)] = false;
     clusters_[static_cast<size_t>(cluster_id)].reset();
+
+    // Swap-remove from compact view: move the last compact slot into the gap
+    // left by the removed cluster, then pop the (now-duplicate) last slot.
+    // Cost: O(dim) centroid copy — independent of total_slots.
+    const size_t cid_sz = static_cast<size_t>(cluster_id);
+    if (cid_sz >= orig_to_compact_.size() || orig_to_compact_[cid_sz] < 0) return;
+    const int ci      = orig_to_compact_[cid_sz];
+    const int last_ci = (int)compact_to_orig_.size() - 1;
+    if (ci != last_ci) {
+        // Overwrite slot ci with last slot's centroid and origin mapping.
+        const int last_orig = compact_to_orig_[static_cast<size_t>(last_ci)];
+        const size_t D = static_cast<size_t>(dim_);
+        std::copy(compact_centroids_.begin() + last_ci * D,
+                  compact_centroids_.begin() + (last_ci + 1) * D,
+                  compact_centroids_.begin() + ci * D);
+        compact_to_orig_[static_cast<size_t>(ci)] = last_orig;
+        orig_to_compact_[static_cast<size_t>(last_orig)] = ci;
+    }
+    compact_centroids_.resize(compact_centroids_.size() - static_cast<size_t>(dim_));
+    compact_to_orig_.pop_back();
+    orig_to_compact_[cid_sz] = -1;
 }
 
 void IVFIndex::remove_cluster(int cluster_id) {
@@ -227,9 +266,17 @@ void IVFIndex::set_centroid(int cluster_id, const std::vector<float>& centroid) 
     if (cluster_id < 0 || cluster_id >= (int)clusters_.size() || !valid_[static_cast<size_t>(cluster_id)]) {
         throw std::out_of_range("IVFIndex::set_centroid: invalid cluster_id");
     }
-    // update snapshot centroid
+    // Update raw centroids_ array.
     std::copy(centroid.begin(), centroid.end(),
               centroids_.begin() + cluster_id * (size_t)dim_);
+
+    // Mirror into compact view.
+    const int ci = (static_cast<size_t>(cluster_id) < orig_to_compact_.size())
+                   ? orig_to_compact_[static_cast<size_t>(cluster_id)] : -1;
+    if (ci >= 0) {
+        std::copy(centroid.begin(), centroid.end(),
+                  compact_centroids_.begin() + ci * static_cast<size_t>(dim_));
+    }
 
     // update underlying cluster's centroid
     // current Cluster does not expose a "set_centroid" method,
@@ -490,6 +537,14 @@ int IVFIndex::split_cluster(int cluster_id, size_t max_vectors_before_split) {
     clusters_[static_cast<size_t>(cluster_id)]->rebuild_from(ids0.data(), vecs0.data(), ids0.size());
     std::copy(c0.begin(), c0.end(), centroids_.begin() + static_cast<size_t>(cluster_id) * dim_sz);
 
+    // Mirror updated centroid into compact view for the original cluster.
+    const int ci_orig = (static_cast<size_t>(cluster_id) < orig_to_compact_.size())
+                        ? orig_to_compact_[static_cast<size_t>(cluster_id)] : -1;
+    if (ci_orig >= 0) {
+        std::copy(c0.begin(), c0.end(),
+                  compact_centroids_.begin() + ci_orig * dim_sz);
+    }
+
     // Create new cluster without re-locking topo_mu_ (avoid deadlock with add_cluster).
     const int new_cid = static_cast<int>(clusters_.size());
     M3Logger::instance().log_cpu_split(
@@ -497,6 +552,14 @@ int IVFIndex::split_cluster(int cluster_id, size_t max_vectors_before_split) {
     clusters_.push_back(std::make_shared<Cluster>(dim_, metric_, normalized_, new_cid, c1));
     centroids_.insert(centroids_.end(), c1.begin(), c1.end());
     valid_.push_back(true);
+
+    // Append new cluster to compact view.
+    const int compact_new = (int)compact_to_orig_.size();
+    compact_centroids_.insert(compact_centroids_.end(), c1.begin(), c1.end());
+    compact_to_orig_.push_back(new_cid);
+    if ((int)orig_to_compact_.size() <= new_cid)
+        orig_to_compact_.resize(static_cast<size_t>(new_cid + 1), -1);
+    orig_to_compact_[static_cast<size_t>(new_cid)] = compact_new;
 
     // Fill new cluster with its assigned vectors.
     clusters_[static_cast<size_t>(new_cid)]->add_batch(ids1.data(), vecs1.data(), ids1.size());
@@ -541,8 +604,17 @@ void IVFIndex::merge_clusters(int cluster_id_a, int cluster_id_b) {
             dst[d] = sum / static_cast<float>(n_a_old + n_b);
         }
     }
-    valid_[static_cast<size_t>(cluster_id_b)] = false;
-    clusters_[static_cast<size_t>(cluster_id_b)].reset();
+    // Remove cluster_b from compact view via swap-remove.
+    remove_cluster_nolock_(cluster_id_b);
+
+    // Mirror the updated centroid of cluster_a into compact view.
+    const int ci_a = (static_cast<size_t>(cluster_id_a) < orig_to_compact_.size())
+                     ? orig_to_compact_[static_cast<size_t>(cluster_id_a)] : -1;
+    if (ci_a >= 0) {
+        const float* new_cent = &centroids_[static_cast<size_t>(cluster_id_a) * dim_sz];
+        std::copy(new_cent, new_cent + dim_sz,
+                  compact_centroids_.begin() + ci_a * dim_sz);
+    }
 }
 
 void IVFIndex::export_cluster_live(int cluster_id,
@@ -571,6 +643,16 @@ void IVFIndex::ensure_cluster(int cluster_id, const std::vector<float>& centroid
     valid_[cid] = true;
     std::copy(centroid.begin(), centroid.end(), centroids_.begin() + cid * static_cast<size_t>(dim_));
     clusters_[cid] = std::make_shared<Cluster>(dim_, metric_, normalized_, static_cast<int>(cid), centroid);
+
+    // Add to compact view (slot may not have been in compact_ if it was previously invalid).
+    if (cid >= orig_to_compact_.size())
+        orig_to_compact_.resize(cid + 1, -1);
+    if (orig_to_compact_[cid] < 0) {
+        const int compact_idx = (int)compact_to_orig_.size();
+        compact_centroids_.insert(compact_centroids_.end(), centroid.begin(), centroid.end());
+        compact_to_orig_.push_back(static_cast<int>(cid));
+        orig_to_compact_[cid] = compact_idx;
+    }
 }
 
 void IVFIndex::search_on(const std::vector<int>& cluster_ids,
@@ -635,37 +717,22 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
     out_scores.assign(q_rows, {});
     if (!queries || q_rows == 0 || k <= 0) return;
 
-    // Snapshot once (shared_ptrs keep clusters alive if bg removes them)
-    std::vector<std::shared_ptr<Cluster>> clusters_snap;
-    std::vector<float> centroids_snap;
-    std::vector<bool> valid_snap;
-    {
-        std::shared_lock lk(topo_mu_);
-        clusters_snap = clusters_;
-        centroids_snap = centroids_;
-        valid_snap = valid_;
-    }
-
     const size_t D = static_cast<size_t>(dim_);
 
-    // Build a compact view of only live (valid) clusters so the BLAS GEMM
-    // operates on live_nlist centroids rather than all slots ever allocated.
-    // Ghost slots (removed clusters) inflate clusters_.size() but hold no data;
-    // skipping them keeps GEMM cost proportional to live cluster count.
-    std::vector<float> compact_centroids;
-    std::vector<int>   compact_to_orig;   // compact index → original cluster id
+    // Snapshot the pre-built compact view — O(live_nlist × D) copy instead of
+    // O(total_slots × D).  After N eviction cycles total_slots grows unboundedly
+    // while live_nlist stays constant; the old approach was the dominant cost.
+    std::vector<float>                   compact_centroids;
+    std::vector<int>                     compact_to_orig;
+    std::vector<std::shared_ptr<Cluster>> compact_clusters;
     {
-        const size_t total_slots = clusters_snap.size();
-        compact_centroids.reserve(total_slots * D);
-        compact_to_orig.reserve(total_slots);
-        for (size_t ci = 0; ci < total_slots; ++ci) {
-            if (ci < valid_snap.size() && valid_snap[ci] && clusters_snap[ci]) {
-                compact_centroids.insert(compact_centroids.end(),
-                    centroids_snap.data() + ci * D,
-                    centroids_snap.data() + ci * D + D);
-                compact_to_orig.push_back((int)ci);
-            }
-        }
+        std::shared_lock lk(topo_mu_);
+        compact_centroids = compact_centroids_;          // [live_nlist, dim]
+        compact_to_orig   = compact_to_orig_;            // [live_nlist]
+        const size_t n = compact_to_orig_.size();
+        compact_clusters.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            compact_clusters[i] = clusters_[static_cast<size_t>(compact_to_orig_[i])];
     }
     const int live_nlist = (int)compact_to_orig.size();
     if (live_nlist == 0) return;
@@ -735,24 +802,26 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
 
         const auto t_topk0 = (out_centroid_ms || out_scan_ms) ? idx_clock::now() : idx_clock::time_point{};
 
-        // 1) pick top-nprobe compact indices by centroid distance
+        // 1) pick top-nprobe compact indices by centroid distance.
+        //    chosen holds compact indices (not original cids) so we can index
+        //    compact_clusters[] directly in the scan step without a reverse lookup.
         row_tmp.clear();
         for (size_t ci = 0; ci < NL; ++ci)
             row_tmp.emplace_back(score_row[ci], (int)ci);
 
-        std::vector<int> chosen;
+        std::vector<int> chosen;   // compact indices, sorted nearest-first
         chosen.reserve(real_nprobe);
         if (real_nprobe >= (int)row_tmp.size()) {
             std::sort(row_tmp.begin(), row_tmp.end(),
                       [](const auto& a, const auto& b){ return a.first < b.first; });
-            for (auto& p : row_tmp) chosen.push_back(compact_to_orig[p.second]);
+            for (auto& p : row_tmp) chosen.push_back(p.second);
         } else {
             std::nth_element(row_tmp.begin(), row_tmp.begin() + real_nprobe, row_tmp.end(),
                              [](const auto& a, const auto& b){ return a.first < b.first; });
             row_tmp.resize(real_nprobe);
             std::sort(row_tmp.begin(), row_tmp.end(),
                       [](const auto& a, const auto& b){ return a.first < b.first; });
-            for (auto& p : row_tmp) chosen.push_back(compact_to_orig[p.second]);
+            for (auto& p : row_tmp) chosen.push_back(p.second);
         }
 
         if (out_centroid_ms || out_scan_ms) centroid_acc += idx_fms(idx_clock::now() - t_topk0);
@@ -763,10 +832,10 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
 
         const auto t_scan0 = (out_centroid_ms || out_scan_ms) ? idx_clock::now() : idx_clock::time_point{};
 
-        // 3) let each selected cluster try to improve this buffer
-        for (int cid : chosen) {
-            if (cid < 0 || cid >= (int)clusters_snap.size()) continue;
-            auto c = clusters_snap[cid];
+        // 3) scan each selected cluster (compact index → compact_clusters[ci])
+        for (int ci : chosen) {
+            if (ci < 0 || ci >= (int)compact_clusters.size()) continue;
+            auto& c = compact_clusters[static_cast<size_t>(ci)];
             if (!c) continue;
             c->search_into(q, k, top_ids, top_scores);
         }

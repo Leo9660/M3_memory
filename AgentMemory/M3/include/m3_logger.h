@@ -235,6 +235,16 @@ private:
     FILE*              fp_search_stats_   = nullptr;
     FILE*              fp_insert_         = nullptr;
     bool               enabled_           = false;
+
+    // Accumulators for end-of-run summary lines.
+    double   search_total_ms_sum_  = 0.0;
+    size_t   search_batch_count_   = 0;
+    double   insert_total_ms_sum_  = 0.0;
+    size_t   insert_batch_count_   = 0;
+    double   l0_exit_ms_sum_       = 0.0;
+    size_t   l0_exit_count_        = 0;
+    double   l1_exit_ms_sum_       = 0.0;
+    size_t   l1_exit_count_        = 0;
 };
 
 } // namespace m3

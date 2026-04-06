@@ -325,9 +325,36 @@ M3Profiler::M3Profiler() {
 
 M3Profiler::~M3Profiler() {
     std::lock_guard<std::mutex> lk(mu_);
-    if (fp_search_profile_) { fflush(fp_search_profile_); fclose(fp_search_profile_); fp_search_profile_ = nullptr; }
-    if (fp_search_stats_)   { fflush(fp_search_stats_);   fclose(fp_search_stats_);   fp_search_stats_   = nullptr; }
-    if (fp_insert_)         { fflush(fp_insert_);         fclose(fp_insert_);         fp_insert_         = nullptr; }
+    if (fp_search_profile_) {
+        if (search_batch_count_ > 0) {
+            fprintf(fp_search_profile_,
+                    "# SUMMARY  batches=%zu  avg_total_ms=%.3f  sum_total_ms=%.3f\n",
+                    search_batch_count_,
+                    search_total_ms_sum_ / static_cast<double>(search_batch_count_),
+                    search_total_ms_sum_);
+        }
+        fflush(fp_search_profile_); fclose(fp_search_profile_); fp_search_profile_ = nullptr;
+    }
+    if (fp_search_stats_) {
+        fprintf(fp_search_stats_,
+                "# SUMMARY  l0_exit_count=%zu  l0_exit_avg_ms=%.3f"
+                "  l1_exit_count=%zu  l1_exit_avg_ms=%.3f\n",
+                l0_exit_count_,
+                l0_exit_count_ > 0 ? l0_exit_ms_sum_ / static_cast<double>(l0_exit_count_) : 0.0,
+                l1_exit_count_,
+                l1_exit_count_ > 0 ? l1_exit_ms_sum_ / static_cast<double>(l1_exit_count_) : 0.0);
+        fflush(fp_search_stats_); fclose(fp_search_stats_); fp_search_stats_ = nullptr;
+    }
+    if (fp_insert_) {
+        if (insert_batch_count_ > 0) {
+            fprintf(fp_insert_,
+                    "# SUMMARY  batches=%zu  avg_total_ms=%.3f  sum_total_ms=%.3f\n",
+                    insert_batch_count_,
+                    insert_total_ms_sum_ / static_cast<double>(insert_batch_count_),
+                    insert_total_ms_sum_);
+        }
+        fflush(fp_insert_); fclose(fp_insert_); fp_insert_ = nullptr;
+    }
 }
 
 M3Profiler& M3Profiler::instance() {
@@ -404,6 +431,8 @@ void M3Profiler::log_search_profile(size_t q_rows,
         l2_gpu_ms, l2_cpu_ms,
         gpu_h2d_ms, gpu_kernel_ms, gpu_sync_d2h_ms, gpu_topk_ms,
         merge_ms, promotion_ms, total_ms);
+    search_total_ms_sum_ += total_ms;
+    ++search_batch_count_;
     write_search_profile_(buf);
 }
 
@@ -438,6 +467,10 @@ void M3Profiler::log_search_stats(size_t q_rows,
         promo_avg_ms,
         l0_clusters, l0_vecs, l1_clusters, l1_vecs,
         static_cast<double>(dagent), static_cast<double>(alpha_et), kth);
+    l0_exit_ms_sum_ += l0_exit_total_ms;
+    l0_exit_count_  += l0_exits;
+    l1_exit_ms_sum_ += l1_exit_total_ms;
+    l1_exit_count_  += l1_exits;
     write_search_stats_(buf);
 }
 
@@ -457,6 +490,8 @@ void M3Profiler::log_insert_row(size_t n_rows,
         ts, n_rows, total_ms,
         gpu_pending, assign_ms, assign_sgemm_ms, assign_topk_ms,
         l0l2_write_ms, gpu_dispatch_ms);
+    insert_total_ms_sum_ += total_ms;
+    ++insert_batch_count_;
     write_insert_(buf);
 }
 

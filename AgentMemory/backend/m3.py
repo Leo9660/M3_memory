@@ -574,7 +574,7 @@ class M3MultiGpuBackend(MemoryBackend):
         "l0_max_nlist":                0,
 
         # --- CacheConfig ---
-        "l0_max_clusters":             16,
+        "l0_max_clusters":             64,
         "l0_max_vectors_per_cluster":  1000,
         "l1_max_clusters":             128,
         "l1_max_vectors_per_cluster":  10000,
@@ -583,9 +583,9 @@ class M3MultiGpuBackend(MemoryBackend):
         "cold_time_ns":                60_000_000_000,  # 60 s
         "l1_neighborhood_k":           20,
         "l0_neighborhood_k":           5,
-        "max_promote_per_query":       0,
-        "l0_nprobe":                   0,
-        "l1_nprobe":                   0,
+        "max_promote_per_query":       20,
+        "l0_nprobe":                   32,
+        "l1_nprobe":                   32,
         "alpha_et":                    1.0,
         "dagent_window":               20,
         "dagent_mode":                 "cache_level_k",  # or "true_k"

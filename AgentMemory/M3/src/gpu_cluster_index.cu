@@ -24,6 +24,25 @@
 //   across CUDA kernel launches or synchronise calls.  Concurrent searches
 //   are safe during expansion because the old DeviceBuffer stays alive via
 //   shared_ptr ref-count until all snapshots release it.
+//
+// Optimisation notes (vs original)
+// ─────────────────────────────────
+//   search_cluster()      : FIXED — stream, d_query, and d_dists scratch
+//                           are now persistent (shared with collaborative_search
+//                           via ensure_scratch_). Per-call cudaStreamCreate /
+//                           cudaMalloc×2 / cudaFree×2 / cudaStreamDestroy
+//                           removed. topk_smallest (nth_element + sort) kept
+//                           as-is — O(N) + O(k log k) is optimal for post-hoc
+//                           flat-array selection; a heap would be O(N log k).
+//   collaborative_search(): FIXED — replaced std::unordered_map<DocId,float>
+//                           + final topk_smallest with a single streaming
+//                           max-heap of size k maintained across all clusters.
+//                           Eliminates: per-query map construction/destruction,
+//                           O(k × num_clusters) hash insertions, map→vector
+//                           conversion, and the second nth_element + sort pass.
+//                           An unordered_set<DocId> handles dedup (insert-buffer
+//                           vs flushed cluster overlap) at much lower cost than
+//                           the full score-keyed map.
 
 #include "gpu_cluster_index.h"
 
@@ -33,11 +52,12 @@
 #include <cstdlib>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <functional>   // std::greater
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace {
-// Returns true once per process (checked at first collaborative_search call).
 inline bool gpu_diag_enabled() {
     static const bool v = (std::getenv("M3_GPU_DIAG") != nullptr &&
                            std::getenv("M3_GPU_DIAG")[0] == '1');
@@ -52,15 +72,14 @@ inline double fms_(clock_t_::duration d) {
 namespace m3 {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CUDA error helper
+// CUDA error helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void cuda_check_(cudaError_t err, const char* file, int line) {
-    if (err != cudaSuccess) {
+    if (err != cudaSuccess)
         throw std::runtime_error(
             std::string("[M3 CUDA] ") + cudaGetErrorString(err) +
             " at " + file + ":" + std::to_string(line));
-    }
 }
 #define CUDA_CHECK(expr) cuda_check_((expr), __FILE__, __LINE__)
 
@@ -73,17 +92,13 @@ static void cublas_check_(cublasStatus_t st, const char* file, int line) {
 #define CUBLAS_CHECK(expr) cublas_check_((expr), __FILE__, __LINE__)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Distance kernels
+// Distance kernels  (unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// One thread per candidate vector.
-// The query is loaded cooperatively into shared memory so each block reads it
-// once from L1 cache rather than having every thread hit global memory.
-
 __global__ void k_l2_distances(
-        const float* __restrict__ query,   // [dim]  (device)
-        const float* __restrict__ vecs,    // [n × dim] row-major (device)
-        float*       __restrict__ dists,   // [n] output (device)
+        const float* __restrict__ query,
+        const float* __restrict__ vecs,
+        float*       __restrict__ dists,
         int n, int dim)
 {
     extern __shared__ float s_query[];
@@ -103,7 +118,6 @@ __global__ void k_l2_distances(
     dists[i] = acc;
 }
 
-// Inner-product: negate so "smallest score = best match" is consistent with L2.
 __global__ void k_ip_distances(
         const float* __restrict__ query,
         const float* __restrict__ vecs,
@@ -122,11 +136,9 @@ __global__ void k_ip_distances(
     float acc = 0.f;
     for (int d = 0; d < dim; ++d)
         acc += s_query[d] * v[d];
-    dists[i] = -acc;   // negate: top-k smallest = highest inner product
+    dists[i] = -acc;
 }
 
-// Compute squared L2 norm for each of N row-vectors of dimension dim.
-// Used to convert cuBLAS inner-product output to L2 distances.
 __global__ void k_squared_norms(const float* __restrict__ vecs,
                                  float*       __restrict__ norms,
                                  int N, int dim)
@@ -139,8 +151,6 @@ __global__ void k_squared_norms(const float* __restrict__ vecs,
     norms[i] = acc;
 }
 
-// Convert inner-product output to squared L2 distance in-place:
-//   dists[i] = qnorm + norms[i] - 2 * dists[i]
 __global__ void k_l2_from_ip(float*       __restrict__ dists,
                                const float* __restrict__ norms,
                                float qnorm, int N)
@@ -157,17 +167,15 @@ static void launch_distance_kernel(Metric metric,
                                    int n, int dim,
                                    cudaStream_t stream = 0)
 {
-    const int  threads  = 256;
-    const int  blocks   = (n + threads - 1) / threads;
-    const size_t smem   = static_cast<size_t>(dim) * sizeof(float);
+    const int    threads = 256;
+    const int    blocks  = (n + threads - 1) / threads;
+    const size_t smem    = static_cast<size_t>(dim) * sizeof(float);
 
-    if (metric == Metric::L2) {
-        k_l2_distances<<<blocks, threads, smem, stream>>>(
-            d_query, d_vecs, d_dists, n, dim);
-    } else {
-        k_ip_distances<<<blocks, threads, smem, stream>>>(
-            d_query, d_vecs, d_dists, n, dim);
-    }
+    if (metric == Metric::L2)
+        k_l2_distances<<<blocks, threads, smem, stream>>>(d_query, d_vecs, d_dists, n, dim);
+    else
+        k_ip_distances<<<blocks, threads, smem, stream>>>(d_query, d_vecs, d_dists, n, dim);
+
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -190,11 +198,7 @@ GpuClusterIndex::~GpuClusterIndex() {
     vecs_packed_cap_ = 0;
 }
 
-// ensure_scratch_ — lazily create persistent stream/cuBLAS handle/query buffer;
-// grow distance and norms scratch to hold at least `need` floats.
-// Must be called under scratch_mu_.
 void GpuClusterIndex::ensure_scratch_(size_t need) const {
-    // One-time: create stream, query buffer, and cuBLAS handle.
     if (!search_stream_) {
         CUDA_CHECK(cudaStreamCreate(&search_stream_));
         CUDA_CHECK(cudaMalloc(&d_query_scratch_,
@@ -204,7 +208,6 @@ void GpuClusterIndex::ensure_scratch_(size_t need) const {
     }
     if (need <= scratch_cap_) return;
 
-    // Grow to at least 2× current capacity (minimum 4096 floats = 16 KB).
     size_t new_cap = std::max(need, scratch_cap_ * 2);
     new_cap = std::max(new_cap, size_t(4096));
 
@@ -218,20 +221,16 @@ void GpuClusterIndex::ensure_scratch_(size_t need) const {
     scratch_cap_ = new_cap;
 }
 
-// ensure_vecs_scratch_ — grow the contiguous device packing buffer.
-// Must be called under scratch_mu_.
 void GpuClusterIndex::ensure_vecs_scratch_(size_t need_floats) const {
     if (need_floats <= vecs_packed_cap_) return;
     size_t new_cap = std::max(need_floats, vecs_packed_cap_ * 2);
-    new_cap = std::max(new_cap, size_t(65536)); // minimum 256 KB
+    new_cap = std::max(new_cap, size_t(65536));
 
     if (d_vecs_packed_) { cudaFree(d_vecs_packed_); d_vecs_packed_ = nullptr; }
     CUDA_CHECK(cudaMalloc(&d_vecs_packed_, new_cap * sizeof(float)));
     vecs_packed_cap_ = new_cap;
 }
 
-// store_cluster — H2D upload; replaces any existing data for cid.
-// Returns the device pointer as an opaque handle for GpuBudgetManager.
 void* GpuClusterIndex::store_cluster(int cid,
                                       const DocId* ids,
                                       const float* vecs,
@@ -239,18 +238,14 @@ void* GpuClusterIndex::store_cluster(int cid,
 {
     const size_t bytes = n * static_cast<size_t>(dim_) * sizeof(float);
 
-    // Allocate device buffer and upload (outside lock — H2D can be slow).
     float* d_ptr = nullptr;
     if (bytes > 0) {
         CUDA_CHECK(cudaMalloc(&d_ptr, bytes));
         CUDA_CHECK(cudaMemcpy(d_ptr, vecs, bytes, cudaMemcpyHostToDevice));
     }
     auto buf = std::make_shared<DeviceBuffer>(d_ptr, bytes);
-
-    // Build host ID list.
     std::vector<DocId> h_ids(ids, ids + n);
 
-    // Install under lock (brief).
     std::lock_guard<std::mutex> lk(mu_);
     ClusterData& cd = clusters_[cid];
     cd.vecs_buf = std::move(buf);
@@ -259,7 +254,6 @@ void* GpuClusterIndex::store_cluster(int cid,
     return static_cast<void*>(cd.d_vecs());
 }
 
-// remove_cluster — releases the shared_ptr; cudaFree fires when ref-count hits 0.
 bool GpuClusterIndex::remove_cluster(int cid) {
     std::lock_guard<std::mutex> lk(mu_);
     return clusters_.erase(cid) > 0;
@@ -281,12 +275,10 @@ size_t GpuClusterIndex::num_clusters() const {
     return clusters_.size();
 }
 
-// export_cluster — D2H copy of the device vectors + host IDs.
 bool GpuClusterIndex::export_cluster(int cid,
                                       std::vector<DocId>& out_ids,
                                       std::vector<float>& out_vecs) const
 {
-    // Snapshot shared_ptr and metadata under brief lock.
     std::shared_ptr<DeviceBuffer> buf;
     std::vector<DocId> h_ids;
     size_t n;
@@ -294,11 +286,10 @@ bool GpuClusterIndex::export_cluster(int cid,
         std::lock_guard<std::mutex> lk(mu_);
         auto it = clusters_.find(cid);
         if (it == clusters_.end()) return false;
-        buf    = it->second.vecs_buf;
-        h_ids  = it->second.h_ids;
-        n      = it->second.n;
+        buf   = it->second.vecs_buf;
+        h_ids = it->second.h_ids;
+        n     = it->second.n;
     }
-
     if (!buf || !buf->ptr || n == 0) return false;
 
     const size_t bytes = n * static_cast<size_t>(dim_) * sizeof(float);
@@ -307,16 +298,7 @@ bool GpuClusterIndex::export_cluster(int cid,
     out_ids = std::move(h_ids);
     return true;
 }
-// expand_cluster — zero-downtime expansion.
-//
-//   Old cluster stays searchable throughout; new buffer is built in parallel,
-//   then atomically swapped in. Old DeviceBuffer destructs (→ cudaFree) only
-//   after all shared_ptr holders (including in-flight searches) release it.
-//
-//   Transfer order (single stream):
-//     1. cudaMemcpy D2D  : existing GPU vectors → new buffer head
-//     2. cudaMemcpyAsync H2D : CPU insert-buffer vectors → new buffer tail
-//   Both complete before the atomic swap.
+
 size_t GpuClusterIndex::expand_cluster(int cid,
                                         const DocId* new_ids,
                                         const float* new_vecs,
@@ -324,7 +306,6 @@ size_t GpuClusterIndex::expand_cluster(int cid,
 {
     if (n_new == 0 || !new_ids || !new_vecs) return 0;
 
-    // ── 1. Snapshot old cluster (brief lock) ──────────────────────────────
     std::shared_ptr<DeviceBuffer> old_buf;
     std::vector<DocId>            old_ids;
     size_t                        n_old = 0;
@@ -332,71 +313,63 @@ size_t GpuClusterIndex::expand_cluster(int cid,
         std::lock_guard<std::mutex> lk(mu_);
         auto it = clusters_.find(cid);
         if (it == clusters_.end()) return 0;
-        old_buf  = it->second.vecs_buf;   // hold ref — keeps old data alive
-        old_ids  = it->second.h_ids;
-        n_old    = it->second.n;
-    }  // lock released — old cluster still searchable
+        old_buf = it->second.vecs_buf;
+        old_ids = it->second.h_ids;
+        n_old   = it->second.n;
+    }
 
     const size_t dim_sz    = static_cast<size_t>(dim_);
     const size_t n_total   = n_old + n_new;
     const size_t new_bytes = n_total * dim_sz * sizeof(float);
 
-    // ── 2. Allocate new device buffer ────────────────────────────────────
     float* d_new = nullptr;
     CUDA_CHECK(cudaMalloc(&d_new, new_bytes));
 
-    // ── 3 & 4. Transfer on a dedicated stream ────────────────────────────
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    if (n_old > 0 && old_buf && old_buf->ptr) {
-        // GPU→GPU: existing vectors into the head of the new buffer.
-        CUDA_CHECK(cudaMemcpyAsync(d_new,
-                                   old_buf->ptr,
+    if (n_old > 0 && old_buf && old_buf->ptr)
+        CUDA_CHECK(cudaMemcpyAsync(d_new, old_buf->ptr,
                                    n_old * dim_sz * sizeof(float),
                                    cudaMemcpyDeviceToDevice, stream));
-    }
 
-    // CPU→GPU: insert-buffer vectors into the tail (async on same stream).
-    CUDA_CHECK(cudaMemcpyAsync(d_new + n_old * dim_sz,
-                               new_vecs,
+    CUDA_CHECK(cudaMemcpyAsync(d_new + n_old * dim_sz, new_vecs,
                                n_new * dim_sz * sizeof(float),
                                cudaMemcpyHostToDevice, stream));
 
-    // ── 5. Wait for all transfers ─────────────────────────────────────────
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
 
-    // ── 6. Build new host ID list (CPU side) ──────────────────────────────
     std::vector<DocId> new_id_list = old_ids;
     new_id_list.insert(new_id_list.end(), new_ids, new_ids + n_new);
 
-    // ── 7. Atomic swap under lock ─────────────────────────────────────────
     auto new_buf = std::make_shared<DeviceBuffer>(d_new, new_bytes);
     {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = clusters_.find(cid);
-        if (it == clusters_.end()) {
-            // Cluster was removed concurrently — discard the new buffer.
-            // DeviceBuffer dtor will cudaFree d_new.
-            return 0;
-        }
+        if (it == clusters_.end()) return 0;
         it->second.vecs_buf = std::move(new_buf);
         it->second.h_ids    = std::move(new_id_list);
         it->second.n        = n_total;
     }
-
-    // ── 8. Release old buffer ─────────────────────────────────────────────
-    // old_buf shared_ptr goes out of scope here. If no concurrent search holds
-    // a reference, DeviceBuffer dtor fires immediately → cudaFree(old ptr).
-    // If a search is still using it, the free is deferred to that search's end.
-
     return n_new;
 }
 
-// search_cluster — GPU distance kernel + CPU top-k.
-//   Mutex held only for the brief snapshot; kernel runs outside the lock.
-//   If `timing` is non-null, per-phase wall-clock times (ms) are written into it.
+// ─────────────────────────────────────────────────────────────────────────────
+// search_cluster
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// FIX: eliminated per-call cudaStreamCreate / cudaMalloc×2 / cudaFree×2 /
+// cudaStreamDestroy.  The stream, d_query_scratch_, and d_dist_scratch_ are
+// now persistent, allocated once via ensure_scratch_ and reused across calls.
+// scratch_mu_ is held for the full duration of this call (same as
+// collaborative_search) so the two paths cannot race on the shared buffers.
+//
+// topk_smallest (nth_element O(N) + sort O(k log k)) is kept unchanged —
+// it is already asymptotically optimal for post-hoc selection on a flat
+// distance array that is fully resident in h_dist_scratch_.  Replacing it
+// with a heap (O(N log k)) would be strictly slower here.
+
 size_t GpuClusterIndex::search_cluster(int cid,
                                         const float* query,
                                         int k,
@@ -412,63 +385,53 @@ size_t GpuClusterIndex::search_cluster(int cid,
         std::lock_guard<std::mutex> lk(mu_);
         auto it = clusters_.find(cid);
         if (it == clusters_.end()) return 0;
-        buf    = it->second.vecs_buf;
-        h_ids  = it->second.h_ids;
-        n      = it->second.n;
+        buf   = it->second.vecs_buf;
+        h_ids = it->second.h_ids;
+        n     = it->second.n;
     }
     if (!buf || !buf->ptr || n == 0) return 0;
 
     const size_t dim_sz = static_cast<size_t>(dim_);
 
-    // cudaStreamCreate
-    cudaStream_t stream;
-    { auto _t = clock_t_::now(); CUDA_CHECK(cudaStreamCreate(&stream));
-      if (timing) timing->stream_create_ms += fms_(clock_t_::now() - _t); }
-
-    // cudaMalloc x2
-    float *d_query = nullptr, *d_dists = nullptr;
+    // Acquire persistent scratch — no per-call stream/malloc/free.
+    // scratch_mu_ is held for the duration so search_cluster and
+    // collaborative_search do not race on the shared buffers.
+    std::lock_guard<std::mutex> slk(scratch_mu_);
     { auto _t = clock_t_::now();
-      CUDA_CHECK(cudaMalloc(&d_query, dim_sz * sizeof(float)));
-      CUDA_CHECK(cudaMalloc(&d_dists, n * sizeof(float)));
+      ensure_scratch_(n);   // grows d_dist_scratch_ / h_dist_scratch_ if needed
       if (timing) timing->malloc_ms += fms_(clock_t_::now() - _t); }
 
-    // H2D: copy query
+    // H2D: copy query into persistent d_query_scratch_.
     { auto _t = clock_t_::now();
-      CUDA_CHECK(cudaMemcpyAsync(d_query, query, dim_sz * sizeof(float),
-                                 cudaMemcpyHostToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(d_query_scratch_, query,
+                                 dim_sz * sizeof(float),
+                                 cudaMemcpyHostToDevice, search_stream_));
       if (timing) timing->h2d_ms += fms_(clock_t_::now() - _t); }
 
-    // Launch distance kernel
-    std::vector<float> h_dists(n);
+    // Launch distance kernel into persistent search_stream_.
     { auto _t = clock_t_::now();
-      launch_distance_kernel(metric_, d_query, buf->ptr, d_dists,
-                             static_cast<int>(n), dim_, stream);
+      launch_distance_kernel(metric_, d_query_scratch_, buf->ptr, d_dist_scratch_,
+                             static_cast<int>(n), dim_, search_stream_);
       if (timing) timing->kernel_ms += fms_(clock_t_::now() - _t); }
 
-    // D2H distances
+    // D2H into persistent pinned h_dist_scratch_.
     { auto _t = clock_t_::now();
-      CUDA_CHECK(cudaMemcpyAsync(h_dists.data(), d_dists, n * sizeof(float),
-                                 cudaMemcpyDeviceToHost, stream));
+      CUDA_CHECK(cudaMemcpyAsync(h_dist_scratch_, d_dist_scratch_,
+                                 n * sizeof(float),
+                                 cudaMemcpyDeviceToHost, search_stream_));
       if (timing) timing->d2h_ms += fms_(clock_t_::now() - _t); }
 
-    // Stream sync
+    // Sync — actual GPU execution time lands here.
     { auto _t = clock_t_::now();
-      CUDA_CHECK(cudaStreamSynchronize(stream));
+      CUDA_CHECK(cudaStreamSynchronize(search_stream_));
       if (timing) timing->sync_ms += fms_(clock_t_::now() - _t); }
 
-    // Free + stream destroy
-    { auto _t = clock_t_::now();
-      cudaFree(d_query);
-      cudaFree(d_dists);
-      cudaStreamDestroy(stream);
-      if (timing) timing->free_ms += fms_(clock_t_::now() - _t); }
-
-    // Top-k on CPU using the snapshotted host IDs.
+    // CPU top-k: nth_element O(N) + sort O(k log k) — optimal for flat array.
     auto _t_topk = clock_t_::now();
     std::vector<Pair> cands;
     cands.reserve(n);
     for (size_t i = 0; i < n; ++i)
-        cands.push_back(Pair{h_dists[i], h_ids[i]});
+        cands.push_back(Pair{h_dist_scratch_[i], h_ids[i]});
     topk_smallest(cands, k);
     if (timing) timing->topk_ms += fms_(clock_t_::now() - _t_topk);
 
@@ -481,19 +444,26 @@ size_t GpuClusterIndex::search_cluster(int cid,
     return cands.size();
 }
 
-// collaborative_search — batched GPU cluster scan + CPU insert-buffer scan.
+// ─────────────────────────────────────────────────────────────────────────────
+// collaborative_search
+// ─────────────────────────────────────────────────────────────────────────────
 //
-// Optimisation pipeline:
-//   1. Snapshot all cluster VRAM pointers under one brief lock pass.
-//   2. Upload query once (H2D) to persistent d_query_scratch_.
-//   3. D2D-pack all cluster vectors into contiguous d_vecs_packed_ (GPU→GPU,
-//      same stream, ~400 GB/s — avoids host round-trip).
-//   4. cuBLAS SGEMV: one highly-parallelised matrix-vector multiply computes
-//      all inner products in a single kernel launch (replaces N tiny kernels).
-//   5. Two small correction kernels convert inner products → L2 distances
-//      (or cublasSscal negates for IP/cosine metric).
-//   6. One cudaStreamSynchronize + one D2H into pinned h_dist_scratch_.
-//   7. CPU top-k per cluster, then merge + insert-buffer scan.
+// FIX: replaced std::unordered_map<DocId,float> + final topk_smallest with a
+// single streaming max-heap of size k maintained across all clusters.
+//
+// OLD cost per query:
+//   - unordered_map constructed and destroyed every call
+//   - k × num_clusters hash insertions (high constant factor, poor cache behaviour)
+//   - map → vector conversion before final sort
+//   - second nth_element + sort on merged results
+//
+// NEW cost per query:
+//   - std::vector<Pair> pre-reserved to k+1 — one allocation, reused as heap
+//   - O(log k) push_heap / pop_heap per candidate that beats current worst
+//   - unordered_set<DocId> for dedup (insert-buffer vs flushed cluster overlap)
+//     — membership-only, no score storage, much cheaper than full score map
+//   - final std::sort_heap O(k log k) to produce sorted output — unavoidable
+
 size_t GpuClusterIndex::collaborative_search(
         const std::vector<int>& probe_cids,
         const float* query,
@@ -510,7 +480,7 @@ size_t GpuClusterIndex::collaborative_search(
         std::shared_ptr<DeviceBuffer> vbuf;
         std::vector<DocId>            h_ids;
         size_t                        n;
-        size_t                        offset; // offset into scratch buffer
+        size_t                        offset;
         int                           cid;
     };
     std::vector<Snap> snaps;
@@ -551,7 +521,6 @@ size_t GpuClusterIndex::collaborative_search(
 
     // ── 4. cuBLAS SGEMV path ──────────────────────────────────────────────
     if (total_n > 0) {
-        // 4a. Pack all cluster VRAM buffers into one contiguous slab (D2D, same stream).
         ensure_vecs_scratch_(total_n * dim_sz);
         for (const auto& s : snaps) {
             CUDA_CHECK(cudaMemcpyAsync(
@@ -561,10 +530,6 @@ size_t GpuClusterIndex::collaborative_search(
                 cudaMemcpyDeviceToDevice, search_stream_));
         }
 
-        // 4b. SGEMV: y[i] = dot(vec_i, query) for all i in [0, total_n).
-        //     d_vecs_packed_ is row-major [total_n × dim], which cuBLAS sees as
-        //     a column-major [dim × total_n] matrix (lda = dim).
-        //     OP_T transposes it → y = A^T * x computes one dot-product per row.
         const float alpha = 1.f, beta = 0.f;
         CUBLAS_CHECK(cublasSgemv(cublas_handle_, CUBLAS_OP_T,
             static_cast<int>(dim_sz), static_cast<int>(total_n),
@@ -572,11 +537,9 @@ size_t GpuClusterIndex::collaborative_search(
             d_query_scratch_, 1,
             &beta, d_dist_scratch_, 1));
 
-        // 4c. Convert inner products to the requested distance metric.
         const int thr = 256;
         const int blk = (static_cast<int>(total_n) + thr - 1) / thr;
         if (metric_ == Metric::L2) {
-            // ||q - v||² = ||q||² + ||v||² - 2·q·v
             k_squared_norms<<<blk, thr, 0, search_stream_>>>(
                 d_vecs_packed_, d_norms_scratch_,
                 static_cast<int>(total_n), static_cast<int>(dim_sz));
@@ -590,7 +553,6 @@ size_t GpuClusterIndex::collaborative_search(
                 static_cast<int>(total_n));
             CUDA_CHECK(cudaGetLastError());
         } else {
-            // IP / cosine: negate so smallest score = best match.
             const float neg_one = -1.f;
             CUBLAS_CHECK(cublasSscal(cublas_handle_,
                 static_cast<int>(total_n), &neg_one, d_dist_scratch_, 1));
@@ -599,7 +561,7 @@ size_t GpuClusterIndex::collaborative_search(
 
     auto t_sync = clock_t_::now();
 
-    // ── 5. Single sync + single D2H (pinned — no staging latency) ─────────
+    // ── 5. Single sync + single D2H (pinned) ─────────────────────────────
     if (total_n > 0) {
         CUDA_CHECK(cudaStreamSynchronize(search_stream_));
         CUDA_CHECK(cudaMemcpy(h_dist_scratch_, d_dist_scratch_,
@@ -608,22 +570,54 @@ size_t GpuClusterIndex::collaborative_search(
 
     auto t_topk = clock_t_::now();
 
-    // ── 6. CPU top-k per cluster, then merge ─────────────────────────────
-    std::unordered_map<DocId, float> best;
+    // ── 6. Streaming max-heap top-k across all clusters ───────────────────
+    //
+    // heap is a max-heap (largest score at top) capped at k elements.
+    // For each candidate: if heap not full → push; else if candidate beats
+    // current worst (heap.front()) → evict worst, push candidate.
+    // Result: heap holds the k smallest scores seen across all clusters.
+    //
+    // seen tracks DocIds already in the heap so that a DocId appearing in
+    // both a flushed cluster and the insert buffer is not double-counted.
+    // This is membership-only — no score storage — making it far cheaper
+    // than the previous unordered_map<DocId,float>.
+
+    auto cmp = [](const Pair& a, const Pair& b){ return a.score < b.score; };
+    // max-heap: cmp reversed so heap.front() is the largest (worst) score.
+    auto heap_cmp = [](const Pair& a, const Pair& b){ return a.score < b.score; };
+
+    std::vector<Pair> heap;
+    heap.reserve(static_cast<size_t>(k) + 1);
+    std::unordered_set<DocId> seen;
+    seen.reserve(static_cast<size_t>(k) * 2);
+
+    // Stream linearly through contiguous pinned h_dist_scratch_ — cache friendly.
     for (const auto& s : snaps) {
         const float* dists = h_dist_scratch_ + s.offset;
-        std::vector<Pair> cands;
-        cands.reserve(s.n);
-        for (size_t i = 0; i < s.n; ++i)
-            cands.push_back(Pair{dists[i], s.h_ids[i]});
-        topk_smallest(cands, k);
-        for (const auto& p : cands) {
-            auto [it, ins] = best.emplace(p.id, p.score);
-            if (!ins && p.score < it->second) it->second = p.score;
+        for (size_t i = 0; i < s.n; ++i) {
+            const float  sc = dists[i];
+            const DocId  id = s.h_ids[i];
+
+            if (seen.count(id)) continue;  // already represented by better score
+
+            if ((int)heap.size() < k) {
+                heap.push_back({sc, id});
+                std::push_heap(heap.begin(), heap.end(), heap_cmp);
+                seen.insert(id);
+            } else if (sc < heap.front().score) {
+                // Evict current worst from heap and seen, insert better candidate.
+                seen.erase(heap.front().id);
+                std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+                heap.back() = {sc, id};
+                std::push_heap(heap.begin(), heap.end(), heap_cmp);
+                seen.insert(id);
+            }
         }
     }
 
-    // ── 7. CPU insert-buffer scan (unchanged) ─────────────────────────────
+    // ── 7. Insert-buffer scan ─────────────────────────────────────────────
+    // Same heap + seen set — insert-buffer candidates participate in the same
+    // global top-k, deduped against already-seen flushed-cluster DocIds.
     for (int cid : probe_cids) {
         if (buf.has_cluster(cid)) {
             std::vector<DocId>  b_ids;
@@ -631,8 +625,22 @@ size_t GpuClusterIndex::collaborative_search(
             buf.scan_insert_buffer(cid, query, k, metric_, normalized_,
                                    b_ids, b_scores);
             for (size_t i = 0; i < b_ids.size(); ++i) {
-                auto [it, ins] = best.emplace(b_ids[i], b_scores[i]);
-                if (!ins && b_scores[i] < it->second) it->second = b_scores[i];
+                const float  sc = b_scores[i];
+                const DocId  id = b_ids[i];
+
+                if (seen.count(id)) continue;
+
+                if ((int)heap.size() < k) {
+                    heap.push_back({sc, id});
+                    std::push_heap(heap.begin(), heap.end(), heap_cmp);
+                    seen.insert(id);
+                } else if (sc < heap.front().score) {
+                    seen.erase(heap.front().id);
+                    std::pop_heap(heap.begin(), heap.end(), heap_cmp);
+                    heap.back() = {sc, id};
+                    std::push_heap(heap.begin(), heap.end(), heap_cmp);
+                    seen.insert(id);
+                }
             }
         }
     }
@@ -640,10 +648,10 @@ size_t GpuClusterIndex::collaborative_search(
     auto t_end = clock_t_::now();
 
     if (timing) {
-        timing->h2d_ms    += fms_(t_kernels - t_h2d);
-        timing->kernel_ms += fms_(t_sync    - t_kernels);
-        timing->sync_d2h_ms += fms_(t_topk  - t_sync);
-        timing->topk_ms   += fms_(t_end     - t_topk);
+        timing->h2d_ms      += fms_(t_kernels - t_h2d);
+        timing->kernel_ms   += fms_(t_sync    - t_kernels);
+        timing->sync_d2h_ms += fms_(t_topk    - t_sync);
+        timing->topk_ms     += fms_(t_end     - t_topk);
     }
 
     if (diag && !snaps.empty()) {
@@ -659,20 +667,17 @@ size_t GpuClusterIndex::collaborative_search(
         fflush(stderr);
     }
 
-    // ── 8. Convert map -> sorted top-k ───────────────────────────────────
-    std::vector<Pair> all;
-    all.reserve(best.size());
-    for (const auto& [id, sc] : best)
-        all.push_back(Pair{sc, id});
-    topk_smallest(all, k);
+    // ── 8. Heap → sorted output ───────────────────────────────────────────
+    // sort_heap produces ascending order (smallest score first).
+    std::sort_heap(heap.begin(), heap.end(), heap_cmp);
 
-    out_ids.clear();    out_ids.reserve(all.size());
-    out_scores.clear(); out_scores.reserve(all.size());
-    for (const auto& p : all) {
+    out_ids.clear();    out_ids.reserve(heap.size());
+    out_scores.clear(); out_scores.reserve(heap.size());
+    for (const auto& p : heap) {
         out_ids.push_back(p.id);
         out_scores.push_back(p.score);
     }
-    return all.size();
+    return heap.size();
 }
 
 } // namespace m3

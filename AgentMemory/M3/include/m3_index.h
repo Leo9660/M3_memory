@@ -142,10 +142,26 @@ private:
     const char*  layer_name_;   // short debug label, e.g. "L0"/"L1"/"L2"/"??"
 
     // Topology & data
-    mutable std::shared_mutex topo_mu_;       // guards clusters_, centroids_, valid_
+    mutable std::shared_mutex topo_mu_;       // guards all topology below
     std::vector<std::shared_ptr<Cluster>> clusters_; // cluster_id == index
-    std::vector<float> centroids_;            // row-major [nlist, dim_]
+    std::vector<float> centroids_;            // row-major [nlist, dim_], indexed by cluster_id
     std::vector<bool> valid_;                // valid_[cid] => slot is in use (not removed)
+
+    // Pre-built compact view — only live clusters, no holes.
+    // Kept in sync with add_cluster / remove_cluster / set_centroid / ensure_cluster / split / merge.
+    // Guarded by topo_mu_ (unique for writes, shared for reads).
+    //
+    // Invariant: compact_centroids_.size() == compact_to_orig_.size() * dim_
+    //            compact_to_orig_[i]  = original cluster_id for compact slot i
+    //            orig_to_compact_[cid] = compact slot for cluster_id cid (-1 if invalid)
+    //
+    // Using a pre-built compact view eliminates the O(total_slots * dim) snapshot rebuild
+    // that search_nprobe previously did on every call.  After N eviction cycles the
+    // total_slots grows without bound while live_nlist stays constant; the rebuild was
+    // the dominant cost (~46 MB copy per call at 60 batches × 256 queries/batch).
+    std::vector<float> compact_centroids_;   // [live_nlist, dim_]
+    std::vector<int>   compact_to_orig_;     // compact_idx → original cluster_id
+    std::vector<int>   orig_to_compact_;     // cluster_id  → compact_idx  (-1 = invalid)
 };
 
 } // namespace m3

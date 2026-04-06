@@ -764,9 +764,18 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             if (profiling) p_probe_ms = fms(clock::now() - t0).count();
         }
 
+        // k_promo: how many L2 candidates to retrieve for L1 promotion.
+        // L1 uses all k_promo results; L0 gets min(l0_neighborhood_k, k); caller gets top k.
+        // When l1_neighborhood_k <= k, k_promo == k and there is no extra L2 work.
+        const int k_promo = std::max(k, cache_config_.l1_neighborhood_k);
+
         std::vector<int> probe_ids;
         std::vector<std::vector<DocId>> l0_ids(1), l1_ids(1), l2_ids(1);
         std::vector<std::vector<float>> l0_scores(1), l1_scores(1), l2_scores(1);
+        // Raw L2-only results (up to k_promo) saved per query for L1 promotion.
+        // Populated only for stage-3 (L2-reaching) queries.
+        std::vector<std::vector<DocId>>  promo_ids(q_rows);
+        std::vector<std::vector<float>>  promo_scores(q_rows);
         // 0 = no results, 1 = satisfied by L0 only, 2 = satisfied after L1, 3 = needed L2
         std::vector<int>   stage(q_rows, 0);
         // k-th distance at the point of early exit for each query (inf if no early exit).
@@ -920,7 +929,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                         const auto t_gpu0 = profiling ? clock::now() : clock::time_point{};
                         auto gpu_fut = !gpu_cids.empty()
                             ? std::async(std::launch::async, [&]() {
-                                  gpu_coord_->search(gpu_cids, qptr, k,
+                                  gpu_coord_->search(gpu_cids, qptr, k_promo,
                                                      gpu_l2_ids, gpu_l2_scores,
                                                      profiling ? &p_gpu_timing : nullptr);
                               })
@@ -929,7 +938,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                         // CPU L2 path runs on this thread while GPU thread is active.
                         const auto t_cpu0 = profiling ? clock::now() : clock::time_point{};
                         if (!cpu_cids.empty())
-                            l2.index->search_on(cpu_cids, qptr, 1, k,
+                            l2.index->search_on(cpu_cids, qptr, 1, k_promo,
                                                 l2_ids, l2_scores);
                         if (profiling) p_l2_cpu_ms += fms(clock::now() - t_cpu0).count();
 
@@ -944,9 +953,14 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     } else {
                         if (profiling) p_l2_cpu_clusters += probe_ids.size();
                         const auto t0 = profiling ? clock::now() : clock::time_point{};
-                        l2.index->search_on(probe_ids, qptr, 1, k, l2_ids, l2_scores);
+                        l2.index->search_on(probe_ids, qptr, 1, k_promo, l2_ids, l2_scores);
                         if (profiling) p_l2_cpu_ms += fms(clock::now() - t0).count();
                     }
+                    // Save the raw L2 results (up to k_promo) for L1 promotion before
+                    // the merge step truncates to k. L2 results are already sorted by
+                    // distance (nearest-first) from search_on / gpu search.
+                    promo_ids[qi]    = l2_ids[0];
+                    promo_scores[qi] = l2_scores[0];
                     {
                         const auto t0 = profiling ? clock::now() : clock::time_point{};
                         std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0], l2_ids[0]};
@@ -1020,9 +1034,17 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     record_access_(it->second);
                 }
                 // L1: per-query promotion — top-k' results form one new query-centric cluster.
-                if (st != 1 && !out_ids[qi].empty()) {
+                // Stage 3 (L2-reaching): promote with the wider k_promo L2 results so
+                //   L1 gets up to l1_neighborhood_k vectors and L0 gets min(l0_nbk, k).
+                // Stage 2 (L1 early-exit): promote with the existing merged results (top-k)
+                //   since no L2 search was performed; behavior unchanged from before.
+                // Stage 1 (L0 early-exit): no promotion (already hot in L0).
+                if (st == 3 && !promo_ids[qi].empty()) {
                     const float* qptr_qi = queries + qi * dim_sz;
-                    promote_query_to_l1_(qptr_qi, out_ids[qi], out_scores[qi]);
+                    promote_query_to_l1_(qptr_qi, promo_ids[qi], promo_scores[qi], k);
+                } else if (st == 2 && !out_ids[qi].empty()) {
+                    const float* qptr_qi = queries + qi * dim_sz;
+                    promote_query_to_l1_(qptr_qi, out_ids[qi], out_scores[qi], k);
                 }
             }
         }
@@ -1674,7 +1696,8 @@ void MultiLevelIndex::record_access_(int cid) const {
 
 void MultiLevelIndex::promote_query_to_l1_(const float* query,
                                             const std::vector<DocId>& result_ids,
-                                            const std::vector<float>& /*result_scores*/) const {
+                                            const std::vector<float>& /*result_scores*/,
+                                            int k_caller) const {
     if (!l1_.index || result_ids.empty() || !query) return;
 
     const size_t dim_sz = static_cast<size_t>(dim_);
@@ -1760,10 +1783,13 @@ void MultiLevelIndex::promote_query_to_l1_(const float* query,
               l1_.centroids.begin() + l1_cid * dim_sz);
 
     // Populate L0 with the top-k'' subset using the same cluster ID.
+    // L0 is capped at min(l0_neighborhood_k, k_caller) so it never holds more
+    // vectors per cluster than the caller's search k (keeps L0 lean and fast).
     if (l0_.index) {
         int l0_k = cache_config_.l0_neighborhood_k;
         if (l0_k <= 0) l0_k = 1;
-        const size_t n_l0 = std::min(static_cast<size_t>(l0_k), new_ids.size());
+        const int l0_cap = (k_caller > 0) ? std::min(l0_k, k_caller) : l0_k;
+        const size_t n_l0 = std::min(static_cast<size_t>(l0_cap), new_ids.size());
         l0_.index->ensure_cluster(l1_cid, query_cent);
         l0_.centroids.resize((static_cast<size_t>(l1_cid) + 1) * dim_sz, 0.0f);
         std::copy(query_cent.begin(), query_cent.end(),
