@@ -89,6 +89,7 @@ void Cluster::add_batch(const DocId* ids, const float* vecs, size_t n_rows) {
     ids_.resize(new_rows);
     alive_.resize(new_rows);
     mat_.resize(new_rows * (size_t)dim_);
+    norms_.resize(new_rows);
     last_access_time_.resize(new_rows);
     id2row_.reserve(id2row_.size() + n_rows);
 
@@ -98,8 +99,11 @@ void Cluster::add_batch(const DocId* ids, const float* vecs, size_t n_rows) {
     std::memcpy(mat_.data() + old_rows * (size_t)dim_,
                 vecs,
                 n_rows * (size_t)dim_ * sizeof(float));
-    for (size_t r = old_rows; r < new_rows; ++r)
+    for (size_t r = old_rows; r < new_rows; ++r) {
         last_access_time_[r] = now;
+        norms_[r] = ip_score(mat_.data() + r * (size_t)dim_,
+                             mat_.data() + r * (size_t)dim_, dim_);
+    }
 
     // --- Build id2row_ mapping (single linear pass) ---
     for (size_t r = 0; r < n_rows; ++r) {
@@ -111,6 +115,7 @@ void Cluster::add_batch(const DocId* ids, const float* vecs, size_t n_rows) {
     // sanity
     assert(mat_.size() == ids_.size() * (size_t)dim_);
     assert(alive_.size() == ids_.size());
+    assert(norms_.size() == ids_.size());
     assert(last_access_time_.size() == ids_.size());
 }
 
@@ -133,6 +138,7 @@ void Cluster::update_batch(const DocId* ids, const float* vecs, size_t n_rows,
             ids_.push_back(id);
             alive_.push_back(1u);
             mat_.insert(mat_.end(), src, src + dim_);
+            norms_.push_back(ip_score(src, src, dim_));
             last_access_time_.push_back(now);
             id2row_.emplace(id, row);
             ++live_count_;
@@ -140,6 +146,7 @@ void Cluster::update_batch(const DocId* ids, const float* vecs, size_t n_rows,
             uint32_t row = it->second;
             float* dst = row_ptr_(row);
             std::copy(src, src + dim_, dst);
+            norms_[row] = ip_score(dst, dst, dim_);
             last_access_time_[row] = now;
         }
     }
@@ -147,6 +154,7 @@ void Cluster::update_batch(const DocId* ids, const float* vecs, size_t n_rows,
     // sanity
     assert(mat_.size() == ids_.size() * (size_t)dim_);
     assert(alive_.size() == ids_.size());
+    assert(norms_.size() == ids_.size());
     assert(last_access_time_.size() == ids_.size());
 }
 
@@ -178,6 +186,7 @@ void Cluster::rebuild_from(const DocId* ids, const float* vecs, size_t n_rows) {
     ids_.resize(n_rows);
     alive_.assign(n_rows, 1u);
     mat_.resize(n_rows * (size_t)dim_);
+    norms_.resize(n_rows);
     last_access_time_.assign(n_rows, now);
     id2row_.clear();
     id2row_.reserve(n_rows);
@@ -189,12 +198,15 @@ void Cluster::rebuild_from(const DocId* ids, const float* vecs, size_t n_rows) {
 
     for (size_t row = 0; row < n_rows; ++row) {
         id2row_.emplace(ids_[row], static_cast<uint32_t>(row));
+        norms_[row] = ip_score(mat_.data() + row * (size_t)dim_,
+                               mat_.data() + row * (size_t)dim_, dim_);
     }
 
     live_count_ = n_rows;
 
     assert(mat_.size() == ids_.size() * (size_t)dim_);
     assert(alive_.size() == ids_.size());
+    assert(norms_.size() == ids_.size());
     assert(last_access_time_.size() == ids_.size());
 }
 
@@ -247,9 +259,10 @@ void Cluster::search(const float* queries, size_t q_rows, int k,
     }
 }
 
-void Cluster::search_into(const float* query, int k,
+void Cluster::search_into(const float* query, float q_norm_sq, int k,
                           std::vector<DocId>& top_ids,
-                          std::vector<float>& top_scores) const {
+                          std::vector<float>& top_scores,
+                          bool skip_alive_check) const {
     if (!query || k <= 0) return;
 
     std::shared_lock lk(mu_);
@@ -262,34 +275,50 @@ void Cluster::search_into(const float* query, int k,
         top_ids.assign(k, -1);  // use -1 as "empty slot"
     }
 
-    // helper lambda: find index of current worst (largest score)
-    auto find_worst = [&]() -> int {
-        float worst_s = top_scores[0];
-        int worst_i = 0;
-        for (int i = 1; i < k; ++i) {
-            if (top_scores[i] > worst_s) {
-                worst_s = top_scores[i];
-                worst_i = i;
-            }
+    // Max-heap over top_scores/top_ids: root (index 0) is always the worst
+    // (largest) score. O(1) worst-score lookup, O(log k) update vs O(k) linear.
+    auto sift_down = [&](int root) {
+        while (true) {
+            int largest = root;
+            const int l = 2 * root + 1;
+            const int r = 2 * root + 2;
+            if (l < k && top_scores[l] > top_scores[largest]) largest = l;
+            if (r < k && top_scores[r] > top_scores[largest]) largest = r;
+            if (largest == root) break;
+            std::swap(top_scores[root], top_scores[largest]);
+            std::swap(top_ids[root],    top_ids[largest]);
+            root = largest;
         }
-        return worst_i;
     };
 
-    int worst_idx = find_worst();
-    float worst_score = top_scores[worst_idx];
+    // For L2 with precomputed q_norm and cached v_norms:
+    //   ||q-v||² = q_norm + norms_[row] - 2·dot(q,v)
+    // The inner loop becomes one ip_score (FMA only, no subtract) + 2 scalar ops,
+    // vs l2_dist (subtract+FMA per element) — roughly 2x faster for the distance.
+    // q_norm is computed once per query across all nprobe clusters (not per-cluster).
+    const bool use_decomposed = (metric_ == Metric::L2)
+                                && (q_norm_sq >= 0.0f)
+                                && (norms_.size() == N);
+    const size_t D = static_cast<size_t>(dim_);
+
+    float worst_score = top_scores[0];  // O(1): always at heap root
 
     for (size_t row = 0; row < N; ++row) {
-        if (!alive_[row]) continue;
-        const float* v = row_ptr_(row);
-        float s = score_(query, v); // smaller is better
+        if (!skip_alive_check && !alive_[row]) continue;
+        const float* v = mat_.data() + row * D;
 
-        // if this score beats current worst, replace
+        float s;
+        if (use_decomposed) {
+            s = q_norm_sq + norms_[row] - 2.0f * ip_score(query, v, dim_);
+        } else {
+            s = score_(query, v);
+        }
+
         if (s < worst_score) {
-            top_ids[worst_idx] = ids_[row];
-            top_scores[worst_idx] = s;
-            // recompute current worst slot
-            worst_idx = find_worst();
-            worst_score = top_scores[worst_idx];
+            top_scores[0] = s;
+            top_ids[0]    = ids_[row];
+            sift_down(0);
+            worst_score = top_scores[0];
         }
     }
 }
@@ -363,10 +392,12 @@ void Cluster::compact() {
 
     std::vector<DocId> new_ids;
     std::vector<float> new_mat;
+    std::vector<float> new_norms;
     std::vector<uint8_t> new_alive;
     std::vector<uint64_t> new_access;
     new_ids.reserve(live_count_);
     new_mat.reserve(live_count_ * (size_t)dim_);
+    new_norms.reserve(live_count_);
     new_alive.reserve(live_count_);
     new_access.reserve(live_count_);
     std::unordered_map<DocId, uint32_t> new_map;
@@ -378,6 +409,8 @@ void Cluster::compact() {
         new_ids.push_back(ids_[row]);
         const float* src = &mat_[row * (size_t)dim_];
         new_mat.insert(new_mat.end(), src, src + dim_);
+        new_norms.push_back(row < norms_.size() ? norms_[row]
+                                                 : ip_score(src, src, dim_));
         new_alive.push_back(1u);
         if (row < last_access_time_.size())
             new_access.push_back(last_access_time_[row]);
@@ -388,6 +421,7 @@ void Cluster::compact() {
 
     ids_.swap(new_ids);
     mat_.swap(new_mat);
+    norms_.swap(new_norms);
     alive_.swap(new_alive);
     last_access_time_.swap(new_access);
     id2row_.swap(new_map);
@@ -395,6 +429,7 @@ void Cluster::compact() {
 
     assert(mat_.size() == ids_.size() * (size_t)dim_);
     assert(alive_.size() == ids_.size());
+    assert(norms_.size() == ids_.size());
     assert(last_access_time_.size() == ids_.size());
 }
 

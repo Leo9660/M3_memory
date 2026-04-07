@@ -532,10 +532,10 @@ size_t GpuClusterIndex::collaborative_search(
 
         const float alpha = 1.f, beta = 0.f;
         CUBLAS_CHECK(cublasSgemv(cublas_handle_, CUBLAS_OP_T,
-            static_cast<int>(dim_sz), static_cast<int>(total_n),
-            &alpha, d_vecs_packed_, static_cast<int>(dim_sz),
+            static_cast<int>(dim_sz), static_cast<int>(total_n),  // <- total_n = sum of ALL clusters' n
+            &alpha, d_vecs_packed_, static_cast<int>(dim_sz),     // <- ALL clusters packed into one matrix
             d_query_scratch_, 1,
-            &beta, d_dist_scratch_, 1));
+            &beta, d_dist_scratch_, 1));                           // <- distances for ALL clusters at once
 
         const int thr = 256;
         const int blk = (static_cast<int>(total_n) + thr - 1) / thr;

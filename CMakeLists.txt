@@ -28,6 +28,9 @@ find_library(OPENBLAS_LIB NAMES openblas HINTS /lib/x86_64-linux-gnu /usr/lib/x8
 find_path(CBLAS_INCLUDE_DIR cblas.h HINTS /usr/include/x86_64-linux-gnu /usr/include REQUIRED)
 message(STATUS "OpenBLAS: ${OPENBLAS_LIB}  cblas.h: ${CBLAS_INCLUDE_DIR}")
 
+find_package(OpenMP REQUIRED)
+message(STATUS "OpenMP: ${OpenMP_CXX_FLAGS}")
+
 set(M3_SRC
     AgentMemory/M3/src/bindings_async.cpp
     AgentMemory/M3/src/m3_async.cpp
@@ -67,8 +70,8 @@ set(M3_INCLUDE
 pybind11_add_module(_m3_async MODULE ${M3_SRC})
 target_include_directories(_m3_async PRIVATE ${M3_INCLUDE} ${CBLAS_INCLUDE_DIR})
 target_compile_features(_m3_async PRIVATE cxx_std_17)
-target_compile_options(_m3_async PRIVATE -O3 -pthread -mavx2 -mfma)
-target_link_libraries(_m3_async PRIVATE CUDA::cudart CUDA::cublas ${OPENBLAS_LIB})
+target_compile_options(_m3_async PRIVATE -O3 -pthread -mavx2 -mfma ${OpenMP_CXX_FLAGS})
+target_link_libraries(_m3_async PRIVATE CUDA::cudart CUDA::cublas ${OPENBLAS_LIB} OpenMP::OpenMP_CXX)
 
 install(TARGETS _m3_async
     LIBRARY DESTINATION AgentMemory/M3

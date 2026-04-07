@@ -472,9 +472,14 @@ class FaissBackend(MemoryBackend):
         self._payloads[index_id] = {}
         self._next_int_id[index_id] = next_id
 
+        index_type = type(loaded).__name__
+        # For IDMap wrappers, also report the inner index type
+        inner = getattr(loaded, "index", None)
+        if inner is not None:
+            index_type = f"{type(loaded).__name__}({type(inner).__name__})"
         print(
             f"[FaissBackend] loaded {loaded.ntotal} vectors from {p.name} "
-            f"(dim={loaded.d}, metric={metric.value})"
+            f"(dim={loaded.d}, metric={metric.value}, index_type={index_type})"
         )
 
     @staticmethod

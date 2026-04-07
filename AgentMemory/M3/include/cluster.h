@@ -56,9 +56,19 @@ public:
     // - top_ids.size() == top_scores.size()
     // - top_ids.size() <= k
     // - We will not clear them; we only insert/bump worse ones out.
-    void search_into(const float* query, int k,
+    // q_norm_sq: precomputed ||q||² for L2 (pass < 0 to compute internally).
+    // When >= 0, uses decomposed L2 = q_norm + norms_[row] - 2·dot(q,v)
+    // with cached per-vector norms — avoids recomputing ||q||² across probes
+    // and replaces l2_dist (sub+fmadd) with ip_score (fmadd only, ~2x faster).
+    //
+    // skip_alive_check: when true, skips the alive_[] test per row (all rows
+    // are treated as live). Use after compact() or when tombstones are absent
+    // (e.g. rebuild_from_faiss path) to eliminate the branch and extra load
+    // that prevent outer-loop vectorisation.
+    void search_into(const float* query, float q_norm_sq, int k,
                     std::vector<DocId>& top_ids,
-                    std::vector<float>& top_scores) const;
+                    std::vector<float>& top_scores,
+                    bool skip_alive_check = false) const;
 
     // ---- Maintenance ----
     void compact();
@@ -99,6 +109,7 @@ private:
     // Row-major dense matrix; mat_.size() == ids_.size() * dim_.
     std::vector<DocId> ids_;
     std::vector<float> mat_;
+    std::vector<float> norms_;              // norms_[row] = ||mat_[row]||²; same size as ids_
     std::vector<uint8_t> alive_;
     std::vector<uint64_t> last_access_time_;  // same size as ids_; 0 = not set
     std::unordered_map<DocId, uint32_t> id2row_;

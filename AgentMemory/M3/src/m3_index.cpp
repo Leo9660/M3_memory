@@ -11,6 +11,7 @@
 #include <utility>
 #include <mutex>
 #include <cblas.h>
+#include <omp.h>
 
 namespace {
 using idx_clock = std::chrono::steady_clock;
@@ -678,12 +679,15 @@ void IVFIndex::search_on(const std::vector<int>& cluster_ids,
         std::vector<DocId>  top_ids(k, (DocId)-1);
         std::vector<float>  top_scores(k, std::numeric_limits<float>::infinity());
 
+        const float q_norm_sq = (metric_ == Metric::L2)
+                                ? ip_score(qptr, qptr, dim_) : -1.0f;
+
         // let each chosen cluster try to improve this buffer
         for (int cid : cluster_ids) {
             if (cid < 0 || cid >= (int)clusters_snap.size()) continue;
             auto c = clusters_snap[cid];
             if (!c) continue;
-            c->search_into(qptr, k, top_ids, top_scores);
+            c->search_into(qptr, q_norm_sq, k, top_ids, top_scores, /*skip_alive_check=*/true);
         }
 
         // compact & sort final results (remove empty slots)
@@ -739,22 +743,25 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
 
     if (nprobe <= 0) nprobe = live_nlist;
     const int real_nprobe = std::min(nprobe, live_nlist);
-
-    // ---------------------------------------------------------------
-    // Batched centroid selection via BLAS sgemm over live clusters only.
-    //
-    // scores = alpha * Q_mat @ C_compact^T  (shape: Q × live_nlist)
-    //
-    // For IP/COSINE-normalized: score = -dot(q,c)  → alpha = -1
-    // For L2:  score = ||q||^2 - 2*dot(q,c) + ||c||^2  → alpha = -2
-    // ---------------------------------------------------------------
     const size_t NL = static_cast<size_t>(live_nlist);
+    const bool do_timing = (out_centroid_ms || out_scan_ms);
 
-    std::vector<float> scores_mat(q_rows * NL);
+    // Centroid norms (L2 only, shared read-only across threads).
+    std::vector<float> c_norms;
+    if (metric_ == Metric::L2) {
+        c_norms.resize(NL);
+        for (size_t ci = 0; ci < NL; ++ci)
+            c_norms[ci] = cblas_sdot(dim_, compact_centroids.data() + ci * D, 1,
+                                           compact_centroids.data() + ci * D, 1);
+    }
 
-    double centroid_acc = 0.0;
-    double scan_acc     = 0.0;
-    const auto t_sgemm0 = (out_centroid_ms || out_scan_ms) ? idx_clock::now() : idx_clock::time_point{};
+    // ---------------------------------------------------------------
+    // Step 1: ONE sgemm for all queries × all centroids — runs OUTSIDE
+    //   the OMP region so OpenBLAS sees omp_in_parallel()==0 and uses
+    //   all available OPENBLAS_NUM_THREADS without risk of overflow.
+    // ---------------------------------------------------------------
+    std::vector<float> scores(q_rows * NL);
+    const auto t_sgemm0 = do_timing ? idx_clock::now() : idx_clock::time_point{};
 
     if (metric_ == Metric::L2) {
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -763,17 +770,12 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
                     queries,                    dim_,
                     compact_centroids.data(),   dim_,
                     0.0f,
-                    scores_mat.data(),          live_nlist);
-
-        std::vector<float> c_norms(NL);
-        for (size_t ci = 0; ci < NL; ++ci)
-            c_norms[ci] = cblas_sdot(dim_, compact_centroids.data() + ci * D, 1,
-                                           compact_centroids.data() + ci * D, 1);
+                    scores.data(),              live_nlist);
 
         for (size_t qi = 0; qi < q_rows; ++qi) {
             const float* q = queries + qi * D;
-            float q_norm = cblas_sdot(dim_, q, 1, q, 1);
-            float* row   = scores_mat.data() + qi * NL;
+            const float q_norm = cblas_sdot(dim_, q, 1, q, 1);
+            float* row = scores.data() + qi * NL;
             for (size_t ci = 0; ci < NL; ++ci)
                 row[ci] += q_norm + c_norms[ci];
         }
@@ -784,32 +786,33 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
                     queries,                    dim_,
                     compact_centroids.data(),   dim_,
                     0.0f,
-                    scores_mat.data(),          live_nlist);
-        if (metric_ == Metric::COSINE && normalized_) {
-            for (float& s : scores_mat) s += 1.0f;
-        }
+                    scores.data(),              live_nlist);
+        if (metric_ == Metric::COSINE && normalized_)
+            for (float& s : scores) s += 1.0f;
     }
+    const double centroid_ms = do_timing ? idx_fms(idx_clock::now() - t_sgemm0) : 0.0;
 
-    if (out_centroid_ms || out_scan_ms) centroid_acc += idx_fms(idx_clock::now() - t_sgemm0);
+    // ---------------------------------------------------------------
+    // Step 2: OMP parallel over queries — nprobe selection + cluster scan.
+    //   Each query is fully independent; no sgemm inside this region.
+    // ---------------------------------------------------------------
+    const auto t_scan0 = do_timing ? idx_clock::now() : idx_clock::time_point{};
+    std::mutex ex_mu;
+    std::string ex_str;
 
-    // Per-query: pick top-nprobe clusters and search them.
-    std::vector<std::pair<float, int>> row_tmp;
-    row_tmp.reserve(NL);
+    #pragma omp parallel for schedule(static) if (q_rows > 1)
+    for (int qi_int = 0; qi_int < (int)q_rows; ++qi_int) {
+        const size_t qi = (size_t)qi_int;
+        const float* q  = queries + qi * D;
+        const float* score_row = scores.data() + qi * NL;
 
-    for (size_t qi = 0; qi < q_rows; ++qi) {
-        const float* q         = queries + qi * D;
-        const float* score_row = scores_mat.data() + qi * NL;
-
-        const auto t_topk0 = (out_centroid_ms || out_scan_ms) ? idx_clock::now() : idx_clock::time_point{};
-
-        // 1) pick top-nprobe compact indices by centroid distance.
-        //    chosen holds compact indices (not original cids) so we can index
-        //    compact_clusters[] directly in the scan step without a reverse lookup.
-        row_tmp.clear();
+        // 1) pick top-nprobe compact indices
+        std::vector<std::pair<float, int>> row_tmp;
+        row_tmp.reserve(NL);
         for (size_t ci = 0; ci < NL; ++ci)
             row_tmp.emplace_back(score_row[ci], (int)ci);
 
-        std::vector<int> chosen;   // compact indices, sorted nearest-first
+        std::vector<int> chosen;
         chosen.reserve(real_nprobe);
         if (real_nprobe >= (int)row_tmp.size()) {
             std::sort(row_tmp.begin(), row_tmp.end(),
@@ -824,47 +827,31 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
             for (auto& p : row_tmp) chosen.push_back(p.second);
         }
 
-        if (out_centroid_ms || out_scan_ms) centroid_acc += idx_fms(idx_clock::now() - t_topk0);
-
-        // 2) prepare a single top-k buffer for THIS query
+        // 2) scan selected clusters
         std::vector<DocId> top_ids(k, (DocId)-1);
         std::vector<float> top_scores(k, std::numeric_limits<float>::infinity());
 
-        const auto t_scan0 = (out_centroid_ms || out_scan_ms) ? idx_clock::now() : idx_clock::time_point{};
+        const float q_norm_sq = (metric_ == Metric::L2) ? ip_score(q, q, dim_) : -1.0f;
 
-        // 3) scan each selected cluster (compact index → compact_clusters[ci])
-        for (int ci : chosen) {
-            if (ci < 0 || ci >= (int)compact_clusters.size()) continue;
-            auto& c = compact_clusters[static_cast<size_t>(ci)];
-            if (!c) continue;
-            c->search_into(q, k, top_ids, top_scores);
+        try {
+            for (int ci : chosen) {
+                if (ci < 0 || ci >= (int)compact_clusters.size()) continue;
+                auto& c = compact_clusters[static_cast<size_t>(ci)];
+                if (!c) continue;
+                c->search_into(q, q_norm_sq, k, top_ids, top_scores, /*skip_alive_check=*/true);
+            }
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lock(ex_mu);
+            ex_str = e.what();
         }
 
-        if (out_centroid_ms || out_scan_ms) scan_acc += idx_fms(idx_clock::now() - t_scan0);
-
-        // 4) compact and sort final results (remove empty -1 slots)
+        // 3) compact and sort results
         std::vector<int> idx;
         idx.reserve(k);
-        for (int i = 0; i < k; ++i) {
-            if (top_ids[i] != (DocId)-1) {
-                idx.push_back(i);
-            }
-        }
-
+        for (int i = 0; i < k; ++i)
+            if (top_ids[i] != (DocId)-1) idx.push_back(i);
         std::sort(idx.begin(), idx.end(),
                   [&](int a, int b){ return top_scores[a] < top_scores[b]; });
-
-        // printf(" Final top_scores =\n");
-        // for (float s : top_scores) {
-        //     printf(", %.4f", s);
-        // }
-        // for (DocId id : top_ids) {
-        //     printf(", %ld", id);
-        // }
-        // for (size_t i = 0; i < idx.size(); ++i) {
-        //     printf(" (%ld, %.4f)", top_ids[idx[i]], top_scores[idx[i]]);
-        // }
-        // printf("\n");
 
         auto& oi = out_ids[qi];
         auto& os = out_scores[qi];
@@ -874,10 +861,11 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
             oi[i] = top_ids[idx[i]];
             os[i] = top_scores[idx[i]];
         }
-
     }
-    if (out_centroid_ms) *out_centroid_ms = centroid_acc;
-    if (out_scan_ms)     *out_scan_ms     = scan_acc;
+    if (!ex_str.empty()) throw std::runtime_error(ex_str);
+
+    if (out_centroid_ms) *out_centroid_ms = centroid_ms;
+    if (out_scan_ms)     *out_scan_ms     = do_timing ? idx_fms(idx_clock::now() - t_scan0) : 0.0;
 }
 
 void IVFIndex::get_probe_ids(const float* query, int nprobe, std::vector<int>& out_ids) const {
