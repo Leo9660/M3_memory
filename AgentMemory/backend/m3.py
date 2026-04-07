@@ -586,7 +586,7 @@ class M3MultiGpuBackend(MemoryBackend):
         "max_promote_per_query":       20,
         "l0_nprobe":                   32,
         "l1_nprobe":                   32,
-        "alpha_et":                    1.0,
+        "alpha_et":                    0.6, #reducing alpha et improves recall
         "dagent_window":               20,
         "dagent_mode":                 "cache_level_k",  # or "true_k"
         "calibration_interval":        10,

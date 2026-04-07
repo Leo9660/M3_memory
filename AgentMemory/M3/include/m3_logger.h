@@ -182,7 +182,9 @@ public:
                             double l2_gpu_ms, double l2_cpu_ms,
                             double gpu_h2d_ms, double gpu_kernel_ms,
                             double gpu_sync_d2h_ms, double gpu_topk_ms,
-                            double merge_ms, double promotion_ms, double total_ms);
+                            double merge_ms, double promotion_ms, double total_ms,
+                            size_t l2_n_queries,
+                            size_t l2_gpu_clusters, size_t l2_cpu_clusters);
 
     // ---- Search stats row (CSV) ----
     // One row per search() batch. Captures per-stage exit distribution and

@@ -284,7 +284,8 @@ M3Profiler::M3Profiler() {
         "l1_ms,l1_centroid_ms,l1_scan_ms,"
         "l2_gpu_ms,l2_cpu_ms,"
         "gpu_h2d_ms,gpu_kernel_ms,gpu_sync_d2h_ms,gpu_topk_ms,"
-        "merge_ms,promotion_ms,total_ms\n");
+        "merge_ms,promotion_ms,total_ms,"
+        "l2_n_queries,l2_gpu_clusters,l2_cpu_clusters\n");
     fflush(fp_search_profile_);
 
     // ---- search_stats.csv ----
@@ -412,7 +413,9 @@ void M3Profiler::log_search_profile(size_t q_rows,
                                      double l2_gpu_ms, double l2_cpu_ms,
                                      double gpu_h2d_ms, double gpu_kernel_ms,
                                      double gpu_sync_d2h_ms, double gpu_topk_ms,
-                                     double merge_ms, double promotion_ms, double total_ms) {
+                                     double merge_ms, double promotion_ms, double total_ms,
+                                     size_t l2_n_queries,
+                                     size_t l2_gpu_clusters, size_t l2_cpu_clusters) {
     if (!enabled_) return;
     char ts[32]; timestamp_(ts, sizeof(ts));
     char buf[512];
@@ -423,14 +426,16 @@ void M3Profiler::log_search_profile(size_t q_rows,
         "%.3f,%.3f,%.3f,"
         "%.3f,%.3f,"
         "%.3f,%.3f,%.3f,%.3f,"
-        "%.3f,%.3f,%.3f",
+        "%.3f,%.3f,%.3f,"
+        "%zu,%zu,%zu",
         ts, q_rows,
         probe_sgemm_ms, probe_topk_ms,
         l0_ms, l0_centroid_ms, l0_scan_ms,
         l1_ms, l1_centroid_ms, l1_scan_ms,
         l2_gpu_ms, l2_cpu_ms,
         gpu_h2d_ms, gpu_kernel_ms, gpu_sync_d2h_ms, gpu_topk_ms,
-        merge_ms, promotion_ms, total_ms);
+        merge_ms, promotion_ms, total_ms,
+        l2_n_queries, l2_gpu_clusters, l2_cpu_clusters);
     search_total_ms_sum_ += total_ms;
     ++search_batch_count_;
     write_search_profile_(buf);

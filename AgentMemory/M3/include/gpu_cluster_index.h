@@ -146,6 +146,20 @@ public:
                                 std::vector<float>&  out_scores,
                                 GpuCollabTiming*     timing = nullptr) const;
 
+    // Batched collaborative search: one SGEMM over all queries × all GPU clusters,
+    // one D2H, then per-query top-k from the shared distance matrix.
+    // per_query_gpu_cids[i] lists GPU-resident cluster IDs for query row i.
+    // queries: [q_rows × dim] row-major. out_ids/out_scores: one result set per row.
+    size_t collaborative_search_batch(
+            const std::vector<std::vector<int>>& per_query_gpu_cids,
+            const float* queries,
+            size_t q_rows,
+            int k,
+            const ClusterInsertBuffer& buf,
+            std::vector<std::vector<DocId>>&  out_ids,
+            std::vector<std::vector<float>>&  out_scores,
+            GpuCollabTiming* timing = nullptr) const;
+
     int    dim()        const { return dim_; }
     Metric metric()     const { return metric_; }
     bool   normalized() const { return normalized_; }
@@ -158,6 +172,10 @@ private:
     void ensure_scratch_(size_t need) const;
     // Grows persistent vector-pack scratch buffer (in floats). scratch_mu_ must be held.
     void ensure_vecs_scratch_(size_t need_floats) const;
+    // Grows query-batch upload buffer (in floats). scratch_mu_ must be held.
+    void ensure_queries_batch_(size_t need_floats) const;
+    // Grows query-norms batch buffer (in floats). scratch_mu_ must be held.
+    void ensure_qnorms_batch_(size_t need_floats) const;
     // RAII wrapper around a cudaMalloc'd device buffer.
     // Shared ownership allows search_cluster() to snapshot the pointer without
     // holding the mutex across the kernel launch -- the buffer is kept alive
@@ -203,8 +221,12 @@ private:
     mutable float*       d_norms_scratch_ = nullptr; // GPU: [scratch_cap_] — squared vector norms (L2)
     mutable float*       h_dist_scratch_  = nullptr; // pinned host: [scratch_cap_]
     mutable size_t       scratch_cap_     = 0;
-    mutable float*       d_vecs_packed_   = nullptr; // GPU: [vecs_packed_cap_] — contiguous packed vecs
-    mutable size_t       vecs_packed_cap_ = 0;       // capacity in floats
+    mutable float*       d_vecs_packed_    = nullptr; // GPU: [vecs_packed_cap_] — contiguous packed vecs
+    mutable size_t       vecs_packed_cap_  = 0;       // capacity in floats
+    mutable float*       d_queries_batch_  = nullptr; // GPU: [queries_batch_cap_] — q_rows × dim query matrix
+    mutable size_t       queries_batch_cap_ = 0;      // capacity in floats
+    mutable float*       d_qnorms_batch_   = nullptr; // GPU: [qnorms_batch_cap_] — per-query L2 norms
+    mutable size_t       qnorms_batch_cap_ = 0;       // capacity in floats
 #ifdef HAVE_CUDA
     mutable cudaStream_t   search_stream_  = nullptr;
     mutable cublasHandle_t cublas_handle_  = nullptr;

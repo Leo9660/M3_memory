@@ -124,6 +124,18 @@ size_t GpuCoordinator::search(const std::vector<int>& probe_cids,
                                          insert_buf_, out_ids, out_scores, timing);
 }
 
+size_t GpuCoordinator::search_batch(
+        const std::vector<std::vector<int>>& per_query_gpu_cids,
+        const float* queries,
+        size_t q_rows,
+        int k,
+        std::vector<std::vector<DocId>>&  out_ids,
+        std::vector<std::vector<float>>&  out_scores,
+        GpuCollabTiming* timing) {
+    return gpu_idx_.collaborative_search_batch(per_query_gpu_cids, queries, q_rows, k,
+                                               insert_buf_, out_ids, out_scores, timing);
+}
+
 bool GpuCoordinator::promote_to_gpu(int cid) {
     // Export current L2 data for the cluster.
     std::vector<DocId>  ids;

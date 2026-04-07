@@ -172,6 +172,17 @@ public:
                   std::vector<float>&  out_scores,
                   GpuCollabTiming*     timing = nullptr);
 
+    // Batched search: one SGEMM for all q_rows queries simultaneously.
+    // per_query_gpu_cids[i] must contain only GPU-resident cluster IDs for query i.
+    // queries: [q_rows × dim] row-major. out_ids/out_scores: one result set per row.
+    size_t search_batch(const std::vector<std::vector<int>>& per_query_gpu_cids,
+                        const float* queries,
+                        size_t q_rows,
+                        int k,
+                        std::vector<std::vector<DocId>>&  out_ids,
+                        std::vector<std::vector<float>>&  out_scores,
+                        GpuCollabTiming* timing = nullptr);
+
     // ---- Cluster lifecycle ----
 
     // Export cluster cid from L2, upload to GpuClusterIndex, register in budget

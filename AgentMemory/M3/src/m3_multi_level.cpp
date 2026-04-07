@@ -1,14 +1,15 @@
 #include "m3_multi_level.h"
 #include "gpu_coordinator.h"
 #include "m3_logger.h"
-#include <chrono>
-#include <future>
-#include <mutex>
 #include <algorithm>
-#include <limits>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
+#include <limits>
+#include <mutex>
+#include <omp.h>
 
 // Runtime verbose logging: set env var M3_DEBUG=1 before running to see detailed
 // per-query, per-promotion, and maintenance events on stderr.
@@ -747,7 +748,9 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         double p_l0_ms = 0, p_l0_centroid_ms = 0, p_l0_scan_ms = 0;
         double p_l1_ms = 0, p_l1_centroid_ms = 0, p_l1_scan_ms = 0;
 
-        // Per-stage query timing buckets (total wall time per query, by exit stage).
+        // Per-stage query timing buckets.
+        // Note: with batched L0/L1, per-query exit wall times are not tracked;
+        // these remain 0 — exit counts are still accurate.
         double p_l0_exit_total_ms = 0, p_l1_exit_total_ms = 0, p_l2_reach_total_ms = 0;
 
         // GPU sub-phase timing (accumulated across all L2-reaching queries).
@@ -769,17 +772,20 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         // When l1_neighborhood_k <= k, k_promo == k and there is no extra L2 work.
         const int k_promo = std::max(k, cache_config_.l1_neighborhood_k);
 
-        std::vector<int> probe_ids;
-        std::vector<std::vector<DocId>> l0_ids(1), l1_ids(1), l2_ids(1);
-        std::vector<std::vector<float>> l0_scores(1), l1_scores(1), l2_scores(1);
+        // Per-query result arrays for L0 and L1 (populated by batch calls below).
+        std::vector<std::vector<DocId>> all_l0_ids(q_rows), all_l1_ids(q_rows);
+        std::vector<std::vector<float>> all_l0_scores(q_rows), all_l1_scores(q_rows);
+
+        // L2 scratch (reused per query in the L2 loop below).
+        std::vector<std::vector<DocId>> l2_ids(1);
+        std::vector<std::vector<float>> l2_scores(1);
+
         // Raw L2-only results (up to k_promo) saved per query for L1 promotion.
-        // Populated only for stage-3 (L2-reaching) queries.
         std::vector<std::vector<DocId>>  promo_ids(q_rows);
         std::vector<std::vector<float>>  promo_scores(q_rows);
-        // 0 = no results, 1 = satisfied by L0 only, 2 = satisfied after L1, 3 = needed L2
+        // 0 = not yet processed, 1 = satisfied at L0, 2 = satisfied at L1, 3 = reached L2
         std::vector<int>   stage(q_rows, 0);
-        // k-th distance at the point of early exit for each query (inf if no early exit).
-        // Used by the background calibration path to compute r = true_kth / early_kth.
+        // k-th distance at the point of early exit (inf = no early exit).
         std::vector<float> early_exit_kths(q_rows, std::numeric_limits<float>::infinity());
         double p_l2_gpu_ms = 0, p_l2_cpu_ms = 0, p_merge_ms = 0;
         size_t p_l0_exits = 0, p_l1_exits = 0;
@@ -791,217 +797,248 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
             return s.back();
         };
 
-        for (size_t qi = 0; qi < q_rows; ++qi) {
-            const float* qptr = queries + qi * dim_sz;
-            probe_ids.clear();
-
-            probe_ids = all_probe_ids[qi];
-            if (probe_ids.empty()) continue;
-
-            // Per-query wall-clock start (used to bucket by exit stage).
-            const auto t_query_start = profiling ? clock::now() : clock::time_point{};
-
-            // Stage 1: search L0 only.
-            // L0 uses query-centric cluster IDs (same space as L1, independent of L2).
-            // Must use search_nprobe over L0's own centroids, NOT L2 probe_ids.
-            l0_ids[0].clear(); l0_scores[0].clear();
-            l1_ids[0].clear(); l1_scores[0].clear();
-            l2_ids[0].clear(); l2_scores[0].clear();
-
-            {
+        // ---------------------------------------------------------------
+        // Phase 0: Batch L0 search — one search_nprobe call for all queries.
+        // ---------------------------------------------------------------
+        if (l0.index) {
+            const int l0_nprobe_eff = (cache_config_.l0_nprobe > 0)
+                                          ? cache_config_.l0_nprobe
+                                          : std::min(nprobe, l0.index->nlist());
+            if (l0_nprobe_eff > 0) {
+                double l0c = 0, l0s = 0;
                 const auto t0 = profiling ? clock::now() : clock::time_point{};
-                if (l0.index) {
-                    const int l0_nlist = l0.index->nlist();
-                    const int l0_nprobe_eff = (cache_config_.l0_nprobe > 0)
-                                                  ? cache_config_.l0_nprobe
-                                                  : std::min(nprobe, l0_nlist);
-                    double l0c = 0, l0s = 0;
-                    if (l0_nprobe_eff > 0)
-                        l0.index->search_nprobe(qptr, 1, k, l0_nprobe_eff, l0_ids, l0_scores,
-                                                profiling ? &l0c : nullptr,
-                                                profiling ? &l0s : nullptr);
-                    if (profiling) { p_l0_centroid_ms += l0c; p_l0_scan_ms += l0s; }
+                l0.index->search_nprobe(queries, q_rows, k, l0_nprobe_eff,
+                                        all_l0_ids, all_l0_scores,
+                                        profiling ? &l0c : nullptr,
+                                        profiling ? &l0s : nullptr);
+                if (profiling) {
+                    p_l0_ms         = fms(clock::now() - t0).count();
+                    p_l0_centroid_ms = l0c;
+                    p_l0_scan_ms     = l0s;
                 }
-                if (profiling) p_l0_ms += fms(clock::now() - t0).count();
             }
+        }
 
-            bool satisfied = false;
-            std::vector<DocId> merged_ids;
-            std::vector<float> merged_scores;
-
-            if (m3_verbose) {
-                const float l0_kth = l0_scores[0].empty()
-                    ? std::numeric_limits<float>::infinity()
-                    : kth_score_vec(l0_scores[0]);
-                fprintf(stderr,
-                    "[M3:search qi=%zu] L0_clusters=%d L0_vecs_returned=%zu "
-                    "L0_kth=%.4f  threshold=%s(%.4f)  "
-                    "has_threshold=%s  dagent=%.4f\n",
-                    qi,
-                    l0.index ? l0.index->nlist() : 0,
-                    l0_ids[0].size(),
-                    l0_kth,
-                    has_threshold ? "active" : "inactive",
-                    search_threshold,
-                    has_threshold ? "yes" : "no",
-                    dagent_);
-            }
-
-            if (has_threshold && (int)l0_scores[0].size() >= k) {
-                float ks = kth_score_vec(l0_scores[0]);
+        // Apply L0 early-exit threshold per query.
+        if (has_threshold) {
+            for (size_t qi = 0; qi < q_rows; ++qi) {
+                if ((int)all_l0_scores[qi].size() < k) continue;
+                const float ks = kth_score_vec(all_l0_scores[qi]);
                 if (ks <= search_threshold) {
-                    // L0 alone is good enough; no need to touch L1/L2.
-                    merged_ids = l0_ids[0];
-                    merged_scores = l0_scores[0];
-                    satisfied = true;
-                    stage[qi] = 1;
+                    out_ids[qi]    = all_l0_ids[qi];
+                    out_scores[qi] = all_l0_scores[qi];
+                    stage[qi]      = 1;
                     early_exit_kths[qi] = ks;
-                    if (profiling) {
-                        ++p_l0_exits;
-                        p_l0_exit_total_ms += fms(clock::now() - t_query_start).count();
-                    }
+                    if (profiling) ++p_l0_exits;
                 }
             }
+        }
 
-            // Stage 2: include L1 if needed.
-            // L1 now has its own query-centric cluster topology, so we use search_nprobe
-            // over L1's own cluster centroids rather than the L2 probe_ids.
-            // l1_nprobe=0 (default) → linear scan all L1 clusters (safe for small L1).
-            if (!satisfied && l1.index) {
-                {
-                    const auto t0 = profiling ? clock::now() : clock::time_point{};
-                    const int l1_nprobe_eff = (cache_config_.l1_nprobe > 0)
-                                                  ? cache_config_.l1_nprobe
-                                                  : std::min(nprobe, l1.index->nlist());
+        // ---------------------------------------------------------------
+        // Phase 1: Batch L1 search — gather unsatisfied queries, one call.
+        // ---------------------------------------------------------------
+        if (l1.index) {
+            const int l1_nprobe_eff = (cache_config_.l1_nprobe > 0)
+                                          ? cache_config_.l1_nprobe
+                                          : std::min(nprobe, l1.index->nlist());
+            if (l1_nprobe_eff > 0) {
+                // Collect indices of queries that still need L1.
+                std::vector<size_t> l1_indices;
+                l1_indices.reserve(q_rows);
+                for (size_t qi = 0; qi < q_rows; ++qi)
+                    if (stage[qi] == 0) l1_indices.push_back(qi);
+
+                if (!l1_indices.empty()) {
+                    const size_t n1 = l1_indices.size();
+
+                    // Pack query vectors contiguously.
+                    std::vector<float> l1_queries(n1 * dim_sz);
+                    for (size_t i = 0; i < n1; ++i)
+                        std::memcpy(l1_queries.data() + i * dim_sz,
+                                    queries + l1_indices[i] * dim_sz,
+                                    dim_sz * sizeof(float));
+
+                    std::vector<std::vector<DocId>> tmp_ids(n1);
+                    std::vector<std::vector<float>> tmp_scores(n1);
                     double l1c = 0, l1s = 0;
-                    if (l1_nprobe_eff > 0)
-                        l1.index->search_nprobe(qptr, 1, k, l1_nprobe_eff, l1_ids, l1_scores,
-                                                profiling ? &l1c : nullptr,
-                                                profiling ? &l1s : nullptr);
-                    if (profiling) { p_l1_ms += fms(clock::now() - t0).count(); p_l1_centroid_ms += l1c; p_l1_scan_ms += l1s; }
-                }
-                {
-                    const auto t0 = profiling ? clock::now() : clock::time_point{};
-                    std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0]};
-                    std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0]};
-                    merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
-                    if (profiling) p_merge_ms += fms(clock::now() - t0).count();
-                }
+                    const auto t1 = profiling ? clock::now() : clock::time_point{};
+                    l1.index->search_nprobe(l1_queries.data(), n1, k, l1_nprobe_eff,
+                                            tmp_ids, tmp_scores,
+                                            profiling ? &l1c : nullptr,
+                                            profiling ? &l1s : nullptr);
+                    if (profiling) {
+                        p_l1_ms          = fms(clock::now() - t1).count();
+                        p_l1_centroid_ms = l1c;
+                        p_l1_scan_ms     = l1s;
+                    }
 
-                if (has_threshold && !merged_scores.empty()) {
-                    float ks = kth_score_vec(merged_scores);
-                    if (ks <= search_threshold) {
-                        satisfied = true;
-                        stage[qi] = 2;
-                        early_exit_kths[qi] = ks;
-                        if (profiling) {
-                            ++p_l1_exits;
-                            p_l1_exit_total_ms += fms(clock::now() - t_query_start).count();
+                    // Scatter back and apply L1 early-exit threshold.
+                    const auto t_merge = profiling ? clock::now() : clock::time_point{};
+                    for (size_t i = 0; i < n1; ++i) {
+                        const size_t qi = l1_indices[i];
+                        all_l1_ids[qi]    = std::move(tmp_ids[i]);
+                        all_l1_scores[qi] = std::move(tmp_scores[i]);
+
+                        // Merge L0+L1 for this query to check early-exit.
+                        if (has_threshold || !l2.index) {
+                            std::vector<DocId> merged_ids;
+                            std::vector<float> merged_scores;
+                            std::vector<std::vector<DocId>> per_ids   = {all_l0_ids[qi], all_l1_ids[qi]};
+                            std::vector<std::vector<float>> per_scores = {all_l0_scores[qi], all_l1_scores[qi]};
+                            merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
+
+                            if (!l2.index) {
+                                // No L2 at all — L1 is the final answer for this query.
+                                out_ids[qi]    = std::move(merged_ids);
+                                out_scores[qi] = std::move(merged_scores);
+                                stage[qi] = 2;
+                            } else if (has_threshold && !merged_scores.empty()) {
+                                const float ks = kth_score_vec(merged_scores);
+                                if (ks <= search_threshold) {
+                                    out_ids[qi]         = std::move(merged_ids);
+                                    out_scores[qi]      = std::move(merged_scores);
+                                    stage[qi]           = 2;
+                                    early_exit_kths[qi] = ks;
+                                    if (profiling) ++p_l1_exits;
+                                }
+                            }
                         }
                     }
+                    if (profiling) p_merge_ms += fms(clock::now() - t_merge).count();
                 }
             }
+        }
 
-            // Stage 3: include L2 if still not satisfied or if there is no threshold.
-            if (!satisfied) {
-                if (l2.index) {
-                    if (gpu_coord_) {
-                        // Partition probe clusters: GPU-resident → GPU kernel + buffer scan,
-                        // non-resident → CPU L2 linear scan.
-                        std::vector<int> gpu_cids, cpu_cids;
-                        for (int cid : probe_ids) {
-                            if (gpu_coord_->is_gpu_resident(cid))
-                                gpu_cids.push_back(cid);
-                            else
-                                cpu_cids.push_back(cid);
-                        }
-                        if (profiling) {
-                            p_l2_gpu_clusters += gpu_cids.size();
-                            p_l2_cpu_clusters += cpu_cids.size();
-                        }
-                        // GPU and CPU L2 searches run in parallel:
-                        //   - GPU search is dispatched to a background thread so the
-                        //     CUDA kernel and D2H transfer overlap with the CPU scan.
-                        //   - CPU scan runs on this thread while the GPU thread is active.
-                        //   - Results are joined before the merge step below.
-                        std::vector<DocId> gpu_l2_ids;
-                        std::vector<float> gpu_l2_scores;
-                        const auto t_gpu0 = profiling ? clock::now() : clock::time_point{};
-                        auto gpu_fut = !gpu_cids.empty()
-                            ? std::async(std::launch::async, [&]() {
-                                  gpu_coord_->search(gpu_cids, qptr, k_promo,
-                                                     gpu_l2_ids, gpu_l2_scores,
-                                                     profiling ? &p_gpu_timing : nullptr);
-                              })
-                            : std::future<void>{};
+        // ---------------------------------------------------------------
+        // Phase 2: Batched L2 search.
+        //
+        // Collect all unsatisfied queries → partition per-query probe clusters
+        // into GPU-resident / CPU sets → one batched GPU SGEMM (async) +
+        // OMP-parallel CPU scan running concurrently → scatter & merge.
+        // ---------------------------------------------------------------
+        if (l2.index) {
+            // Collect L2 queries and partition their probe clusters.
+            std::vector<size_t>              l2_qis;
+            std::vector<std::vector<int>>    per_q_gpu_cids, per_q_cpu_cids;
+            l2_qis.reserve(q_rows);
 
-                        // CPU L2 path runs on this thread while GPU thread is active.
-                        const auto t_cpu0 = profiling ? clock::now() : clock::time_point{};
-                        if (!cpu_cids.empty())
-                            l2.index->search_on(cpu_cids, qptr, 1, k_promo,
-                                                l2_ids, l2_scores);
-                        if (profiling) p_l2_cpu_ms += fms(clock::now() - t_cpu0).count();
+            for (size_t qi = 0; qi < q_rows; ++qi) {
+                if (stage[qi] != 0) continue;
+                const auto& probe_ids = all_probe_ids[qi];
+                if (probe_ids.empty()) continue;
 
-                        // Join GPU thread before merge.
-                        if (gpu_fut.valid()) gpu_fut.get();
-                        if (profiling) p_l2_gpu_ms += fms(clock::now() - t_gpu0).count();
-                        // Fold GPU results into l2 result vectors for unified merge.
-                        l2_ids[0].insert(l2_ids[0].end(),
-                                         gpu_l2_ids.begin(), gpu_l2_ids.end());
-                        l2_scores[0].insert(l2_scores[0].end(),
-                                            gpu_l2_scores.begin(), gpu_l2_scores.end());
-                    } else {
-                        if (profiling) p_l2_cpu_clusters += probe_ids.size();
-                        const auto t0 = profiling ? clock::now() : clock::time_point{};
-                        l2.index->search_on(probe_ids, qptr, 1, k_promo, l2_ids, l2_scores);
-                        if (profiling) p_l2_cpu_ms += fms(clock::now() - t0).count();
+                std::vector<int> gpu_cids, cpu_cids;
+                if (gpu_coord_) {
+                    for (int cid : probe_ids) {
+                        if (gpu_coord_->is_gpu_resident(cid))
+                            gpu_cids.push_back(cid);
+                        else
+                            cpu_cids.push_back(cid);
                     }
-                    // Save the raw L2 results (up to k_promo) for L1 promotion before
-                    // the merge step truncates to k. L2 results are already sorted by
-                    // distance (nearest-first) from search_on / gpu search.
+                } else {
+                    cpu_cids = std::vector<int>(probe_ids.begin(), probe_ids.end());
+                }
+                if (profiling) {
+                    p_l2_gpu_clusters += gpu_cids.size();
+                    p_l2_cpu_clusters += cpu_cids.size();
+                }
+                l2_qis.push_back(qi);
+                per_q_gpu_cids.push_back(std::move(gpu_cids));
+                per_q_cpu_cids.push_back(std::move(cpu_cids));
+            }
+
+            const size_t n_l2 = l2_qis.size();
+            if (n_l2 > 0) {
+                // Pack L2 query vectors contiguously.
+                std::vector<float> l2_qvecs(n_l2 * dim_sz);
+                for (size_t i = 0; i < n_l2; ++i)
+                    std::memcpy(l2_qvecs.data() + i * dim_sz,
+                                queries + l2_qis[i] * dim_sz,
+                                dim_sz * sizeof(float));
+
+                // Per-query result arrays (GPU and CPU contributions).
+                std::vector<std::vector<DocId>> gpu_out_ids(n_l2), cpu_out_ids(n_l2);
+                std::vector<std::vector<float>> gpu_out_sc(n_l2),  cpu_out_sc(n_l2);
+
+                // Check whether any query has GPU-resident clusters to search.
+                const bool has_gpu_work = gpu_coord_ &&
+                    std::any_of(per_q_gpu_cids.begin(), per_q_gpu_cids.end(),
+                                [](const std::vector<int>& v){ return !v.empty(); });
+
+                // Launch batched GPU search asynchronously so it overlaps with CPU.
+                const auto t_gpu0 = profiling ? clock::now() : clock::time_point{};
+                auto gpu_fut = has_gpu_work
+                    ? std::async(std::launch::async, [&]() {
+                          gpu_coord_->search_batch(per_q_gpu_cids,
+                                                   l2_qvecs.data(), n_l2, k_promo,
+                                                   gpu_out_ids, gpu_out_sc,
+                                                   profiling ? &p_gpu_timing : nullptr);
+                      })
+                    : std::future<void>{};
+
+                // OMP-parallel CPU L2 scan across all L2 queries simultaneously.
+                const auto t_cpu0 = profiling ? clock::now() : clock::time_point{};
+                #pragma omp parallel for schedule(dynamic) if(n_l2 > 1)
+                for (int ii = 0; ii < static_cast<int>(n_l2); ++ii) {
+                    if (per_q_cpu_cids[static_cast<size_t>(ii)].empty()) continue;
+                    std::vector<std::vector<DocId>> tmp_ids(1);
+                    std::vector<std::vector<float>> tmp_sc(1);
+                    l2.index->search_on(per_q_cpu_cids[static_cast<size_t>(ii)],
+                                        l2_qvecs.data() + static_cast<size_t>(ii) * dim_sz,
+                                        1, k_promo, tmp_ids, tmp_sc);
+                    cpu_out_ids[static_cast<size_t>(ii)] = std::move(tmp_ids[0]);
+                    cpu_out_sc[static_cast<size_t>(ii)]  = std::move(tmp_sc[0]);
+                }
+                if (profiling) p_l2_cpu_ms += fms(clock::now() - t_cpu0).count();
+
+                if (gpu_fut.valid()) gpu_fut.get();
+                if (profiling) p_l2_gpu_ms += fms(clock::now() - t_gpu0).count();
+
+                // Scatter results back, merge L0+L1+L2 per query.
+                const auto t_merge0 = profiling ? clock::now() : clock::time_point{};
+                for (size_t i = 0; i < n_l2; ++i) {
+                    const size_t qi = l2_qis[i];
+
+                    // Combine GPU and CPU L2 results into l2_ids[0]/l2_scores[0].
+                    l2_ids[0] = std::move(gpu_out_ids[i]);
+                    l2_ids[0].insert(l2_ids[0].end(),
+                                     cpu_out_ids[i].begin(), cpu_out_ids[i].end());
+                    l2_scores[0] = std::move(gpu_out_sc[i]);
+                    l2_scores[0].insert(l2_scores[0].end(),
+                                        cpu_out_sc[i].begin(), cpu_out_sc[i].end());
+
                     promo_ids[qi]    = l2_ids[0];
                     promo_scores[qi] = l2_scores[0];
-                    {
-                        const auto t0 = profiling ? clock::now() : clock::time_point{};
-                        std::vector<std::vector<DocId>> per_ids = {l0_ids[0], l1_ids[0], l2_ids[0]};
-                        std::vector<std::vector<float>> per_scores = {l0_scores[0], l1_scores[0], l2_scores[0]};
-                        merge_levels_(per_ids, per_scores, k, merged_ids, merged_scores);
-                        if (profiling) p_merge_ms += fms(clock::now() - t0).count();
-                    }
+
+                    std::vector<std::vector<DocId>> per_ids    = {all_l0_ids[qi], all_l1_ids[qi], l2_ids[0]};
+                    std::vector<std::vector<float>> per_scores = {all_l0_scores[qi], all_l1_scores[qi], l2_scores[0]};
+                    merge_levels_(per_ids, per_scores, k, out_ids[qi], out_scores[qi]);
                     stage[qi] = 3;
-                    if (profiling)
-                        p_l2_reach_total_ms += fms(clock::now() - t_query_start).count();
-                } else {
-                    // No L2; if we haven't merged yet (e.g. no L1), fallback to L0-only.
-                    if (merged_ids.empty() && !l0_ids[0].empty()) {
-                        merged_ids = l0_ids[0];
-                        merged_scores = l0_scores[0];
-                        // Treat this like L0-only satisfaction.
-                        if (stage[qi] == 0) stage[qi] = 1;
-                    }
                 }
+                if (profiling) p_merge_ms += fms(clock::now() - t_merge0).count();
             }
+        }
 
-            out_ids[qi] = std::move(merged_ids);
-            out_scores[qi] = std::move(merged_scores);
-
-            if (m3_verbose) {
+        // Verbose per-query logging (covers all stages).
+        if (m3_verbose) {
+            float cur_dagent, cur_thresh, cur_alpha_et;
+            {
+                std::lock_guard<std::mutex> dlk(dagent_mu_);
+                std::lock_guard<std::mutex> alk(alpha_et_mu_);
+                cur_dagent   = dagent_;
+                cur_alpha_et = alpha_et_dynamic_;
+                cur_thresh   = (cur_alpha_et > 0.f && cur_dagent > 0.f)
+                                   ? cur_alpha_et * cur_dagent
+                                   : cfg_.search_threshold;
+            }
+            for (size_t qi = 0; qi < q_rows; ++qi) {
                 const char* sname = (stage[qi] == 1) ? "L0-only"
                                   : (stage[qi] == 2) ? "L0+L1 (early-exit)"
                                   :                    "L0+L1+L2 (full)";
                 float kth = out_scores[qi].empty() ? -1.f
-                          : ((int)out_scores[qi].size() >= k ? out_scores[qi][static_cast<size_t>(k-1)]
-                                                             : out_scores[qi].back());
-                float cur_dagent, cur_thresh, cur_alpha_et;
-                {
-                    std::lock_guard<std::mutex> dlk(dagent_mu_);
-                    std::lock_guard<std::mutex> alk(alpha_et_mu_);
-                    cur_dagent   = dagent_;
-                    cur_alpha_et = alpha_et_dynamic_;
-                    cur_thresh   = (cur_alpha_et > 0.f && cur_dagent > 0.f)
-                                       ? cur_alpha_et * cur_dagent
-                                       : cfg_.search_threshold;
-                }
+                          : ((int)out_scores[qi].size() >= k
+                                 ? out_scores[qi][static_cast<size_t>(k-1)]
+                                 : out_scores[qi].back());
                 fprintf(stderr,
                         "[M3:search] qi=%zu  stage=%-22s  kth=%.4f  "
                         "thresh=%.4f (αet=%.2f × dagent=%.4f)  results=%zu\n",
@@ -1178,7 +1215,8 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                 p_l2_gpu_ms, p_l2_cpu_ms,
                 p_gpu_timing.h2d_ms, p_gpu_timing.kernel_ms,
                 p_gpu_timing.sync_d2h_ms, p_gpu_timing.topk_ms,
-                p_merge_ms, p_promo_ms, p_total_ms);
+                p_merge_ms, p_promo_ms, p_total_ms,
+                p_l2_reach, p_l2_gpu_clusters, p_l2_cpu_clusters);
 
             M3Profiler::instance().log_search_stats(
                 q_rows,
