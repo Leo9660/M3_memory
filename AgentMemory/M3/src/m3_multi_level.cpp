@@ -751,7 +751,9 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         // Per-stage query timing buckets.
         // Note: with batched L0/L1, per-query exit wall times are not tracked;
         // these remain 0 — exit counts are still accurate.
+        // p_l2_reach_total_ms is the wall time of the entire L2 phase block.
         double p_l0_exit_total_ms = 0, p_l1_exit_total_ms = 0, p_l2_reach_total_ms = 0;
+        clock::time_point t_l2_start;
 
         // GPU sub-phase timing (accumulated across all L2-reaching queries).
         GpuCollabTiming p_gpu_timing;
@@ -917,6 +919,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         // OMP-parallel CPU scan running concurrently → scatter & merge.
         // ---------------------------------------------------------------
         if (l2.index) {
+            if (profiling) t_l2_start = clock::now();
             // Collect L2 queries and partition their probe clusters.
             std::vector<size_t>              l2_qis;
             std::vector<std::vector<int>>    per_q_gpu_cids, per_q_cpu_cids;
@@ -945,6 +948,32 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                 l2_qis.push_back(qi);
                 per_q_gpu_cids.push_back(std::move(gpu_cids));
                 per_q_cpu_cids.push_back(std::move(cpu_cids));
+            }
+
+            // ── Recall-divergence diagnostic (profiling only) ───────────────
+            // For each unique GPU-resident cluster probed in this search batch,
+            // check whether l2_vector_count > (gpu_cluster_size + buffer_size).
+            // A positive delta means vectors that are in L2 but will NOT be
+            // searched (because L2 is skipped for GPU-resident clusters).
+            // Root causes: overflow-to-L2 fallbacks and promotion races.
+            if (profiling && gpu_coord_) {
+                std::unordered_set<int> seen_gpu_cids;
+                for (const auto& qcids : per_q_gpu_cids)
+                    for (int cid : qcids)
+                        seen_gpu_cids.insert(cid);
+
+                for (int cid : seen_gpu_cids) {
+                    const size_t gpu_n = gpu_coord_->gpu_cluster_size(cid);
+                    const size_t buf_n = gpu_coord_->buffer_size(cid);
+                    const size_t l2_n  = (static_cast<size_t>(cid) < metadata_.size())
+                                         ? metadata_[cid].l2_vector_count : 0;
+                    if (l2_n > gpu_n + buf_n) {
+                        M3Profiler::instance().log_recall_diag(
+                            "SEARCH_DIVERGE", cid,
+                            gpu_n, buf_n, l2_n,
+                            gpu_coord_->total_overflow_count());
+                    }
+                }
             }
 
             const size_t n_l2 = l2_qis.size();
@@ -1017,6 +1046,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                 }
                 if (profiling) p_merge_ms += fms(clock::now() - t_merge0).count();
             }
+            if (profiling) p_l2_reach_total_ms = fms(clock::now() - t_l2_start).count();
         }
 
         // Verbose per-query logging (covers all stages).

@@ -70,6 +70,32 @@ public:
                     std::vector<float>& top_scores,
                     bool skip_alive_check = false) const;
 
+    // Profiling variant: same as search_into but accumulates nanoseconds spent
+    // waiting on the shared_lock (*lock_ns) and in the inner distance loop
+    // (*scan_ns).  Both are added (not set) so the caller can accumulate across
+    // multiple clusters.
+    void search_into_timed(const float* query, float q_norm_sq, int k,
+                           std::vector<DocId>& top_ids,
+                           std::vector<float>& top_scores,
+                           bool skip_alive_check,
+                           int64_t* lock_ns,
+                           int64_t* scan_ns) const;
+
+    // Batch scan for L2 metric: compute distances from n_queries queries to all
+    // live vectors in this cluster using a single cblas_sgemm call.
+    // Efficient when dim or n_queries is large (avoids per-vector ip_score overhead).
+    //
+    // Output:
+    //   dists_out: resized to [n_queries × N_live], row-major
+    //   live_ids_out: DocIds of the N_live live vectors (in storage order)
+    //
+    // Returns N_live (0 if cluster is empty or metric != L2).
+    size_t scan_batch_l2(const float* queries,
+                         const float* q_norms_sq,
+                         size_t n_queries,
+                         std::vector<float>& dists_out,
+                         std::vector<DocId>& live_ids_out) const;
+
     // ---- Maintenance ----
     void compact();
 

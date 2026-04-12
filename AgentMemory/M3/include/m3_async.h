@@ -104,6 +104,14 @@ public:
                 std::vector<std::vector<DocId>>& out_ids,
                 std::vector<std::vector<float>>& out_scores) const;
 
+    // ---- profiled search ----
+    // Same result as search() but fills a SearchProfile with per-phase wall times.
+    void search_profiled(int index_id,
+                         const float* queries, size_t q_rows, int k, int nprobe,
+                         std::vector<std::vector<DocId>>& out_ids,
+                         std::vector<std::vector<float>>& out_scores,
+                         IVFIndex::SearchProfile& prof) const;
+
     // ---- direct cluster rebuild (sync, bypasses async queue) ----
     void load_cluster(int index_id,
                       int cluster_id,

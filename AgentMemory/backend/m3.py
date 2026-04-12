@@ -228,6 +228,8 @@ class M3Backend(MemoryBackend):
                     hits = []
                     for doc_id, score in zip(ids_list, scores_list):
                         int_id = int(doc_id)
+                        if int_id < 0:
+                            break  # -1 padding sentinel from numpy return format
                         # Get external ID (use int_id as fallback)
                         ext_id = self._int2ext.get(idx, {}).get(int_id, str(int_id))
                         # Build metadata dict
@@ -304,6 +306,36 @@ class M3MultiLevelBackend(MemoryBackend):
     Simple synchronous backend backed by MultiLevelIndex (no async writers).
     """
 
+    DEFAULTS: Dict[str, Any] = {
+        # --- MultiLevelConfig ---
+        "l0_nlist":                    1,
+        "l1_nlist":                    1,
+        "l2_nlist":                    1,
+        "l0_new_cluster_threshold":    float("inf"),
+        "search_threshold":            float("inf"),
+        "l0_merge_threshold":          float("inf"),
+        "l0_max_nlist":                0,
+
+        # --- CacheConfig ---
+        "l0_max_clusters":             64,
+        "l0_max_vectors_per_cluster":  1000,
+        "l1_max_clusters":             128,
+        "l1_max_vectors_per_cluster":  10000,
+        "l0_eviction_ratio":           0.8,
+        "l1_eviction_ratio":           0.9,
+        "cold_time_ns":                60_000_000_000,
+        "l1_neighborhood_k":           20,
+        "l0_neighborhood_k":           5,
+        "max_promote_per_query":       20,
+        "l0_nprobe":                   32,
+        "l1_nprobe":                   32,
+        "alpha_et":                    0.6,
+        "dagent_window":               20,
+        "dagent_mode":                 "true_k",
+        "calibration_interval":        10,
+        "alpha_et_adapt_rate":         0.05,
+    }
+
     def __init__(self) -> None:
         super().__init__()
         self._indices: Dict[int, M3MultiLevelIndex] = {}
@@ -323,20 +355,22 @@ class M3MultiLevelBackend(MemoryBackend):
         metric = _metric_enum(getattr(spec, "metric", "l2"))
         normalized = (metric == m3.Metric.COSINE)
 
-        params = getattr(spec, "params", {}) or {}
+        raw = getattr(spec, "params", {}) or {}
+        p: Dict[str, Any] = {**self.DEFAULTS, **raw}
         cfg_kwargs = {
-            "l0_nlist": int(params.get("l0_nlist", 1)),
-            "l1_nlist": int(params.get("l1_nlist", 1)),
-            "l2_nlist": int(params.get("l2_nlist", 1)),
-            "l0_new_cluster_threshold": float(params.get("l0_new_cluster_threshold", float("inf"))),
-            "search_threshold": float(params.get("search_threshold", float("inf"))),
-            "l0_merge_threshold": float(params.get("l0_merge_threshold", float("inf"))),
-            "l0_max_nlist": int(params.get("l0_max_nlist", 0)),
+            "l0_nlist": int(p["l0_nlist"]),
+            "l1_nlist": int(p["l1_nlist"]),
+            "l2_nlist": int(p["l2_nlist"]),
+            "l0_new_cluster_threshold": float(p["l0_new_cluster_threshold"]),
+            "search_threshold": float(p["search_threshold"]),
+            "l0_merge_threshold": float(p["l0_merge_threshold"]),
+            "l0_max_nlist": int(p["l0_max_nlist"]),
         }
         idx = M3MultiLevelIndex(dim=dim, metric=metric, normalized=normalized, **cfg_kwargs)
+        _apply_cache_config(idx, p)
 
         # seed L0 centroids if provided; else zero centroid
-        centroids = params.get("centroids")
+        centroids = p.get("centroids")
         if centroids is None:
             centroids = np.zeros((cfg_kwargs["l0_nlist"], dim), dtype=np.float32)
         centroids = np.ascontiguousarray(centroids, dtype=np.float32)
@@ -423,6 +457,8 @@ class M3MultiLevelBackend(MemoryBackend):
                     hits = []
                     for doc_id, score in zip(ids_list, scores_list):
                         int_id = int(doc_id)
+                        if int_id < 0:
+                            break  # -1 padding sentinel from numpy return format
                         # Get external ID (use int_id as fallback)
                         ext_id = self._int2ext.get(idx_id, {}).get(int_id, str(int_id))
                         # Build metadata dict
@@ -588,7 +624,7 @@ class M3MultiGpuBackend(MemoryBackend):
         "l1_nprobe":                   32,
         "alpha_et":                    0.6, #reducing alpha et improves recall
         "dagent_window":               20,
-        "dagent_mode":                 "cache_level_k",  # or "true_k"
+        "dagent_mode":                 "cache_level_k",  # "cache_level_k" or "true_k"
         "calibration_interval":        10,
         "alpha_et_adapt_rate":         0.05,
     }
@@ -743,6 +779,8 @@ class M3MultiGpuBackend(MemoryBackend):
                     hits = []
                     for doc_id, score in zip(ids_list, scores_list):
                         int_id = int(doc_id)
+                        if int_id < 0:
+                            break  # -1 padding sentinel from numpy return format
                         ext_id = self._int2ext.get(idx_id, {}).get(int_id, str(int_id))
                         base_meta = self._meta.get(idx_id, {}).get(int_id) or {}
                         meta = dict(base_meta) if base_meta else {}

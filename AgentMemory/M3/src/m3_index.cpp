@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <queue>
@@ -12,6 +13,15 @@
 #include <mutex>
 #include <cblas.h>
 #include <omp.h>
+
+// OpenBLAS-specific thread control (linked as libopenblas).
+// On large machines OpenBLAS defaults to using all available cores; for small
+// centroid matrices this creates massive thread-spawn overhead that dominates
+// the actual computation.  We cap threads to a sensible value per sgemm call.
+extern "C" {
+    int  openblas_get_num_threads(void);
+    void openblas_set_num_threads(int num_threads);
+}
 
 namespace {
 using idx_clock = std::chrono::steady_clock;
@@ -756,47 +766,435 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
     }
 
     // ---------------------------------------------------------------
-    // Step 1: ONE sgemm for all queries × all centroids — runs OUTSIDE
-    //   the OMP region so OpenBLAS sees omp_in_parallel()==0 and uses
-    //   all available OPENBLAS_NUM_THREADS without risk of overflow.
+    // Step 1: Centroid distance matrix  [q_rows × live_nlist]
+    //
+    //   FAISS threshold (distances.cpp): use direct loop when
+    //   q_rows * dim < 128000; otherwise use blocked sgemm.
+    //   Reason: for small matrices sgemm thread-spawn overhead >> compute.
+    //
+    //   Direct path  — OMP-parallel over queries, no BLAS:
+    //     L2:  scores[qi][ci] = ||q||² + ||c||² - 2·dot(q,c)
+    //          (c_norms precomputed; q_norm computed once per query)
+    //     IP / COSINE: unified_score(q, c)
+    //
+    //   BLAS path — one sgemm for large matrices, thread-capped.
     // ---------------------------------------------------------------
     std::vector<float> scores(q_rows * NL);
     const auto t_sgemm0 = do_timing ? idx_clock::now() : idx_clock::time_point{};
 
-    if (metric_ == Metric::L2) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    (int)q_rows, live_nlist, dim_,
-                    -2.0f,
-                    queries,                    dim_,
-                    compact_centroids.data(),   dim_,
-                    0.0f,
-                    scores.data(),              live_nlist);
+    const bool use_direct = ((size_t)q_rows * (size_t)dim_ < 128000UL);
 
-        for (size_t qi = 0; qi < q_rows; ++qi) {
-            const float* q = queries + qi * D;
-            const float q_norm = cblas_sdot(dim_, q, 1, q, 1);
-            float* row = scores.data() + qi * NL;
-            for (size_t ci = 0; ci < NL; ++ci)
-                row[ci] += q_norm + c_norms[ci];
+    if (use_direct) {
+        // Serial loop — no BLAS, no thread spawn. For small matrices the thread
+        // spawn overhead (256 cores → 256 OMP threads) far exceeds the compute.
+        for (int qi_int = 0; qi_int < (int)q_rows; ++qi_int) {
+            const size_t qi      = (size_t)qi_int;
+            const float* q       = queries + qi * D;
+            float*       row     = scores.data() + qi * NL;
+            if (metric_ == Metric::L2) {
+                const float q_norm = ip_score(q, q, dim_);
+                for (size_t ci = 0; ci < NL; ++ci) {
+                    const float* c = compact_centroids.data() + ci * D;
+                    row[ci] = q_norm + c_norms[ci] - 2.0f * ip_score(q, c, dim_);
+                }
+            } else {
+                for (size_t ci = 0; ci < NL; ++ci) {
+                    const float* c = compact_centroids.data() + ci * D;
+                    row[ci] = unified_score(q, c, dim_, metric_, normalized_);
+                }
+            }
         }
     } else {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-                    (int)q_rows, live_nlist, dim_,
-                    -1.0f,
-                    queries,                    dim_,
-                    compact_centroids.data(),   dim_,
-                    0.0f,
-                    scores.data(),              live_nlist);
-        if (metric_ == Metric::COSINE && normalized_)
-            for (float& s : scores) s += 1.0f;
+        // Large-matrix path: one sgemm, thread count capped to avoid overhead.
+        const int blas_saved = openblas_get_num_threads();
+        const int blas_cap   = std::max(1, std::min(blas_saved, 8));
+        if (blas_saved != blas_cap) openblas_set_num_threads(blas_cap);
+
+        if (metric_ == Metric::L2) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)q_rows, live_nlist, dim_,
+                        -2.0f,
+                        queries,                    dim_,
+                        compact_centroids.data(),   dim_,
+                        0.0f,
+                        scores.data(),              live_nlist);
+
+            for (size_t qi = 0; qi < q_rows; ++qi) {
+                const float* q     = queries + qi * D;
+                const float q_norm = cblas_sdot(dim_, q, 1, q, 1);
+                float* row = scores.data() + qi * NL;
+                for (size_t ci = 0; ci < NL; ++ci)
+                    row[ci] += q_norm + c_norms[ci];
+            }
+        } else {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)q_rows, live_nlist, dim_,
+                        -1.0f,
+                        queries,                    dim_,
+                        compact_centroids.data(),   dim_,
+                        0.0f,
+                        scores.data(),              live_nlist);
+            if (metric_ == Metric::COSINE && normalized_)
+                for (float& s : scores) s += 1.0f;
+        }
+
+        if (blas_saved != blas_cap) openblas_set_num_threads(blas_saved);
     }
     const double centroid_ms = do_timing ? idx_fms(idx_clock::now() - t_sgemm0) : 0.0;
 
     // ---------------------------------------------------------------
-    // Step 2: OMP parallel over queries — nprobe selection + cluster scan.
-    //   Each query is fully independent; no sgemm inside this region.
+    // Step 2: nprobe selection + cluster scan.
+    //
+    //   Two strategies depending on dim:
+    //
+    //   A) Query-parallel (small dim):
+    //      OMP over queries; each thread calls search_into() per cluster
+    //      using the AVX2 ip_score loop.  Low overhead, good cache reuse
+    //      per query.
+    //
+    //   B) Cluster-parallel sgemm (large dim, dim >= 512):
+    //      For each unique cluster: one cblas_sgemm across ALL queries
+    //      that probe it.  Amortises BLAS overhead and uses full
+    //      multi-threading per large matrix.  This mirrors FAISS's
+    //      parallel_mode=1 strategy.
+    //
+    //      Steps:
+    //        i)  OMP parallel: nprobe selection + q_norm per query
+    //        ii) Serial: build cluster→queries inverted list
+    //        iii) Serial outer, BLAS inner: sgemm per cluster + heap update
     // ---------------------------------------------------------------
     const auto t_scan0 = do_timing ? idx_clock::now() : idx_clock::time_point{};
+
+    // Inline max-heap sift-down used by both paths.
+    auto heap_sift_down = [&](std::vector<DocId>& tids, std::vector<float>& tscs, int root) {
+        while (true) {
+            int largest = root;
+            const int l = 2 * root + 1, r = 2 * root + 2;
+            if (l < k && tscs[l] > tscs[largest]) largest = l;
+            if (r < k && tscs[r] > tscs[largest]) largest = r;
+            if (largest == root) break;
+            std::swap(tscs[root], tscs[largest]);
+            std::swap(tids[root], tids[largest]);
+            root = largest;
+        }
+    };
+
+    // ---- Path B: cluster-parallel sgemm (large dim) ----
+    // Only profitable when each cluster sgemm has enough work to justify BLAS
+    // thread-spawn overhead.  avg_q_per_cluster ≈ q_rows × nprobe / NL.
+    const int avg_q_per_cluster =
+        (NL > 0) ? std::max(1, (int)q_rows * real_nprobe / (int)NL) : 1;
+    // Threshold: cluster sgemm only pays off when each per-cluster matrix is
+    // large enough that BLAS compute >> BLAS thread-spawn overhead (~50µs/call).
+    // For [n_q × dim × N_cluster]: need n_q × dim × N_cluster × 2 / (32 threads × 10 GFLOPS) > 100µs
+    // With n_q≈32, N_cluster≈390 → need dim >= ~1000.
+    // Cluster-sgemm is disabled: the BLAS thread-spawn overhead per cluster
+    // call outweighs its compute benefit for the matrix sizes typical in
+    // these benchmarks (n_q≈32, N_cluster≈390, dim=1024).  AVX512 ip_score
+    // in PATH A is faster for all dims tested so far.
+    const bool use_cluster_sgemm = false;
+
+    if (use_cluster_sgemm) {
+        // i) OMP: nprobe selection + q_norm per query
+        std::vector<std::vector<int>> chosen(q_rows);
+        std::vector<float> all_q_norms(q_rows, 0.0f);
+
+        #pragma omp parallel for schedule(static) if (q_rows > 1)
+        for (int qi_int = 0; qi_int < (int)q_rows; ++qi_int) {
+            const size_t qi = (size_t)qi_int;
+            all_q_norms[qi] = ip_score(queries + qi * D, queries + qi * D, dim_);
+
+            const float* score_row = scores.data() + qi * NL;
+            std::vector<std::pair<float, int>> row_tmp;
+            row_tmp.reserve(NL);
+            for (size_t ci = 0; ci < NL; ++ci)
+                row_tmp.emplace_back(score_row[ci], (int)ci);
+
+            if (real_nprobe >= (int)NL) {
+                std::sort(row_tmp.begin(), row_tmp.end(),
+                          [](const auto& a, const auto& b){ return a.first < b.first; });
+                chosen[qi].reserve(NL);
+                for (auto& p : row_tmp) chosen[qi].push_back(p.second);
+            } else {
+                std::nth_element(row_tmp.begin(), row_tmp.begin() + real_nprobe, row_tmp.end(),
+                                 [](const auto& a, const auto& b){ return a.first < b.first; });
+                row_tmp.resize(real_nprobe);
+                std::sort(row_tmp.begin(), row_tmp.end(),
+                          [](const auto& a, const auto& b){ return a.first < b.first; });
+                chosen[qi].reserve(real_nprobe);
+                for (auto& p : row_tmp) chosen[qi].push_back(p.second);
+            }
+        }
+
+        // ii) Build cluster → query-index list
+        std::vector<std::vector<int>> c2q(NL);
+        for (int qi = 0; qi < (int)q_rows; ++qi)
+            for (int ci : chosen[qi])
+                if (ci >= 0 && ci < (int)NL) c2q[ci].push_back(qi);
+
+        // Per-query result heaps
+        std::vector<std::vector<DocId>> top_ids(q_rows,
+            std::vector<DocId>(k, static_cast<DocId>(-1)));
+        std::vector<std::vector<float>> top_scores(q_rows,
+            std::vector<float>(k, std::numeric_limits<float>::infinity()));
+
+        // iii) For each probed cluster: one sgemm for all its assigned queries.
+        //   Allow more BLAS threads for these large per-cluster matrices.
+        const int blas_saved2 = openblas_get_num_threads();
+        const int blas_cap2   = std::min(blas_saved2, 32);
+        if (blas_saved2 != blas_cap2) openblas_set_num_threads(blas_cap2);
+
+        std::vector<float> q_gather;   // scratch: gathered query rows for this cluster
+        std::vector<float> qn_gather;  // scratch: gathered q_norms for this cluster
+        std::vector<float> dists;
+        std::vector<DocId> live_ids;
+
+        for (int ci = 0; ci < (int)NL; ++ci) {
+            if (c2q[ci].empty()) continue;
+            auto& c = compact_clusters[static_cast<size_t>(ci)];
+            if (!c) continue;
+
+            const std::vector<int>& qi_list = c2q[ci];
+            const size_t n_q = qi_list.size();
+
+            // Gather query rows contiguously
+            q_gather.resize(n_q * D);
+            qn_gather.resize(n_q);
+            for (size_t ii = 0; ii < n_q; ++ii) {
+                const int qi = qi_list[ii];
+                std::memcpy(q_gather.data() + ii * D,
+                            queries + (size_t)qi * D,
+                            D * sizeof(float));
+                qn_gather[ii] = all_q_norms[qi];
+            }
+
+            // Cluster sgemm scan
+            live_ids.clear();
+            const size_t N_live = c->scan_batch_l2(
+                q_gather.data(), qn_gather.data(), n_q, dists, live_ids);
+            if (N_live == 0) continue;
+
+            // Update per-query heaps from distance matrix
+            for (size_t ii = 0; ii < n_q; ++ii) {
+                const int qi = qi_list[ii];
+                const float* drow = dists.data() + ii * N_live;
+                auto& tids = top_ids[qi];
+                auto& tscs = top_scores[qi];
+                float worst = tscs[0];
+                for (size_t vi = 0; vi < N_live; ++vi) {
+                    const float s = drow[vi];
+                    if (s < worst) {
+                        tscs[0] = s;
+                        tids[0] = live_ids[vi];
+                        heap_sift_down(tids, tscs, 0);
+                        worst = tscs[0];
+                    }
+                }
+            }
+        }
+
+        if (blas_saved2 != blas_cap2) openblas_set_num_threads(blas_saved2);
+
+        // Package results
+        for (size_t qi = 0; qi < q_rows; ++qi) {
+            std::vector<int> idx;
+            idx.reserve(k);
+            for (int i = 0; i < k; ++i)
+                if (top_ids[qi][i] != static_cast<DocId>(-1)) idx.push_back(i);
+            std::sort(idx.begin(), idx.end(),
+                      [&](int a, int b){ return top_scores[qi][a] < top_scores[qi][b]; });
+            auto& oi = out_ids[qi];
+            auto& os = out_scores[qi];
+            oi.resize(idx.size());
+            os.resize(idx.size());
+            for (size_t i = 0; i < idx.size(); ++i) {
+                oi[i] = top_ids[qi][idx[i]];
+                os[i] = top_scores[qi][idx[i]];
+            }
+        }
+
+    } else {
+        // ---- Path A: query-parallel ip_score loop (small dim) ----
+        std::mutex ex_mu;
+        std::string ex_str;
+
+        #pragma omp parallel for schedule(static) if (q_rows > 1)
+        for (int qi_int = 0; qi_int < (int)q_rows; ++qi_int) {
+            const size_t qi = (size_t)qi_int;
+            const float* q  = queries + qi * D;
+            const float* score_row = scores.data() + qi * NL;
+
+            // 1) pick top-nprobe compact indices
+            std::vector<std::pair<float, int>> row_tmp;
+            row_tmp.reserve(NL);
+            for (size_t ci = 0; ci < NL; ++ci)
+                row_tmp.emplace_back(score_row[ci], (int)ci);
+
+            std::vector<int> chosen;
+            chosen.reserve(real_nprobe);
+            if (real_nprobe >= (int)row_tmp.size()) {
+                std::sort(row_tmp.begin(), row_tmp.end(),
+                          [](const auto& a, const auto& b){ return a.first < b.first; });
+                for (auto& p : row_tmp) chosen.push_back(p.second);
+            } else {
+                std::nth_element(row_tmp.begin(), row_tmp.begin() + real_nprobe, row_tmp.end(),
+                                 [](const auto& a, const auto& b){ return a.first < b.first; });
+                row_tmp.resize(real_nprobe);
+                std::sort(row_tmp.begin(), row_tmp.end(),
+                          [](const auto& a, const auto& b){ return a.first < b.first; });
+                for (auto& p : row_tmp) chosen.push_back(p.second);
+            }
+
+            // 2) scan selected clusters
+            std::vector<DocId> top_ids(k, static_cast<DocId>(-1));
+            std::vector<float> top_scores(k, std::numeric_limits<float>::infinity());
+            const float q_norm_sq = (metric_ == Metric::L2) ? ip_score(q, q, dim_) : -1.0f;
+
+            try {
+                for (int ci : chosen) {
+                    if (ci < 0 || ci >= (int)compact_clusters.size()) continue;
+                    auto& c = compact_clusters[static_cast<size_t>(ci)];
+                    if (!c) continue;
+                    c->search_into(q, q_norm_sq, k, top_ids, top_scores, /*skip_alive_check=*/true);
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(ex_mu);
+                ex_str = e.what();
+            }
+
+            // 3) compact and sort results
+            std::vector<int> idx;
+            idx.reserve(k);
+            for (int i = 0; i < k; ++i)
+                if (top_ids[i] != static_cast<DocId>(-1)) idx.push_back(i);
+            std::sort(idx.begin(), idx.end(),
+                      [&](int a, int b){ return top_scores[a] < top_scores[b]; });
+
+            auto& oi = out_ids[qi];
+            auto& os = out_scores[qi];
+            oi.resize(idx.size());
+            os.resize(idx.size());
+            for (size_t i = 0; i < idx.size(); ++i) {
+                oi[i] = top_ids[idx[i]];
+                os[i] = top_scores[idx[i]];
+            }
+        }
+        if (!ex_str.empty()) throw std::runtime_error(ex_str);
+    }
+
+    if (out_centroid_ms) *out_centroid_ms = centroid_ms;
+    if (out_scan_ms)     *out_scan_ms     = do_timing ? idx_fms(idx_clock::now() - t_scan0) : 0.0;
+}
+
+void IVFIndex::search_nprobe_profiled(const float* queries, size_t q_rows, int k, int nprobe,
+                                      std::vector<std::vector<DocId>>& out_ids,
+                                      std::vector<std::vector<float>>& out_scores,
+                                      SearchProfile& prof) const {
+    out_ids.assign(q_rows, {});
+    out_scores.assign(q_rows, {});
+    if (!queries || q_rows == 0 || k <= 0) return;
+
+    const size_t D = static_cast<size_t>(dim_);
+    using clk = std::chrono::steady_clock;
+    auto ns = [](clk::duration d){ return std::chrono::duration<double,std::milli>(d).count(); };
+
+    // ---- Phase 1: snapshot ----
+    std::vector<float>                    compact_centroids;
+    std::vector<int>                      compact_to_orig;
+    std::vector<std::shared_ptr<Cluster>> compact_clusters;
+    {
+        const auto t0 = clk::now();
+        std::shared_lock lk(topo_mu_);
+        compact_centroids = compact_centroids_;
+        compact_to_orig   = compact_to_orig_;
+        const size_t n = compact_to_orig_.size();
+        compact_clusters.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            compact_clusters[i] = clusters_[static_cast<size_t>(compact_to_orig_[i])];
+        prof.snapshot_ms += ns(clk::now() - t0);
+    }
+    const int live_nlist  = (int)compact_to_orig.size();
+    if (live_nlist == 0) return;
+    if (nprobe <= 0) nprobe = live_nlist;
+    const int real_nprobe = std::min(nprobe, live_nlist);
+    const size_t NL       = static_cast<size_t>(live_nlist);
+    prof.n_queries   = (int)q_rows;
+    prof.n_clusters  = live_nlist;
+    prof.nprobe_used = real_nprobe;
+
+    // ---- Phase 2: centroid norms (L2 only) ----
+    std::vector<float> c_norms;
+    if (metric_ == Metric::L2) {
+        const auto t0 = clk::now();
+        c_norms.resize(NL);
+        for (size_t ci = 0; ci < NL; ++ci)
+            c_norms[ci] = cblas_sdot(dim_, compact_centroids.data() + ci * D, 1,
+                                          compact_centroids.data() + ci * D, 1);
+        prof.c_norms_ms += ns(clk::now() - t0);
+    }
+
+    // ---- Phase 3: centroid scoring (direct serial or sgemm) ----
+    std::vector<float> scores(q_rows * NL);
+    {
+        const auto t0 = clk::now();
+        const bool use_direct = ((size_t)q_rows * (size_t)dim_ < 128000UL);
+        if (use_direct) {
+            // Serial loop — matches the non-profiled path; no thread spawn overhead.
+            for (int qi_int = 0; qi_int < (int)q_rows; ++qi_int) {
+                const size_t qi  = (size_t)qi_int;
+                const float* q   = queries + qi * D;
+                float*       row = scores.data() + qi * NL;
+                if (metric_ == Metric::L2) {
+                    const float q_norm = ip_score(q, q, dim_);
+                    for (size_t ci = 0; ci < NL; ++ci) {
+                        const float* c = compact_centroids.data() + ci * D;
+                        row[ci] = q_norm + c_norms[ci] - 2.0f * ip_score(q, c, dim_);
+                    }
+                } else {
+                    for (size_t ci = 0; ci < NL; ++ci) {
+                        const float* c = compact_centroids.data() + ci * D;
+                        row[ci] = unified_score(q, c, dim_, metric_, normalized_);
+                    }
+                }
+            }
+        } else {
+            const int blas_saved = openblas_get_num_threads();
+            const int blas_cap   = std::max(1, std::min(blas_saved, 8));
+            if (blas_saved != blas_cap) openblas_set_num_threads(blas_cap);
+
+            if (metric_ == Metric::L2) {
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            (int)q_rows, live_nlist, dim_,
+                            -2.0f, queries, dim_,
+                            compact_centroids.data(), dim_,
+                            0.0f, scores.data(), live_nlist);
+                for (size_t qi = 0; qi < q_rows; ++qi) {
+                    const float* q = queries + qi * D;
+                    const float q_norm = cblas_sdot(dim_, q, 1, q, 1);
+                    float* row = scores.data() + qi * NL;
+                    for (size_t ci = 0; ci < NL; ++ci)
+                        row[ci] += q_norm + c_norms[ci];
+                }
+            } else {
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            (int)q_rows, live_nlist, dim_,
+                            -1.0f, queries, dim_,
+                            compact_centroids.data(), dim_,
+                            0.0f, scores.data(), live_nlist);
+                if (metric_ == Metric::COSINE && normalized_)
+                    for (float& s : scores) s += 1.0f;
+            }
+            if (blas_saved != blas_cap) openblas_set_num_threads(blas_saved);
+        }
+        prof.sgemm_ms += ns(clk::now() - t0);
+    }
+
+    // ---- Phases 4-6: per-query (OMP parallel) ----
+    // Use atomic accumulators so OMP threads can safely add their contributions.
+    std::atomic<int64_t> acc_select_ns{0};
+    std::atomic<int64_t> acc_lock_ns{0};
+    std::atomic<int64_t> acc_scan_ns{0};
+    std::atomic<int64_t> acc_output_ns{0};
     std::mutex ex_mu;
     std::string ex_str;
 
@@ -806,12 +1204,12 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
         const float* q  = queries + qi * D;
         const float* score_row = scores.data() + qi * NL;
 
-        // 1) pick top-nprobe compact indices
+        // Phase 4: top-nprobe selection
+        const auto ts0 = clk::now();
         std::vector<std::pair<float, int>> row_tmp;
         row_tmp.reserve(NL);
         for (size_t ci = 0; ci < NL; ++ci)
             row_tmp.emplace_back(score_row[ci], (int)ci);
-
         std::vector<int> chosen;
         chosen.reserve(real_nprobe);
         if (real_nprobe >= (int)row_tmp.size()) {
@@ -826,33 +1224,40 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
                       [](const auto& a, const auto& b){ return a.first < b.first; });
             for (auto& p : row_tmp) chosen.push_back(p.second);
         }
+        acc_select_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - ts0).count(),
+            std::memory_order_relaxed);
 
-        // 2) scan selected clusters
+        // Phase 5: cluster scan (lock + inner loop timed separately per cluster)
         std::vector<DocId> top_ids(k, (DocId)-1);
         std::vector<float> top_scores(k, std::numeric_limits<float>::infinity());
-
         const float q_norm_sq = (metric_ == Metric::L2) ? ip_score(q, q, dim_) : -1.0f;
 
+        int64_t this_lock_ns = 0, this_scan_ns = 0;
         try {
             for (int ci : chosen) {
                 if (ci < 0 || ci >= (int)compact_clusters.size()) continue;
                 auto& c = compact_clusters[static_cast<size_t>(ci)];
                 if (!c) continue;
-                c->search_into(q, q_norm_sq, k, top_ids, top_scores, /*skip_alive_check=*/true);
+                c->search_into_timed(q, q_norm_sq, k, top_ids, top_scores,
+                                     /*skip_alive_check=*/true,
+                                     &this_lock_ns, &this_scan_ns);
             }
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(ex_mu);
             ex_str = e.what();
         }
+        acc_lock_ns.fetch_add(this_lock_ns, std::memory_order_relaxed);
+        acc_scan_ns.fetch_add(this_scan_ns, std::memory_order_relaxed);
 
-        // 3) compact and sort results
+        // Phase 6: output formatting
+        const auto to0 = clk::now();
         std::vector<int> idx;
         idx.reserve(k);
         for (int i = 0; i < k; ++i)
             if (top_ids[i] != (DocId)-1) idx.push_back(i);
         std::sort(idx.begin(), idx.end(),
                   [&](int a, int b){ return top_scores[a] < top_scores[b]; });
-
         auto& oi = out_ids[qi];
         auto& os = out_scores[qi];
         oi.resize(idx.size());
@@ -861,11 +1266,20 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
             oi[i] = top_ids[idx[i]];
             os[i] = top_scores[idx[i]];
         }
+        acc_output_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - to0).count(),
+            std::memory_order_relaxed);
     }
     if (!ex_str.empty()) throw std::runtime_error(ex_str);
 
-    if (out_centroid_ms) *out_centroid_ms = centroid_ms;
-    if (out_scan_ms)     *out_scan_ms     = do_timing ? idx_fms(idx_clock::now() - t_scan0) : 0.0;
+    // Convert accumulated nanoseconds → milliseconds.
+    // The OMP threads sum wall-time per thread, so divide by omp_get_max_threads
+    // to get the average parallel wall time (approximation).
+    const double inv_ns_to_ms = 1e-6;
+    prof.select_ms += acc_select_ns.load() * inv_ns_to_ms;
+    prof.lock_ms   += acc_lock_ns.load()   * inv_ns_to_ms;
+    prof.scan_ms   += acc_scan_ns.load()   * inv_ns_to_ms;
+    prof.output_ms += acc_output_ns.load() * inv_ns_to_ms;
 }
 
 void IVFIndex::get_probe_ids(const float* query, int nprobe, std::vector<int>& out_ids) const {

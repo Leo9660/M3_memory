@@ -275,6 +275,13 @@ public:
     uint64_t         total_flushed_vectors()     const;
     uint64_t         total_flush_events()        const;
 
+    // Number of vectors in the GPU cluster for cid (0 if not GPU-resident).
+    size_t           gpu_cluster_size(int cid)   const;
+    // Number of vectors currently staged in the insert buffer for cid.
+    size_t           buffer_size(int cid)        const;
+    // Running count of insert-overflow events (buffer-full L2 fallbacks).
+    uint64_t         total_overflow_count()      const;
+
 private:
     void   bg_thread_fn_(int flush_ms, int maintenance_ms, int rebalance_ms);
     size_t hotspot_rebalance_();
@@ -301,7 +308,8 @@ private:
     std::thread           bg_thread_;
 
     // Op-count-driven split config (set by start_background).
-    std::atomic<uint64_t> op_count_{0};   // incremented per insert(); relaxed ordering
+    std::atomic<uint64_t> op_count_{0};       // incremented per insert(); relaxed ordering
+    std::atomic<uint64_t> overflow_count_{0}; // insert-buffer-full fallbacks to L2
     uint64_t              split_every_ops_{0};    // 0 = disabled
     size_t                split_threshold_{200000};
 
@@ -309,6 +317,13 @@ private:
     std::vector<int>      pending_promotes_;
     std::vector<int>      pending_demotes_;
     std::vector<int>      pending_flushes_;   // cids whose insert buffer hit cap during insert
+
+    // Overflow staging: vectors that arrived when the insert buffer was full.
+    // Written to L2 immediately in insert() for durability, then also expanded
+    // onto the GPU cluster by process_pending_() so they are not invisible to search.
+    // Protected by pending_mu_; drained atomically with pending_flushes_.
+    std::unordered_map<int, std::vector<DocId>>  overflow_ids_;
+    std::unordered_map<int, std::vector<float>>  overflow_vecs_;
 };
 
 } // namespace m3

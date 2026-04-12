@@ -274,6 +274,14 @@ public:
         return metadata_[static_cast<size_t>(cid)].access_count;
     }
 
+    // Returns the L2 vector count for a single cluster (0 if cid is out of range).
+    // Used by recall diagnostics to detect GPU/L2 divergence after promotions.
+    size_t l2_vector_count(int cid) const {
+        std::lock_guard<std::mutex> ml(meta_mu_);
+        if (cid < 0 || static_cast<size_t>(cid) >= metadata_.size()) return 0;
+        return metadata_[static_cast<size_t>(cid)].l2_vector_count;
+    }
+
 private:
     struct Layer {
         std::shared_ptr<IVFIndex> index;    // built on demand

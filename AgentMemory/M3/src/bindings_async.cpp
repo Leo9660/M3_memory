@@ -645,54 +645,50 @@ PYBIND11_MODULE(_m3_async, m) {
                  //  printf("Flush complete.\n");
              })
 
-        // ---- search(index_id, q, k) ----
+        // ---- search(index_id, q, k) / search(index_id, q, k, nprobe) ----
+        // Returns (ids, scores) as numpy arrays of shape [Q, k] (int64 / float32).
+        // Empty slots are filled with id=-1, score=inf  (same convention as FAISS).
+        // Callers iterating over rows should skip entries where id == -1.
         .def("search",
              [](AsyncEngine& e,
                 int index_id,
                 py::array_t<float, py::array::c_style> queries,
                 int k) {
                  auto buf = queries.request();
-                 if (buf.ndim != 2) {
+                 if (buf.ndim != 2)
                      throw std::runtime_error("queries must be 2D [Q, D]");
-                 }
                  int expected_dim = e.dim_of(index_id);
-                 if (expected_dim <= 0) {
-                     throw std::runtime_error("search: unknown index_id (call create_ivf first)");
-                 }
-                 if (buf.shape[1] != expected_dim) {
-                     throw std::runtime_error(
-                         "search: query dim mismatch, expected " +
-                         std::to_string(expected_dim) + ", got " +
-                         std::to_string(buf.shape[1]));
-                 }
+                 if (expected_dim <= 0)
+                     throw std::runtime_error("search: unknown index_id");
+                 if (buf.shape[1] != expected_dim)
+                     throw std::runtime_error("search: query dim mismatch");
+
                  std::vector<std::vector<DocId>> out_ids;
                  std::vector<std::vector<float>> out_scores;
-                 out_ids.reserve(buf.shape[0]);
-                 out_scores.reserve(buf.shape[0]);
                  {
-                    py::gil_scoped_release _g;
-                    e.search(index_id,
-                          (const float*)buf.ptr,
-                          (size_t)buf.shape[0],
-                          k,
-                          /*nprobe=*/-1,
-                          out_ids,
-                          out_scores);
-                }
-                //  printf("Query %d: final results:", index_id);
-                //  for (size_t i = 0; i < out_ids.size(); ++i) {
-                //         for (size_t j = 0; j < out_ids[i].size(); ++j) {
-                //             printf(" (id=%ld, score=%.4f)", out_ids[i][j], out_scores[i][j]);
-                //         }
-                //  }
-                //  printf("Finished\n");
-                 return py::make_tuple(out_ids, out_scores);
+                     py::gil_scoped_release _g;
+                     e.search(index_id, (const float*)buf.ptr,
+                              (size_t)buf.shape[0], k, /*nprobe=*/-1,
+                              out_ids, out_scores);
+                 }
+                 const py::ssize_t Q = (py::ssize_t)out_ids.size();
+                 auto ids_arr    = py::array_t<int64_t>({Q, (py::ssize_t)k});
+                 auto scores_arr = py::array_t<float>  ({Q, (py::ssize_t)k});
+                 auto ids_p    = ids_arr.mutable_unchecked<2>();
+                 auto scores_p = scores_arr.mutable_unchecked<2>();
+                 for (py::ssize_t qi = 0; qi < Q; ++qi) {
+                     const auto& ri = out_ids[(size_t)qi];
+                     const auto& rs = out_scores[(size_t)qi];
+                     for (int j = 0; j < k; ++j) {
+                         ids_p(qi,j)    = j < (int)ri.size() ? ri[j]   : -1;
+                         scores_p(qi,j) = j < (int)rs.size() ? rs[j]
+                                          : std::numeric_limits<float>::infinity();
+                     }
+                 }
+                 return py::make_tuple(ids_arr, scores_arr);
              },
-             py::arg("index_id"),
-             py::arg("queries"),
-             py::arg("k"))
+             py::arg("index_id"), py::arg("queries"), py::arg("k"))
 
-        // ---- search(index_id, q, k, nprobe) ----
         .def("search",
              [](AsyncEngine& e,
                 int index_id,
@@ -700,34 +696,99 @@ PYBIND11_MODULE(_m3_async, m) {
                 int k,
                 int nprobe) {
                  auto buf = queries.request();
-                 if (buf.ndim != 2) {
+                 if (buf.ndim != 2)
                      throw std::runtime_error("queries must be 2D [Q, D]");
-                 }
                  int expected_dim = e.dim_of(index_id);
-                 if (expected_dim <= 0) {
-                     throw std::runtime_error("search: unknown index_id (call create_ivf first)");
-                 }
-                 if (buf.shape[1] != expected_dim) {
-                     throw std::runtime_error(
-                         "search: query dim mismatch, expected " +
-                         std::to_string(expected_dim) + ", got " +
-                         std::to_string(buf.shape[1]));
-                 }
+                 if (expected_dim <= 0)
+                     throw std::runtime_error("search: unknown index_id");
+                 if (buf.shape[1] != expected_dim)
+                     throw std::runtime_error("search: query dim mismatch");
+
                  std::vector<std::vector<DocId>> out_ids;
                  std::vector<std::vector<float>> out_scores;
-                 out_ids.reserve(buf.shape[0]);
-                 out_scores.reserve(buf.shape[0]);
                  {
-                    py::gil_scoped_release _g;
-                    e.search(index_id,
-                            (const float*)buf.ptr,
-                            (size_t)buf.shape[0],
-                            k,
-                            nprobe,
-                            out_ids,
-                            out_scores);
+                     py::gil_scoped_release _g;
+                     e.search(index_id, (const float*)buf.ptr,
+                              (size_t)buf.shape[0], k, nprobe,
+                              out_ids, out_scores);
                  }
-                 return py::make_tuple(out_ids, out_scores);
+                 const py::ssize_t Q = (py::ssize_t)out_ids.size();
+                 auto ids_arr    = py::array_t<int64_t>({Q, (py::ssize_t)k});
+                 auto scores_arr = py::array_t<float>  ({Q, (py::ssize_t)k});
+                 auto ids_p    = ids_arr.mutable_unchecked<2>();
+                 auto scores_p = scores_arr.mutable_unchecked<2>();
+                 for (py::ssize_t qi = 0; qi < Q; ++qi) {
+                     const auto& ri = out_ids[(size_t)qi];
+                     const auto& rs = out_scores[(size_t)qi];
+                     for (int j = 0; j < k; ++j) {
+                         ids_p(qi,j)    = j < (int)ri.size() ? ri[j]   : -1;
+                         scores_p(qi,j) = j < (int)rs.size() ? rs[j]
+                                          : std::numeric_limits<float>::infinity();
+                     }
+                 }
+                 return py::make_tuple(ids_arr, scores_arr);
+             },
+             py::arg("index_id"), py::arg("queries"), py::arg("k"), py::arg("nprobe"))
+
+        // ---- search_profiled(index_id, q, k, nprobe) -> (ids, scores, profile_dict) ----
+        // profile_dict keys (all in milliseconds, cumulative across OMP threads):
+        //   snapshot_ms, c_norms_ms, sgemm_ms, select_ms, lock_ms, scan_ms, output_ms
+        //   n_queries, n_clusters, nprobe_used
+        .def("search_profiled",
+             [](AsyncEngine& e,
+                int index_id,
+                py::array_t<float, py::array::c_style> queries,
+                int k,
+                int nprobe) {
+                 auto buf = queries.request();
+                 if (buf.ndim != 2)
+                     throw std::runtime_error("queries must be 2D [Q, D]");
+                 int expected_dim = e.dim_of(index_id);
+                 if (expected_dim <= 0)
+                     throw std::runtime_error("search_profiled: unknown index_id");
+                 if (buf.shape[1] != expected_dim)
+                     throw std::runtime_error("search_profiled: query dim mismatch");
+
+                 std::vector<std::vector<DocId>> out_ids;
+                 std::vector<std::vector<float>> out_scores;
+                 IVFIndex::SearchProfile prof;
+
+                 {
+                     py::gil_scoped_release _g;
+                     e.search_profiled(index_id,
+                                       (const float*)buf.ptr,
+                                       (size_t)buf.shape[0],
+                                       k, nprobe,
+                                       out_ids, out_scores, prof);
+                 }
+
+                 const py::ssize_t Q = (py::ssize_t)out_ids.size();
+                 auto ids_arr    = py::array_t<int64_t>({Q, (py::ssize_t)k});
+                 auto scores_arr = py::array_t<float>  ({Q, (py::ssize_t)k});
+                 auto ids_p    = ids_arr.mutable_unchecked<2>();
+                 auto scores_p = scores_arr.mutable_unchecked<2>();
+                 for (py::ssize_t qi = 0; qi < Q; ++qi) {
+                     const auto& ri = out_ids[(size_t)qi];
+                     const auto& rs = out_scores[(size_t)qi];
+                     for (int j = 0; j < k; ++j) {
+                         ids_p(qi,j)    = j < (int)ri.size() ? ri[j]   : -1;
+                         scores_p(qi,j) = j < (int)rs.size() ? rs[j]
+                                          : std::numeric_limits<float>::infinity();
+                     }
+                 }
+
+                 py::dict pd;
+                 pd["snapshot_ms"]  = prof.snapshot_ms;
+                 pd["c_norms_ms"]   = prof.c_norms_ms;
+                 pd["sgemm_ms"]     = prof.sgemm_ms;
+                 pd["select_ms"]    = prof.select_ms;
+                 pd["lock_ms"]      = prof.lock_ms;
+                 pd["scan_ms"]      = prof.scan_ms;
+                 pd["output_ms"]    = prof.output_ms;
+                 pd["n_queries"]    = prof.n_queries;
+                 pd["n_clusters"]   = prof.n_clusters;
+                 pd["nprobe_used"]  = prof.nprobe_used;
+                 return py::make_tuple(ids_arr, scores_arr, pd);
              },
              py::arg("index_id"),
              py::arg("queries"),

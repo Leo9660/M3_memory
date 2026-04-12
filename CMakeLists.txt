@@ -70,7 +70,7 @@ set(M3_INCLUDE
 pybind11_add_module(_m3_async MODULE ${M3_SRC})
 target_include_directories(_m3_async PRIVATE ${M3_INCLUDE} ${CBLAS_INCLUDE_DIR})
 target_compile_features(_m3_async PRIVATE cxx_std_17)
-target_compile_options(_m3_async PRIVATE -O3 -pthread -mavx2 -mfma ${OpenMP_CXX_FLAGS})
+target_compile_options(_m3_async PRIVATE -O3 -pthread -mavx2 -mfma -mavx512f -mavx512dq -mavx512bw -mavx512vl ${OpenMP_CXX_FLAGS})
 target_link_libraries(_m3_async PRIVATE CUDA::cudart CUDA::cublas ${OPENBLAS_LIB} OpenMP::OpenMP_CXX)
 
 install(TARGETS _m3_async

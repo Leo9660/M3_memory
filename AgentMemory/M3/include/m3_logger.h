@@ -223,6 +223,35 @@ public:
                         double gpu_dispatch_ms,
                         double total_ms);
 
+    // ---- Recall diagnostics (CSV) ----
+    // Written to recall_diag.csv. Three event types track the three known
+    // causes of recall degradation:
+    //
+    //   OVERFLOW      — insert buffer was full; vector routed to L2 directly.
+    //                   While the cluster is GPU-resident L2 is not searched,
+    //                   so this vector is invisible until the cluster is evicted.
+    //                   gpu_n  = GPU cluster size at overflow time.
+    //                   buf_n  = insert buffer capacity (buffer was full).
+    //                   l2_n   = 0 (not queried at this call site).
+    //                   cumul_overflows = running total of overflow events.
+    //
+    //   PROMOTION     — cluster uploaded to GPU. gpu_n = vectors uploaded;
+    //                   l2_n = vectors in L2 at export time (should equal gpu_n).
+    //                   If l2_n > gpu_n, vectors were written to L2 after the
+    //                   export snapshot but before the cluster became GPU-resident
+    //                   (promotion race) — those l2_n - gpu_n vectors are now
+    //                   permanently invisible while the cluster stays on GPU.
+    //
+    //   SEARCH_DIVERGE — at search time, a GPU-resident cluster has more vectors
+    //                   in L2 than (gpu_n + buf_n).  The delta is invisible to
+    //                   the current search.  Logged once per unique cluster per
+    //                   search() call, only when invisible_n > 0.
+    //
+    // invisible_n = max(0, l2_n - gpu_n - buf_n)  (computed internally).
+    void log_recall_diag(const char* event, int cid,
+                         size_t gpu_n, size_t buf_n, size_t l2_n,
+                         uint64_t cumul_overflows);
+
 private:
     M3Profiler();
     ~M3Profiler();
@@ -230,12 +259,14 @@ private:
     void write_search_profile_(const char* line);
     void write_search_stats_(const char* line);
     void write_insert_(const char* line);
+    void write_recall_diag_(const char* line);
     static void timestamp_(char* buf, size_t buf_sz);
 
     mutable std::mutex mu_;
     FILE*              fp_search_profile_ = nullptr;
     FILE*              fp_search_stats_   = nullptr;
     FILE*              fp_insert_         = nullptr;
+    FILE*              fp_recall_diag_    = nullptr;
     bool               enabled_           = false;
 
     // Accumulators for end-of-run summary lines.

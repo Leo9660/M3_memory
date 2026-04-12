@@ -76,7 +76,7 @@ class MemoryManagement:
             self.backend: MemoryBackend = FaissBackend()
         elif backend.lower() == "milvus":
             from .backend.milvus import MilvusBackend
-            self.backend: MemoryBackend = MilvusBackend(uri=milvus_uri, token=milvus_token)
+            self.backend: MemoryBackend = MilvusBackend()
         else:
             raise ValueError(f"Unknown backend: {backend}")
 

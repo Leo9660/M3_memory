@@ -104,25 +104,34 @@ BufferResult GpuCoordinator::insert(int cid, DocId id, const float* vec) {
         // Route this vector to L2 so the insert is durable immediately;
         // the background thread will expand the GPU cluster and reopen the
         // buffer slot without stalling the insert path.
+        const uint64_t oc = overflow_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         {
             std::lock_guard<std::mutex> lk(pending_mu_);
             pending_flushes_.push_back(cid);
+            // Stage the overflow vector so process_pending_() can expand the
+            // GPU cluster with it — prevents the vector from being invisible
+            // to search while the cluster remains GPU-resident.
+            overflow_ids_[cid].push_back(id);
+            const size_t d = static_cast<size_t>(gpu_idx_.dim());
+            overflow_vecs_[cid].insert(overflow_vecs_[cid].end(), vec, vec + d);
         }
         M3Logger::instance().log_insert_overflow(cid);
+        if (M3Profiler::instance().is_enabled()) {
+            // buf_n = current buffer size (== capacity, since try_buffer returned kFull).
+            // l2_n = 0: not queried here; SEARCH_DIVERGE events will show the gap.
+            M3Profiler::instance().log_recall_diag(
+                "OVERFLOW", cid,
+                gpu_idx_.cluster_size(cid),  // gpu_n
+                insert_buf_.size(cid),        // buf_n (== capacity)
+                0,                            // l2_n (unknown at insert site)
+                oc);
+        }
         idx_.load_cluster(cid, &id, vec, 1);
         return BufferResult::kBuffered;
     }
     return r;
 }
 
-size_t GpuCoordinator::search(const std::vector<int>& probe_cids,
-                               const float* query, int k,
-                               std::vector<DocId>&  out_ids,
-                               std::vector<float>&  out_scores,
-                               GpuCollabTiming*     timing) {
-    return gpu_idx_.collaborative_search(probe_cids, query, k,
-                                         insert_buf_, out_ids, out_scores, timing);
-}
 
 size_t GpuCoordinator::search_batch(
         const std::vector<std::vector<int>>& per_query_gpu_cids,
@@ -167,6 +176,21 @@ bool GpuCoordinator::promote_to_gpu(int cid) {
     insert_buf_.activate_cluster(cid);
     M3Logger::instance().log_promotion(cid, idx_.get_access_count(cid),
                                        /*auto_promoted=*/false);
+    if (M3Profiler::instance().is_enabled()) {
+        // gpu_n = vectors actually uploaded to GPU (from export snapshot = n).
+        // l2_n  = current L2 vector count — may exceed gpu_n if vectors were
+        //         written to L2 between export_l2_cluster() and register_cluster()
+        //         (the promotion race). Those (l2_n - gpu_n) vectors are now
+        //         invisible while this cluster remains GPU-resident.
+        const size_t gpu_n = gpu_idx_.cluster_size(cid);
+        const size_t l2_n  = idx_.l2_vector_count(cid);
+        M3Profiler::instance().log_recall_diag(
+            "PROMOTION", cid,
+            gpu_n,
+            0,     // buf_n: buffer just activated, starts empty
+            l2_n,
+            overflow_count_.load(std::memory_order_relaxed));
+    }
     return true;
 }
 
@@ -481,11 +505,15 @@ void GpuCoordinator::enqueue_demote(int cid) {
 
 void GpuCoordinator::process_pending_() {
     std::vector<int> promotes, demotes, flushes;
+    std::unordered_map<int, std::vector<DocId>> ovf_ids;
+    std::unordered_map<int, std::vector<float>> ovf_vecs;
     {
         std::lock_guard<std::mutex> lk(pending_mu_);
         promotes.swap(pending_promotes_);
         demotes.swap(pending_demotes_);
         flushes.swap(pending_flushes_);
+        ovf_ids.swap(overflow_ids_);
+        ovf_vecs.swap(overflow_vecs_);
     }
 
     // Demotes first: drain buffered vectors to L2, then release GPU memory.
@@ -511,6 +539,20 @@ void GpuCoordinator::process_pending_() {
     // subsequent inserts can buffer again without routing to L2.
     if (!flushes.empty())
         flush_coord_.force_flush_all(flushes);
+
+    // Overflow drain: vectors that were written to L2 when the insert buffer
+    // was full are now expanded into the GPU cluster so they are visible to
+    // collaborative_search. Skip any cluster that was demoted in this same
+    // tick (not GPU-resident anymore) — those vectors already live in L2.
+    for (auto& [cid, ids] : ovf_ids) {
+        if (ids.empty()) continue;
+        if (!budget_.is_gpu_resident(cid) || !gpu_idx_.has_cluster(cid)) continue;
+        auto& vecs = ovf_vecs[cid];
+        gpu_idx_.expand_cluster(cid, ids.data(), vecs.data(), ids.size());
+        const size_t new_bytes = gpu_idx_.cluster_size(cid)
+                               * static_cast<size_t>(gpu_idx_.dim()) * sizeof(float);
+        budget_.update_cluster(cid, nullptr, new_bytes);
+    }
 }
 
 bool GpuCoordinator::is_gpu_resident(int cid) const {
@@ -535,6 +577,18 @@ uint64_t GpuCoordinator::total_flushed_vectors() const {
 
 uint64_t GpuCoordinator::total_flush_events() const {
     return flush_coord_.total_flush_events();
+}
+
+size_t GpuCoordinator::gpu_cluster_size(int cid) const {
+    return gpu_idx_.cluster_size(cid);
+}
+
+size_t GpuCoordinator::buffer_size(int cid) const {
+    return insert_buf_.size(cid);
+}
+
+uint64_t GpuCoordinator::total_overflow_count() const {
+    return overflow_count_.load(std::memory_order_relaxed);
 }
 
 } // namespace m3

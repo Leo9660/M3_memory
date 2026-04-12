@@ -97,6 +97,26 @@ public:
                        double* out_centroid_ms = nullptr,
                        double* out_scan_ms     = nullptr) const;
 
+    // Fine-grained per-phase profiling result (all times in milliseconds, wall-clock).
+    struct SearchProfile {
+        double snapshot_ms   = 0;  // shared_lock + copy of compact_centroids + cluster ptrs
+        double c_norms_ms    = 0;  // computing per-centroid norms (L2 only)
+        double sgemm_ms      = 0;  // cblas_sgemm + per-query q_norm fixup
+        double select_ms     = 0;  // per-query nth_element + sort to choose top-nprobe clusters
+        double lock_ms       = 0;  // total time spent waiting on Cluster::mu_ shared_lock
+        double scan_ms       = 0;  // total time in the inner distance loop (search_into body)
+        double output_ms     = 0;  // compact+sort results into out_ids/out_scores
+        int    n_queries     = 0;
+        int    n_clusters    = 0;  // live_nlist
+        int    nprobe_used   = 0;
+    };
+
+    // Profiled variant of search_nprobe — same results, fills a SearchProfile.
+    void search_nprobe_profiled(const float* queries, size_t q_rows, int k, int nprobe,
+                                std::vector<std::vector<DocId>>& out_ids,
+                                std::vector<std::vector<float>>& out_scores,
+                                SearchProfile& prof) const;
+
     // For one query, return the top-nprobe cluster ids by centroid distance (for cache probe set).
     void get_probe_ids(const float* query, int nprobe, std::vector<int>& out_ids) const;
 

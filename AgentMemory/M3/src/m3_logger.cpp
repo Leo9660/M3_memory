@@ -260,12 +260,14 @@ M3Profiler::M3Profiler() {
 
     const char* dir = std::getenv("M3_PROFILE_DIR");
     if (!dir) dir = "profile";
+    const char* prefix = std::getenv("M3_PROFILE_PREFIX");
+    if (!prefix || prefix[0] == '\0') prefix = "m3";
     time_t now = time(nullptr);
     struct tm tm_buf;
     localtime_r(&now, &tm_buf);
     char base[256];
-    snprintf(base, sizeof(base), "%s/m3_%04d%02d%02d_%02d%02d%02d",
-             dir,
+    snprintf(base, sizeof(base), "%s/%s_%04d%02d%02d_%02d%02d%02d",
+             dir, prefix,
              tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
              tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
 
@@ -321,6 +323,22 @@ M3Profiler::M3Profiler() {
         "l0l2_write_ms,gpu_dispatch_ms\n");
     fflush(fp_insert_);
 
+    // ---- recall_diag.csv ----
+    snprintf(path, sizeof(path), "%s_recall_diag.csv", base);
+    fp_recall_diag_ = fopen(path, "w");
+    if (!fp_recall_diag_) {
+        fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
+        fclose(fp_search_profile_); fp_search_profile_ = nullptr;
+        fclose(fp_search_stats_);   fp_search_stats_   = nullptr;
+        fclose(fp_insert_);         fp_insert_         = nullptr;
+        return;
+    }
+    // event types: OVERFLOW | PROMOTION | SEARCH_DIVERGE
+    // invisible_n = max(0, l2_n - gpu_n - buf_n)
+    fprintf(fp_recall_diag_,
+        "timestamp,event,cid,gpu_n,buf_n,l2_n,invisible_n,cumul_overflows\n");
+    fflush(fp_recall_diag_);
+
     enabled_ = true;
 }
 
@@ -355,6 +373,9 @@ M3Profiler::~M3Profiler() {
                     insert_total_ms_sum_);
         }
         fflush(fp_insert_); fclose(fp_insert_); fp_insert_ = nullptr;
+    }
+    if (fp_recall_diag_) {
+        fflush(fp_recall_diag_); fclose(fp_recall_diag_); fp_recall_diag_ = nullptr;
     }
 }
 
@@ -477,6 +498,30 @@ void M3Profiler::log_search_stats(size_t q_rows,
     l1_exit_ms_sum_ += l1_exit_total_ms;
     l1_exit_count_  += l1_exits;
     write_search_stats_(buf);
+}
+
+void M3Profiler::write_recall_diag_(const char* line) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!enabled_ || !fp_recall_diag_) return;
+    fprintf(fp_recall_diag_, "%s\n", line);
+    fflush(fp_recall_diag_);
+}
+
+void M3Profiler::log_recall_diag(const char* event, int cid,
+                                  size_t gpu_n, size_t buf_n, size_t l2_n,
+                                  uint64_t cumul_overflows) {
+    if (!enabled_) return;
+    char ts[32]; timestamp_(ts, sizeof(ts));
+    const int64_t invisible = (static_cast<int64_t>(l2_n)
+                               - static_cast<int64_t>(gpu_n)
+                               - static_cast<int64_t>(buf_n));
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "%s,%s,%d,%zu,%zu,%zu,%lld,%llu",
+        ts, event, cid, gpu_n, buf_n, l2_n,
+        static_cast<long long>(invisible < 0 ? 0 : invisible),
+        static_cast<unsigned long long>(cumul_overflows));
+    write_recall_diag_(buf);
 }
 
 void M3Profiler::log_insert_row(size_t n_rows,

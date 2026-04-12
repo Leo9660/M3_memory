@@ -235,6 +235,27 @@ void AsyncEngine::search(int index_id,
     search(index_id, queries, q_rows, k, /*nprobe=*/-1, out_ids, out_scores);
 }
 
+void AsyncEngine::search_profiled(int index_id,
+                                  const float* queries, size_t q_rows, int k, int nprobe,
+                                  std::vector<std::vector<DocId>>& out_ids,
+                                  std::vector<std::vector<float>>& out_scores,
+                                  IVFIndex::SearchProfile& prof) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+
+    if (!idx) {
+        out_ids.assign(q_rows, {});
+        out_scores.assign(q_rows, {});
+        return;
+    }
+
+    int use_nprobe = (nprobe > 0) ? nprobe : search_policy_.default_nprobe;
+    idx->search_nprobe_profiled(queries, q_rows, k, use_nprobe, out_ids, out_scores, prof);
+}
+
 void AsyncEngine::load_cluster(int index_id,
                                int cluster_id,
                                const std::vector<DocId>& ids,

@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <cstring>   // memcpy, memset
 #include <mutex>
+#include <cblas.h>
 
 namespace m3 {
 
@@ -321,6 +322,134 @@ void Cluster::search_into(const float* query, float q_norm_sq, int k,
             worst_score = top_scores[0];
         }
     }
+}
+
+void Cluster::search_into_timed(const float* query, float q_norm_sq, int k,
+                                std::vector<DocId>& top_ids,
+                                std::vector<float>& top_scores,
+                                bool skip_alive_check,
+                                int64_t* lock_ns,
+                                int64_t* scan_ns) const {
+    if (!query || k <= 0) return;
+
+    using clk = std::chrono::steady_clock;
+
+    const auto t0 = clk::now();
+    std::shared_lock lk(mu_);
+    const auto t1 = clk::now();
+
+    const size_t N = ids_.size();
+    if (N == 0) return;
+
+    if ((int)top_scores.size() < k) {
+        top_scores.assign(k, std::numeric_limits<float>::infinity());
+        top_ids.assign(k, -1);
+    }
+
+    auto sift_down = [&](int root) {
+        while (true) {
+            int largest = root;
+            const int l = 2 * root + 1;
+            const int r = 2 * root + 2;
+            if (l < k && top_scores[l] > top_scores[largest]) largest = l;
+            if (r < k && top_scores[r] > top_scores[largest]) largest = r;
+            if (largest == root) break;
+            std::swap(top_scores[root], top_scores[largest]);
+            std::swap(top_ids[root],    top_ids[largest]);
+            root = largest;
+        }
+    };
+
+    const bool use_decomposed = (metric_ == Metric::L2)
+                                && (q_norm_sq >= 0.0f)
+                                && (norms_.size() == N);
+    const size_t D = static_cast<size_t>(dim_);
+    float worst_score = top_scores[0];
+
+    for (size_t row = 0; row < N; ++row) {
+        if (!skip_alive_check && !alive_[row]) continue;
+        const float* v = mat_.data() + row * D;
+        float s;
+        if (use_decomposed) {
+            s = q_norm_sq + norms_[row] - 2.0f * ip_score(query, v, dim_);
+        } else {
+            s = score_(query, v);
+        }
+        if (s < worst_score) {
+            top_scores[0] = s;
+            top_ids[0]    = ids_[row];
+            sift_down(0);
+            worst_score = top_scores[0];
+        }
+    }
+
+    const auto t2 = clk::now();
+
+    if (lock_ns) *lock_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    if (scan_ns) *scan_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+}
+
+size_t Cluster::scan_batch_l2(
+        const float* queries,
+        const float* q_norms_sq,
+        size_t n_queries,
+        std::vector<float>& dists_out,
+        std::vector<DocId>& live_ids_out) const {
+    if (n_queries == 0 || metric_ != Metric::L2) return 0;
+
+    std::shared_lock lk(mu_);
+    const size_t N_total = ids_.size();
+    if (N_total == 0 || live_count_ == 0) return 0;
+
+    // Fast path: no tombstones — use mat_ directly without copying.
+    const bool all_live = (live_count_ == N_total);
+    const float* scan_mat   = nullptr;
+    const float* scan_norms = nullptr;
+    std::vector<float> tmp_mat, tmp_norms;
+    size_t N;
+
+    if (all_live) {
+        scan_mat   = mat_.data();
+        scan_norms = norms_.data();
+        live_ids_out.assign(ids_.begin(), ids_.end());
+        N = N_total;
+    } else {
+        live_ids_out.clear();
+        live_ids_out.reserve(live_count_);
+        tmp_mat.reserve(live_count_ * (size_t)dim_);
+        tmp_norms.reserve(live_count_);
+        for (size_t row = 0; row < N_total; ++row) {
+            if (!alive_[row]) continue;
+            live_ids_out.push_back(ids_[row]);
+            tmp_mat.insert(tmp_mat.end(),
+                           mat_.begin() + (ptrdiff_t)(row * (size_t)dim_),
+                           mat_.begin() + (ptrdiff_t)((row + 1) * (size_t)dim_));
+            tmp_norms.push_back(norms_[row]);
+        }
+        scan_mat   = tmp_mat.data();
+        scan_norms = tmp_norms.data();
+        N = live_ids_out.size();
+    }
+    if (N == 0) return 0;
+
+    dists_out.resize(n_queries * N);
+
+    // sgemm: dists = -2 * queries × scan_mat^T  →  [n_queries × N]
+    // gives -2·dot(q_i, v_j) for each (i,j)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                (int)n_queries, (int)N, dim_,
+                -2.0f, queries, dim_,
+                scan_mat, dim_,
+                0.0f, dists_out.data(), (int)N);
+
+    // L2 fixup: add q_norm²[i] + v_norm²[j]
+    for (size_t qi = 0; qi < n_queries; ++qi) {
+        float* row = dists_out.data() + qi * N;
+        const float qn = q_norms_sq[qi];
+        for (size_t vi = 0; vi < N; ++vi)
+            row[vi] += qn + scan_norms[vi];
+    }
+    return N;
 }
 
 const float* Cluster::get_vector(DocId id) const {
