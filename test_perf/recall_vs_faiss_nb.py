@@ -1,27 +1,16 @@
 #!/usr/bin/env python
 """
-Recall@k benchmark: test backend (M3MultiGpu or other) + test Faiss vs GT Faiss ground truth.
+Recall@k benchmark identical to recall_vs_faiss.py but automatically tunes
+M3MultiGpuBackend neighbourhood-k values based on --top-k.
 
-Three backends run in lockstep:
-  GT    faiss  @ --gt-nprobe   (default 512) — ground truth, latency not reported
-  test  faiss  @ --faiss-nprobe              — compared against GT
-  test  m3/etc @ --nprobe                    — compared against GT
-
-Outputs (all written to bench/<backend>_<mode>_<DD>_<HHMMSS>/):
-  console.csv                       — every log line with elapsed time and tag
-  batches.csv                       — per-batch recall@k + latency for test-faiss and m3 backends
-  <prefix>_<ts>_search_profile.csv  — M3 C++ profiler step timings (auto-enabled)
-  <prefix>_<ts>_search_stats.csv    — M3 C++ profiler routing/exit stats (auto-enabled)
-  <prefix>_<ts>_insert.csv          — M3 C++ profiler insert timings (auto-enabled)
-  <prefix>_<ts>_recall_diag.csv     — M3 C++ profiler recall diagnostic rows
+K_NEIGHBOURHOOD maps each supported k to (l0_neighborhood_k, l1_neighborhood_k).
+Only the M3 backend is affected; GT-faiss and test-faiss are unchanged.
 
 Usage:
-  python recall_vs_faiss.py \\
-      --faiss-index /path/to/index.faiss \\
-      --dataset agentgym --limit 4096 \\
-      --top-k 10 --nprobe 64 --faiss-nprobe 64 --gt-nprobe 512 \\
-      --search-batch 128 --insert-batch 512 \\
-      --mode item_search_insert
+  python recall_vs_faiss_nb.py \\
+      --faiss-index /data/IVF.index \\
+      --top-k 10 \\
+      [all other recall_vs_faiss.py flags]
 """
 
 from __future__ import annotations
@@ -33,7 +22,6 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import re as _re
 import sys
 import time
 from datetime import datetime
@@ -43,6 +31,16 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+# ---------------------------------------------------------------------------
+# Neighbourhood-k table: top-k → (l0_neighborhood_k, l1_neighborhood_k)
+# ---------------------------------------------------------------------------
+K_NEIGHBOURHOOD: Dict[int, Tuple[int, int]] = {
+    1:  (1,  3),
+    5:  (3,  8),
+    10: (8,  12),
+    20: (10, 25),
+}
 
 # ---------------------------------------------------------------------------
 # Parse backend / mode / bench-dir from sys.argv early so that M3_PROFILE_DIR
@@ -85,17 +83,15 @@ while _i < len(_argv):
     _i += 1
 del _argv, _i, _a
 
-# Build run dir: <backend>_<mode>_<DD>_<HHMMSS>
+# Build run dir: <MM_DD>/recall_vs_faiss_out/<HH_MM_SS>
 _now = datetime.now()
-_run_ts = _now.strftime("%d_%H%M%S")
-_aet_tag_e = f"_aet{_aet_early}" if _aet_early else ""
-_aer_tag_e = f"_aer{_aer_early}" if _aer_early else ""
-_run_tag = f"{_default_backend}_{_mode_early}_{_run_ts}{_aet_tag_e}{_aer_tag_e}"
-
 if _bench_dir_early:
     _run_dir = Path(_bench_dir_early).expanduser()
 else:
-    _run_dir = Path(__file__).parent / "bench" / _run_tag
+    _run_dir = (Path(__file__).parent
+                / _now.strftime("%m_%d")
+                / "recall_vs_faiss_out"
+                / _now.strftime("%H_%M_%S"))
 
 _run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -130,33 +126,18 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Bench logger — tees every log line to stdout AND bench/<run>/console.csv
+# Bench logger
 # ---------------------------------------------------------------------------
 
-_TAG_RE = _re.compile(r"^\s*\[([^\]]+)\]")
-
-
 class BenchLogger:
-    """Writes every log line to stdout and to bench/<run>/console.csv."""
-
     def __init__(self, run_dir: Path) -> None:
-        self._start = time.perf_counter()
-        run_dir.mkdir(parents=True, exist_ok=True)
-        self._f = (run_dir / "console.csv").open("w", newline="", encoding="utf-8")
-        self._w = csv.writer(self._f)
-        self._w.writerow(["elapsed_s", "tag", "message"])
-        self._f.flush()
+        pass
 
     def log(self, msg: str) -> None:
         print(msg)
-        elapsed = time.perf_counter() - self._start
-        m = _TAG_RE.match(msg)
-        tag = m.group(1) if m else ""
-        self._w.writerow([f"{elapsed:.3f}", tag, msg.strip()])
-        self._f.flush()
 
     def close(self) -> None:
-        self._f.close()
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -308,15 +289,6 @@ class TripleRunner:
         # CSV writer (set by caller)
         self.csv_writer: Optional[csv.writer] = None  # type: ignore[type-arg]
 
-        # recall_diag appender — appends RECALL_BATCH rows into the C++ profiler CSV
-        self._recall_diag_f = None
-        self._recall_diag_w = None
-        import glob as _glob
-        prof_dir = str(_run_dir)
-        matches = sorted(_glob.glob(os.path.join(prof_dir, "*_recall_diag.csv")))
-        if matches:
-            self._recall_diag_f = open(matches[-1], "a", newline="", encoding="utf-8")
-            self._recall_diag_w = csv.writer(self._recall_diag_f)
 
     # --- public API --------------------------------------------------------
 
@@ -339,9 +311,6 @@ class TripleRunner:
     def flush_remaining(self) -> None:
         if self.mm_m3.queue:
             self._flush()
-        if self._recall_diag_f is not None:
-            self._recall_diag_f.close()
-            self._recall_diag_f = None
 
     # --- internals ---------------------------------------------------------
 
@@ -421,17 +390,6 @@ class TripleRunner:
                     f"{t_m3*1e3:.3f}",     f"{m3_lat_ms:.3f}",
                 ])
 
-            if self._recall_diag_w is not None:
-                from datetime import datetime as _dt
-                ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                self._recall_diag_w.writerow([
-                    ts, "RECALL_BATCH",
-                    self._batch_idx, n_q,
-                    f"{recall_faiss:.6f}", f"{cum_faiss:.6f}",
-                    f"{recall_m3:.6f}",    f"{cum_m3:.6f}",
-                    f"{t_faiss*1e3:.3f}",  f"{t_m3*1e3:.3f}",
-                ])
-                self._recall_diag_f.flush()
 
     # --- aggregate properties ----------------------------------------------
 
@@ -474,7 +432,7 @@ class TripleRunner:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Recall@k benchmark: test-faiss + M3MultiGpu vs GT Faiss."
+        description="Recall@k benchmark with per-k neighbourhood tuning for M3MultiGpu."
     )
     parser.add_argument("--faiss-index", default="/data/IVF.index",
                         help="Path to Faiss IVF checkpoint (default: /data/IVF.index).")
@@ -487,7 +445,8 @@ def main() -> None:
                         help="Which M3 backend variant to test.")
     parser.add_argument("--metric", default="l2",
                         help="cosine / ip / l2 (default: l2 to match /data/IVF.index)")
-    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--top-k", type=int, default=10,
+                        help="Top-k for search. Also drives neighbourhood-k lookup in K_NEIGHBOURHOOD.")
     parser.add_argument("--nprobe", type=int, default=64,
                         help="nprobe for the M3/test backend.")
     parser.add_argument("--faiss-nprobe", type=int, default=64,
@@ -519,19 +478,35 @@ def main() -> None:
     args = parser.parse_args()
 
     # Patch M3MultiGpuBackend class defaults before the backend is instantiated.
-    if args.alpha_et is not None or args.alpha_et_adapt_rate is not None:
-        from AgentMemory.backend.m3 import M3MultiGpuBackend as _M3MG
-        if args.alpha_et is not None:
-            _M3MG.DEFAULTS["alpha_et"] = args.alpha_et
-        if args.alpha_et_adapt_rate is not None:
-            _M3MG.DEFAULTS["alpha_et_adapt_rate"] = args.alpha_et_adapt_rate
+    from AgentMemory.backend.m3 import M3MultiGpuBackend as _M3MG
+
+    # Apply neighbourhood-k overrides from the lookup table.
+    nb = K_NEIGHBOURHOOD.get(args.top_k)
+    if nb is not None:
+        l0_nb, l1_nb = nb
+        _M3MG.DEFAULTS["l0_neighborhood_k"] = l0_nb
+        _M3MG.DEFAULTS["l1_neighborhood_k"] = l1_nb
+    else:
+        l0_nb = _M3MG.DEFAULTS["l0_neighborhood_k"]
+        l1_nb = _M3MG.DEFAULTS["l1_neighborhood_k"]
+
+    if args.alpha_et is not None:
+        _M3MG.DEFAULTS["alpha_et"] = args.alpha_et
+    if args.alpha_et_adapt_rate is not None:
+        _M3MG.DEFAULTS["alpha_et_adapt_rate"] = args.alpha_et_adapt_rate
 
     # Use the run dir computed at module load time (M3_PROFILE_DIR already set)
     run_dir = _run_dir
     logger  = BenchLogger(run_dir)
 
+    logger.log(
+        f"[nb] top_k={args.top_k}  "
+        f"l0_neighborhood_k={l0_nb}  l1_neighborhood_k={l1_nb}"
+        + ("" if nb is not None else "  (not in K_NEIGHBOURHOOD, using defaults)")
+    )
+
     # per-batch CSV
-    batches_path = run_dir / "batches.csv"
+    batches_path = run_dir / "recall_latency.csv"
     batches_f    = batches_path.open("w", newline="", encoding="utf-8")
     csv_w        = csv.writer(batches_f)
     csv_w.writerow([
@@ -628,6 +603,23 @@ def main() -> None:
     idx_gt    = mm_gt.create_index("recall-bench-gt",    metric=metric)
     idx_faiss = mm_faiss.create_index("recall-bench-faiss", metric=metric)
     idx_m3    = mm_m3.create_index("recall-bench",          metric=metric)
+
+    # Confirm what the M3 backend was actually constructed with.
+    _l0_nb   = _M3MG.DEFAULTS["l0_neighborhood_k"]
+    _l1_nb   = _M3MG.DEFAULTS["l1_neighborhood_k"]
+    _k_promo = max(args.top_k, _l1_nb)
+    _l0_cap  = min(_l0_nb, args.top_k)
+    logger.log(
+        f"[m3-config] backend constructed with:"
+        f"  l0_neighborhood_k={_l0_nb}"
+        f"  l1_neighborhood_k={_l1_nb}"
+        f"  → k_promo=max(k={args.top_k}, l1_nb={_l1_nb})={_k_promo}"
+        f"  → l0_cap=min(l0_nb={_l0_nb}, k={args.top_k})={_l0_cap}"
+        + (f"  [WARN: l0_nb > k, {_l0_nb - args.top_k} l0 slots wasted]"
+           if _l0_nb > args.top_k else "")
+        + (f"  [WARN: k_promo={_k_promo} > k={args.top_k}, L2 fetches {_k_promo/args.top_k:.1f}x overhead]"
+           if _k_promo > args.top_k else "")
+    )
 
     # Hydrate all three from the same Faiss checkpoint
     for label, mm, idx in [

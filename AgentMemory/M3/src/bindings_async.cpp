@@ -222,7 +222,116 @@ PYBIND11_MODULE(_m3_async, m) {
                      idx.set_gpu_coordinator(&coord);
                  }
              },
-             py::arg("coordinator"));
+             py::arg("coordinator"))
+#ifdef M3_WITH_FSM
+        // ---- FSM-aware search (only available when built with M3_WITH_FSM) ----
+        .def("search_fsm",
+             [](const MultiLevelIndex& idx,
+                py::array_t<float, py::array::c_style> queries,
+                int k,
+                int nprobe,
+                py::object fsm_table_obj,
+                py::object traj_obj) {
+                 auto buf = queries.request();
+                 if (buf.ndim != 2) throw std::runtime_error("queries must be 2D [Q, D]");
+                 if (buf.shape[1] != idx.dim()) throw std::runtime_error("query dim mismatch");
+
+                 const fsm::FSMTable*    fsm_ptr  = nullptr;
+                 fsm::RequestTrajectory* traj_ptr = nullptr;
+                 if (!fsm_table_obj.is_none())
+                     fsm_ptr  = &fsm_table_obj.cast<fsm::FSMTable&>();
+                 if (!traj_obj.is_none())
+                     traj_ptr = &traj_obj.cast<fsm::RequestTrajectory&>();
+
+                 std::vector<std::vector<DocId>> out_ids;
+                 std::vector<std::vector<float>> out_scores;
+                 {
+                     py::gil_scoped_release _g;
+                     idx.search_fsm((const float*)buf.ptr,
+                                    (size_t)buf.shape[0],
+                                    k, nprobe,
+                                    fsm_ptr, traj_ptr,
+                                    out_ids, out_scores);
+                 }
+                 return py::make_tuple(out_ids, out_scores);
+             },
+             py::arg("queries"),
+             py::arg("k"),
+             py::arg("nprobe")    = -1,
+             py::arg("fsm_table") = py::none(),
+             py::arg("traj")      = py::none())
+        .def("nearest_l2_centroid",
+             [](const MultiLevelIndex& idx,
+                py::array_t<float, py::array::c_style> query) {
+                 auto buf = query.request();
+                 if (buf.ndim != 1 && !(buf.ndim == 2 && buf.shape[0] == 1))
+                     throw std::runtime_error("query must be 1D [D] or 2D [1,D]");
+                 const float* qptr = (const float*)buf.ptr;
+                 py::gil_scoped_release _g;
+                 return idx.nearest_l2_centroid(qptr);
+             },
+             py::arg("query"))
+#endif // M3_WITH_FSM
+        ; // end MultiLevelIndex
+
+#ifdef M3_WITH_FSM
+    // ----- fsm::RequestTrajectory -----
+    py::class_<fsm::RequestTrajectory>(m, "RequestTrajectory")
+        .def(py::init<std::string>(), py::arg("request_id"))
+        .def("append_step",
+             [](fsm::RequestTrajectory& t,
+                int cid,
+                py::array_t<float, py::array::c_style> vec) {
+                 auto buf = vec.request();
+                 if (buf.ndim != 1 && !(buf.ndim == 2 && buf.shape[0] == 1))
+                     throw std::runtime_error("vec must be 1D [D] or 2D [1,D]");
+                 t.append_step(cid, (const float*)buf.ptr, (int)buf.size);
+             },
+             py::arg("cid"),
+             py::arg("vec"))
+        .def("length",     &fsm::RequestTrajectory::length)
+        .def("clear",      &fsm::RequestTrajectory::clear)
+        .def_readonly("request_id", &fsm::RequestTrajectory::request_id);
+
+    // ----- fsm::FSMConfig -----
+    py::class_<fsm::FSMConfig>(m, "FSMConfig")
+        .def(py::init<>())
+        .def_readwrite("max_patterns",        &fsm::FSMConfig::max_patterns)
+        .def_readwrite("ns_max_states",       &fsm::FSMConfig::ns_max_states)
+        .def_readwrite("d_merge",             &fsm::FSMConfig::d_merge)
+        .def_readwrite("reinforce_threshold", &fsm::FSMConfig::reinforce_threshold)
+        .def_readwrite("min_hits_to_predict", &fsm::FSMConfig::min_hits_to_predict)
+        .def_readwrite("min_traj_len",        &fsm::FSMConfig::min_traj_len);
+
+    // ----- fsm::FSMTable -----
+    py::class_<fsm::FSMTable>(m, "FSMTable")
+        .def(py::init<fsm::FSMConfig>(), py::arg("config") = fsm::FSMConfig())
+        .def("match_and_predict",
+             [](const fsm::FSMTable& t, const fsm::RequestTrajectory& traj) {
+                 py::gil_scoped_release _g;
+                 return t.match_and_predict(traj);
+             },
+             py::arg("traj"))
+        .def("update_from_trajectory",
+             [](fsm::FSMTable& t,
+                const fsm::RequestTrajectory& traj,
+                py::array_t<float, py::array::c_style> centroids) {
+                 auto buf = centroids.request();
+                 if (buf.ndim != 2)
+                     throw std::runtime_error("centroids must be 2D [nlist, dim]");
+                 {
+                     py::gil_scoped_release _g;
+                     t.update_from_trajectory(traj,
+                                              (const float*)buf.ptr,
+                                              (int)buf.shape[0],
+                                              (int)buf.shape[1]);
+                 }
+             },
+             py::arg("traj"),
+             py::arg("centroids"))
+        .def("num_patterns", &fsm::FSMTable::num_patterns)
+        .def("total_hits",   &fsm::FSMTable::total_hits);
+#endif // M3_WITH_FSM
 
     // ----- GpuCoordinator -----
     py::class_<GpuCoordinator>(m, "GpuCoordinator")

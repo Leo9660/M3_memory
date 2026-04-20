@@ -31,6 +31,9 @@ message(STATUS "OpenBLAS: ${OPENBLAS_LIB}  cblas.h: ${CBLAS_INCLUDE_DIR}")
 find_package(OpenMP REQUIRED)
 message(STATUS "OpenMP: ${OpenMP_CXX_FLAGS}")
 
+# ---- FSM pattern-learning extension (ON by default; set -DM3_WITH_FSM=OFF to disable) ----
+option(M3_WITH_FSM "Enable FSM-based access-pattern learning" ON)
+
 set(M3_SRC
     AgentMemory/M3/src/bindings_async.cpp
     AgentMemory/M3/src/m3_async.cpp
@@ -63,6 +66,14 @@ set(M3_CORE_SRC
     ${M3_SPLIT_V4_SRC}
 )
 
+if(M3_WITH_FSM)
+    message(STATUS "M3: FSM pattern learning ENABLED (-DM3_WITH_FSM)")
+    list(APPEND M3_SRC      AgentMemory/M3/src/fsm_table.cpp)
+    list(APPEND M3_CORE_SRC AgentMemory/M3/src/fsm_table.cpp)
+else()
+    message(STATUS "M3: FSM pattern learning DISABLED")
+endif()
+
 set(M3_INCLUDE
     ${CMAKE_SOURCE_DIR}/AgentMemory/M3/include
 )
@@ -72,6 +83,9 @@ target_include_directories(_m3_async PRIVATE ${M3_INCLUDE} ${CBLAS_INCLUDE_DIR})
 target_compile_features(_m3_async PRIVATE cxx_std_17)
 target_compile_options(_m3_async PRIVATE -O3 -pthread -mavx2 -mfma -mavx512f -mavx512dq -mavx512bw -mavx512vl ${OpenMP_CXX_FLAGS})
 target_link_libraries(_m3_async PRIVATE CUDA::cudart CUDA::cublas ${OPENBLAS_LIB} OpenMP::OpenMP_CXX)
+if(M3_WITH_FSM)
+    target_compile_definitions(_m3_async PRIVATE M3_WITH_FSM)
+endif()
 
 install(TARGETS _m3_async
     LIBRARY DESTINATION AgentMemory/M3

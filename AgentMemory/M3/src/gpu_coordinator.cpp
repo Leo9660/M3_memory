@@ -225,48 +225,48 @@ size_t GpuCoordinator::hotspot_rebalance_() {
     const int  n_clusters = static_cast<int>(meta.size());
     if (n_clusters == 0) return 0;
 
-    // Find the minimum access_count among currently GPU-resident clusters.
-    // If the GPU is empty, any cluster qualifies for promotion.
-    const auto resident = budget_.all_resident_cids();
-    uint64_t min_gpu_freq = resident.empty()
-                          ? 0
-                          : std::numeric_limits<uint64_t>::max();
-    for (int cid : resident) {
-        if (cid >= 0 && cid < n_clusters)
-            min_gpu_freq = std::min(min_gpu_freq, meta[cid].access_count);
-    }
-
-    // Collect non-resident clusters hotter than the current minimum.
+    // Collect all non-resident clusters that have been accessed at least once,
+    // sorted hottest-first. We consider all of them as candidates regardless of
+    // whether they beat the current weakest GPU cluster — the two-pass logic
+    // below decides which actually get promoted.
     std::vector<std::pair<uint64_t, int>> candidates;  // (freq, cid)
     for (int cid = 0; cid < n_clusters; ++cid) {
-        if (!budget_.is_gpu_resident(cid) && meta[cid].access_count > min_gpu_freq)
+        if (!budget_.is_gpu_resident(cid) && meta[cid].access_count > 0)
             candidates.emplace_back(meta[cid].access_count, cid);
     }
     if (candidates.empty()) return 0;
 
-    // Process hottest-first: ensures we prefer the strongest candidates when
-    // the budget fills up and LFU eviction kicks in.
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
 
     const size_t n_candidates = candidates.size();
     size_t promoted = 0;
+
     for (auto& [freq, cid] : candidates) {
-        // Re-read current minimum GPU frequency before each promotion so we
-        // don't evict a cluster that has since become hotter than the candidate.
-        uint64_t cur_min = std::numeric_limits<uint64_t>::max();
-        for (int r : budget_.all_resident_cids())
-            cur_min = std::min(cur_min, idx_.get_access_count(r));
+        const bool budget_full = (budget_.total_bytes_used() >= budget_.budget_bytes());
 
-        // Skip if the candidate is no longer hotter than the worst GPU cluster.
-        if (!budget_.all_resident_cids().empty() && freq <= cur_min)
-            break;
+        if (!budget_full) {
+            // Pass 1: free space available — promote regardless of relative rank.
+            // Fills the GPU to capacity with the hottest non-resident clusters.
+            enqueue_promote(cid);
+            ++promoted;
+        } else {
+            // Pass 2: budget is full — only displace if this candidate is strictly
+            // hotter than the weakest currently GPU-resident cluster.
+            uint64_t cur_min = std::numeric_limits<uint64_t>::max();
+            for (int r : budget_.all_resident_cids())
+                cur_min = std::min(cur_min, idx_.get_access_count(r));
 
-        // Enqueue async: H2D transfer happens on the background thread, not here.
-        // promote_to_gpu() will log with auto_promoted=true when it executes.
-        enqueue_promote(cid);
-        ++promoted;
+            if (freq <= cur_min)
+                break;  // remaining candidates are cooler still; no more swaps needed
+
+            // Existing LFU eviction in GpuBudgetManager fires automatically
+            // when promote_to_gpu() registers the new cluster.
+            enqueue_promote(cid);
+            ++promoted;
+        }
     }
+
     M3Logger::instance().log_hotspot_rebalance(promoted, n_candidates);
     return promoted;
 }

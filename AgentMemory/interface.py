@@ -65,6 +65,9 @@ class MemoryManagement:
         elif backend.lower() == "m3multigpu":
             from .backend.m3 import M3MultiGpuBackend
             self.backend: MemoryBackend = M3MultiGpuBackend()
+        elif backend.lower() == "m3multigpufsm":
+            from .backend.m3 import M3MultiGpuFSMBackend
+            self.backend: MemoryBackend = M3MultiGpuFSMBackend(fsm_enabled=True)
         elif backend.lower() == "amem":
             from .backend.amem import AMemBackend
             self.backend: MemoryBackend = AMemBackend()

@@ -7,6 +7,7 @@ Modes:
 - step_search_then_update: search every item, then insert them once at the end.
 - head_search_tail_insert: first item search-only, remaining items insert only.
 - search_only: search every item, never insert.
+- load_only: insert every item, never search.
 - ratio (legacy): synthetic vectors with a search:insert ratio like "1:1".
 
 Supports:
@@ -17,6 +18,10 @@ Supports:
 """
 
 from __future__ import annotations
+
+import os
+os.environ.setdefault("OMP_NUM_THREADS",      "32")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
 
 import argparse
 import math
@@ -34,6 +39,7 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from AgentMemory.interface import MemoryManagement
+from AgentMemory.backend.milvus import MilvusBackend
 from AgentMemory.types import MemoryItem, Metric
 from dataset import (
     AgentGymDataset,
@@ -186,9 +192,9 @@ def to_items(prefix: str, texts: List[str]) -> List[MemoryItem]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Search/insert ratio perf benchmark.")
-    parser.add_argument("--backend", choices=["placeholder", "quake", "m3", "m3multi", "m3multigpu"], default="m3")
+    parser.add_argument("--backend", choices=["placeholder", "quake", "m3", "m3multi", "m3multigpu", "faiss", "milvus"], default="m3")
     parser.add_argument("--index", default="perf-ratio", help="Index handle passed to MemoryManagement.")
-    parser.add_argument("--mode", choices=["item_search_insert", "step_search_then_update", "head_search_tail_insert", "search_only", "ratio"], default="item_search_insert", help="Request scheduling pattern.")
+    parser.add_argument("--mode", choices=["item_search_insert", "step_search_then_update", "head_search_tail_insert", "search_only", "load_only", "ratio"], default="item_search_insert", help="Request scheduling pattern.")
     parser.add_argument("--dataset", choices=list(DATASET_LOADERS.keys()), default=None, help="Dataset name; when omitted, synthetic vectors are used (ratio mode).")
     parser.add_argument("--split", default=None, help="Dataset split override.")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of dataset items (<=0 means all).")
@@ -208,7 +214,9 @@ def main() -> None:
     parser.add_argument("--normalize", dest="normalize", action="store_true", help="L2-normalize vectors before sending to backend (default for synthetic).")
     parser.add_argument("--no-normalize", dest="normalize", action="store_false", help="Disable L2 normalization before sending to backend.")
     parser.add_argument("--encoder", choices=["transformer", "passthrough"], default="transformer", help="Encoder to use (transformer required for text datasets; passthrough only for synthetic).")
+    parser.add_argument("--uri", type=str, default=None, help="Milvus URI (e.g. http://localhost:19530). Used only when backend=milvus.")
     parser.add_argument("--log-file", type=str, default=None, help="Optional path to append a TSV log row (mode, dataset, backend, throughput).")
+    parser.add_argument("--max-runs", type=int, default=0, help="Stop after this many flushes/runs (0 = unlimited).")
     parser.set_defaults(normalize=True)
     args = parser.parse_args()
 
@@ -217,7 +225,10 @@ def main() -> None:
     if args.dataset and args.encoder == "passthrough":
         raise ValueError("Passthrough encoder only supports synthetic vectors. Use --encoder transformer for datasets.")
     if args.dataset and args.mode == "ratio":
-        raise ValueError("mode=ratio is only supported for synthetic runs (no dataset).")
+        raise ValueError("The ratio mode is only compatible with synthetic vectors. Use a different mode for datasets.")
+    backend_impl: Any = args.backend
+    if args.backend == "milvus" and args.uri:
+        backend_impl = MilvusBackend(uri=args.uri)
 
     if args.dataset:
         split = args.split  # None -> dataset default split
@@ -227,12 +238,12 @@ def main() -> None:
             raise RuntimeError("No dataset texts were loaded.")
         items = to_items(args.dataset, texts)
         encoder = None  # use default TransformerEncoder from MemoryManagement
-        mm = MemoryManagement(backend=args.backend, encoder=encoder, default_nprobe=args.nprobe)
+        mm = MemoryManagement(backend=backend_impl, encoder=encoder, default_nprobe=args.nprobe)
     else:
         search_ratio, insert_ratio = parse_ratio(args.ratio)
         rng = np.random.default_rng(args.seed)
         encoder = VectorPassthroughEncoder(dim=args.dim, normalize=args.normalize)
-        mm = MemoryManagement(backend=args.backend, encoder=encoder, default_nprobe=args.nprobe)
+        mm = MemoryManagement(backend=backend_impl, encoder=encoder, default_nprobe=args.nprobe)
         insert_mat = build_vectors(args.insert_count, args.dim, rng)
         expected_search = int(math.ceil(args.insert_count * (search_ratio / insert_ratio)))
         search_mat = build_vectors(expected_search, args.dim, rng)
@@ -275,14 +286,17 @@ def main() -> None:
 
     queued_ops = 0
     run_idx = 1
+    _stop = False
     stats: Dict[str, float] = {"runs": 0, "time": 0.0, "inserted": 0.0, "searched": 0.0}
 
     def maybe_flush() -> None:
-        nonlocal queued_ops, run_idx
+        nonlocal queued_ops, run_idx, _stop
         if args.ops_per_run > 0 and queued_ops >= args.ops_per_run:
             flush_queue(mm, stats, run_idx)
             run_idx += 1
             queued_ops = 0
+            if args.max_runs > 0 and stats["runs"] >= args.max_runs:
+                _stop = True
 
     print(f"[config] backend={args.backend}, mode={args.mode}, dataset={args.dataset or 'synthetic'}")
 
@@ -295,7 +309,7 @@ def main() -> None:
         insert_idx = 0
         search_idx = 0
 
-        while insert_idx < len(insert_batches) or search_idx < len(search_batches):
+        while (insert_idx < len(insert_batches) or search_idx < len(search_batches)) and not _stop:
             target_search = dispatched_insert * (search_ratio / insert_ratio)
             do_search = (
                 search_idx < len(search_batches)
@@ -324,11 +338,13 @@ def main() -> None:
 
         if args.mode == "item_search_insert":
             for sb in search_batches:
+                if _stop:
+                    break
                 mm.add_search(index_id, sb, args.top_k, nprobe=args.nprobe, request_id=f"search-{run_idx}-{queued_ops}")
                 queued_ops += 1
                 maybe_flush()
                 # align insert batch to same size if available
-                if insert_batches:
+                if insert_batches and not _stop:
                     ib = insert_batches.pop(0)
                     mm.add_insert(index_id, ib)
                     queued_ops += 1
@@ -336,40 +352,50 @@ def main() -> None:
 
             # insert any remaining batches
             for ib in insert_batches:
+                if _stop:
+                    break
                 mm.add_insert(index_id, ib)
                 queued_ops += 1
                 maybe_flush()
 
         elif args.mode == "step_search_then_update":
             for sb in search_batches:
+                if _stop:
+                    break
                 mm.add_search(index_id, sb, args.top_k, nprobe=args.nprobe, request_id=f"search-{run_idx}-{queued_ops}")
                 queued_ops += 1
                 maybe_flush()
             for ib in insert_batches:
+                if _stop:
+                    break
                 mm.add_insert(index_id, ib)
                 queued_ops += 1
                 maybe_flush()
 
         elif args.mode == "head_search_tail_insert":
-            if search_batches:
+            if search_batches and not _stop:
                 first = search_batches[0]
                 mm.add_search(index_id, first, args.top_k, nprobe=args.nprobe, request_id="search-head")
                 queued_ops += 1
                 maybe_flush()
             for ib in insert_batches:
+                if _stop:
+                    break
                 mm.add_insert(index_id, ib)
                 queued_ops += 1
                 maybe_flush()
 
         elif args.mode == "search_only":
             for sb in search_batches:
+                if _stop:
+                    break
                 mm.add_search(index_id, sb, args.top_k, nprobe=args.nprobe, request_id=f"search-{run_idx}-{queued_ops}")
                 queued_ops += 1
                 maybe_flush()
         else:
             raise ValueError(f"Unsupported mode: {args.mode}")
 
-    if mm.queue:
+    if mm.queue and not _stop:
         flush_queue(mm, stats, run_idx)
 
     total_ops = stats["inserted"] + stats["searched"]
@@ -393,8 +419,8 @@ def main() -> None:
         with log_path.open("a", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             if needs_header:
-                writer.writerow(["mode", "dataset", "backend", "throughput_ops_per_s"])
-            writer.writerow([args.mode, args.dataset or "synthetic", args.backend, f"{overall_tp:.3f}"])
+                writer.writerow(["mode", "dataset", "backend", "nprobe", "throughput_ops_per_s"])
+            writer.writerow([args.mode, args.dataset or "synthetic", args.backend, args.nprobe, f"{overall_tp:.3f}"])
 
 
 if __name__ == "__main__":

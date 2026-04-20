@@ -1932,4 +1932,71 @@ void MultiLevelIndex::run_cluster_count_demotion_() const {
     // L0/L1 cluster-count demotion is handled via l1_cluster_access_time_ in run_maintenance_.
 }
 
+// ============================================================
+// FSM-aware search — compiled only when M3_WITH_FSM is defined.
+// The regular search() method is completely untouched.
+// ============================================================
+#ifdef M3_WITH_FSM
+
+int MultiLevelIndex::nearest_l2_centroid(const float* query) const {
+    std::shared_lock<std::shared_mutex> lk(topo_mu_);
+    const auto& cents = l2_.centroids;
+    if (cents.empty()) return 0;
+    const int dim     = dim_;
+    const int nlist   = static_cast<int>(cents.size()) / dim;
+    float best_sq = std::numeric_limits<float>::infinity();
+    int   best_i  = 0;
+    for (int i = 0; i < nlist; ++i) {
+        const float* c = cents.data() + static_cast<size_t>(i) * dim;
+        float sq = 0.0f;
+        for (int d = 0; d < dim; ++d) {
+            float e = query[d] - c[d];
+            sq += e * e;
+        }
+        if (sq < best_sq) { best_sq = sq; best_i = i; }
+    }
+    return best_i;
+}
+
+void MultiLevelIndex::search_fsm(const float* queries, size_t q_rows,
+                                  int k, int nprobe,
+                                  const fsm::FSMTable*    fsm_table,
+                                  fsm::RequestTrajectory* traj,
+                                  std::vector<std::vector<DocId>>& out_ids,
+                                  std::vector<std::vector<float>>& out_scores) const {
+    out_ids.resize(q_rows);
+    out_scores.resize(q_rows);
+
+    const size_t dim_sz = static_cast<size_t>(dim_);
+
+    for (size_t qi = 0; qi < q_rows; ++qi) {
+        const float* qptr = queries + qi * dim_sz;
+
+        // 1. Predict next clusters from FSM and enqueue GPU prefetch.
+        if (fsm_table && traj && traj->length() > 0) {
+            auto predicted = fsm_table->match_and_predict(*traj);
+            if (gpu_coord_ && !predicted.empty()) {
+                for (int cid : predicted)
+                    gpu_coord_->enqueue_promote(cid);
+            }
+        }
+
+        // 2. Standard L0→L1→L2 search (probe ordering unchanged, results identical).
+        std::vector<std::vector<DocId>> ids(1);
+        std::vector<std::vector<float>> scores(1);
+        search(qptr, 1, k, nprobe, ids, scores);
+
+        out_ids[qi]    = std::move(ids[0]);
+        out_scores[qi] = std::move(scores[0]);
+
+        // 3. Record winning cluster in trajectory.
+        if (traj) {
+            int win_cid = nearest_l2_centroid(qptr);
+            traj->append_step(win_cid, qptr, dim_);
+        }
+    }
+}
+
+#endif // M3_WITH_FSM
+
 } // namespace m3

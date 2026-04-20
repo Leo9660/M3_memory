@@ -262,18 +262,12 @@ M3Profiler::M3Profiler() {
     if (!dir) dir = "profile";
     const char* prefix = std::getenv("M3_PROFILE_PREFIX");
     if (!prefix || prefix[0] == '\0') prefix = "m3";
-    time_t now = time(nullptr);
-    struct tm tm_buf;
-    localtime_r(&now, &tm_buf);
     char base[256];
-    snprintf(base, sizeof(base), "%s/%s_%04d%02d%02d_%02d%02d%02d",
-             dir, prefix,
-             tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
-             tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+    snprintf(base, sizeof(base), "%s/%s", dir, prefix);
 
-    // ---- search_profile.csv ----
+    // ---- search_phases.csv ----
     char path[288];
-    snprintf(path, sizeof(path), "%s_search_profile.csv", base);
+    snprintf(path, sizeof(path), "%s_search_phases.csv", base);
     fp_search_profile_ = fopen(path, "w");
     if (!fp_search_profile_) {
         fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
@@ -290,8 +284,8 @@ M3Profiler::M3Profiler() {
         "l2_n_queries,l2_gpu_clusters,l2_cpu_clusters\n");
     fflush(fp_search_profile_);
 
-    // ---- search_stats.csv ----
-    snprintf(path, sizeof(path), "%s_search_stats.csv", base);
+    // ---- cache_stats.csv ----
+    snprintf(path, sizeof(path), "%s_cache_stats.csv", base);
     fp_search_stats_ = fopen(path, "w");
     if (!fp_search_stats_) {
         fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
@@ -308,8 +302,8 @@ M3Profiler::M3Profiler() {
         "dagent,alpha_et,true_kth_avg\n");
     fflush(fp_search_stats_);
 
-    // ---- insert.csv ----
-    snprintf(path, sizeof(path), "%s_insert.csv", base);
+    // ---- insert_phases.csv ----
+    snprintf(path, sizeof(path), "%s_insert_phases.csv", base);
     fp_insert_ = fopen(path, "w");
     if (!fp_insert_) {
         fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
@@ -323,8 +317,8 @@ M3Profiler::M3Profiler() {
         "l0l2_write_ms,gpu_dispatch_ms\n");
     fflush(fp_insert_);
 
-    // ---- recall_diag.csv ----
-    snprintf(path, sizeof(path), "%s_recall_diag.csv", base);
+    // ---- visibility_events.csv ----
+    snprintf(path, sizeof(path), "%s_visibility_events.csv", base);
     fp_recall_diag_ = fopen(path, "w");
     if (!fp_recall_diag_) {
         fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);

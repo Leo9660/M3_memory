@@ -121,9 +121,9 @@ class FaissBackend(MemoryBackend):
         self._payloads: Dict[int, Dict[str, Any]] = {}
         self._next_int_id: Dict[int, int] = {}
 
-        # Profiler — defaults to ./profile, override with FAISS_PROFILE_DIR env var
-        _profile_dir = os.environ.get("FAISS_PROFILE_DIR", "profile").strip()
-        self._profiler = _FaissProfiler(_profile_dir)
+        # Profiler — opt-in via FAISS_PROFILE_DIR env var (disabled by default)
+        _profile_dir = os.environ.get("FAISS_PROFILE_DIR", "").strip()
+        self._profiler = _FaissProfiler(_profile_dir) if _profile_dir else None
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                           #

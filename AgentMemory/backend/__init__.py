@@ -5,7 +5,7 @@ from .base import MemoryBackend
 # from .m3 import M3Backend
 # from .amem import AMemBackend
 
-__all__ = ["PlaceholderBackend", "MemoryBackend", "QuakeBackend", "M3Backend", "AMemBackend", "FaissBackend", "MilvusBackend"]
+__all__ = ["PlaceholderBackend", "MemoryBackend", "QuakeBackend", "M3Backend", "AMemBackend", "FaissBackend", "MilvusBackend", "M3MultiGpuFSMBackend"]
 
 def __getattr__(name: str):
     """Lazy import backends to avoid circular imports."""
@@ -27,4 +27,7 @@ def __getattr__(name: str):
     elif name == "MilvusBackend":
         from .milvus import MilvusBackend
         return MilvusBackend
+    elif name == "M3MultiGpuFSMBackend":
+        from .m3 import M3MultiGpuFSMBackend
+        return M3MultiGpuFSMBackend
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

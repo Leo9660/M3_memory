@@ -12,6 +12,11 @@
 #include "base.h"      // Metric, DocId, topk_smallest
 #include "m3_index.h"  // IVFIndex
 
+// FSM-aware search extension — compiled only when -DM3_WITH_FSM is set.
+#ifdef M3_WITH_FSM
+#include "fsm_table.h"
+#endif
+
 namespace m3 {
 
 // Forward declaration to avoid circular include (gpu_coordinator.h includes this file).
@@ -243,6 +248,29 @@ public:
                             const float* query, int k,
                             std::vector<DocId>&  out_ids,
                             std::vector<float>&  out_scores) const;
+
+#ifdef M3_WITH_FSM
+    // ---- FSM-aware batch search ----
+    //
+    // For each query in [queries, queries + q_rows*dim]:
+    //   1. Calls fsm_table->match_and_predict(*traj) and enqueues GPU promote
+    //      for predicted clusters (non-blocking, best-effort prefetch).
+    //   2. Runs the standard 3-level search (identical results to search()).
+    //   3. Computes the nearest L2 centroid to the query and appends the step
+    //      to *traj.
+    //
+    // fsm_table and traj may be nullptr (search still runs; step not recorded).
+    // Thread-safe.  out_ids / out_scores are resized to q_rows on return.
+    void search_fsm(const float* queries, size_t q_rows, int k, int nprobe,
+                    const fsm::FSMTable*    fsm_table,
+                    fsm::RequestTrajectory* traj,
+                    std::vector<std::vector<DocId>>& out_ids,
+                    std::vector<std::vector<float>>& out_scores) const;
+
+    // Return the index of the nearest L2 centroid to `query` (squared-L2).
+    // Thread-safe.
+    int nearest_l2_centroid(const float* query) const;
+#endif // M3_WITH_FSM
 
     // ---- maintenance ----
     void maintenance_pass(); // per-layer maintenance hooks

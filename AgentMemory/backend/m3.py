@@ -1,6 +1,6 @@
 # AgentMemory/backend/m3.py
 from __future__ import annotations
-from typing import Any, Dict, List, Set, Optional
+from typing import Any, Dict, List, Optional
 import hashlib
 import numpy as np
 
@@ -622,11 +622,11 @@ class M3MultiGpuBackend(MemoryBackend):
         "max_promote_per_query":       20,
         "l0_nprobe":                   32,
         "l1_nprobe":                   32,
-        "alpha_et":                    0.6, #reducing alpha et improves recall
+        "alpha_et":                    0.7, #reducing alpha et improves recall
         "dagent_window":               20,
-        "dagent_mode":                 "cache_level_k",  # "cache_level_k" or "true_k"
+        "dagent_mode":                 "true_k",  # "cache_level_k" or "true_k"
         "calibration_interval":        10,
-        "alpha_et_adapt_rate":         0.05,
+        "alpha_et_adapt_rate":         0.2,
     }
 
     def __init__(self) -> None:
@@ -864,3 +864,230 @@ class M3MultiGpuBackend(MemoryBackend):
     @staticmethod
     def _keys_to_int64(keys, err: str):
         return M3MultiLevelBackend._keys_to_int64(keys, err)
+
+
+# ---------------------------------------------------------------------------
+# M3MultiGpuFSMBackend
+# ---------------------------------------------------------------------------
+
+class M3MultiGpuFSMBackend(M3MultiGpuBackend):
+    """
+    Drop-in extension of M3MultiGpuBackend with FSM-based trajectory learning.
+    M3MultiGpuBackend is completely untouched.
+
+    Requires _m3_async to be compiled with -DM3_WITH_FSM (cmake option M3_WITH_FSM=ON).
+    Raises RuntimeError at construction if the C++ FSM types are not available.
+
+    When fsm_enabled=True (default):
+      - Each request (keyed by BackendRequest.request_id) accumulates a C++
+        RequestTrajectory across search steps.
+      - Before each SEARCH, fsm_table.match_and_predict(traj) returns predicted
+        next-cluster IDs used for non-blocking GPU prefetch via enqueue_promote().
+      - idx.search_fsm() runs the search and records the winning cluster into
+        the trajectory in one C++ call.
+      - Call commit_request(request_id) after the last step of a request to
+        update the FSM table (reinforce or create new pattern, then prune).
+
+    When fsm_enabled=False:
+      - execute() delegates directly to super().execute() — zero overhead.
+
+    FSM-specific spec.params keys (all optional):
+      fsm_max_patterns        (int,   500)
+      fsm_ns_max_states       (int,   8)
+      fsm_d_merge             (float, 0.3)
+      fsm_reinforce_threshold (float, 0.5)
+      fsm_min_hits_to_predict (int,   2)
+      fsm_min_traj_len        (int,   2)
+    """
+
+    _FSM_DEFAULTS: Dict[str, Any] = {
+        "fsm_max_patterns":        500,
+        "fsm_ns_max_states":       8,
+        "fsm_d_merge":             0.3,
+        "fsm_reinforce_threshold": 0.5,
+        "fsm_min_hits_to_predict": 2,
+        "fsm_min_traj_len":        2,
+    }
+
+    def __init__(self, fsm_enabled: bool = True) -> None:
+        super().__init__()
+        self.fsm_enabled: bool = fsm_enabled
+
+        if fsm_enabled:
+            if not hasattr(m3, "FSMTable") or not hasattr(m3, "FSMConfig") or not hasattr(m3, "RequestTrajectory"):
+                raise RuntimeError(
+                    "M3MultiGpuFSMBackend requires _m3_async built with M3_WITH_FSM=ON. "
+                    "Rebuild with: cmake -DM3_WITH_FSM=ON ..."
+                )
+
+        self._fsm_tables: Dict[int, Any] = {}          # index_id → m3.FSMTable
+        self._fsm_params: Dict[int, Dict[str, Any]] = {}
+        self._centroids:  Dict[int, np.ndarray] = {}   # L2 centroids per index
+
+        self._active_trajs: Dict[str, Any] = {}        # rid → m3.RequestTrajectory
+        self._traj_index:   Dict[str, int]  = {}        # rid → index_id
+
+    # ------------------------------------------------------------------
+    def create_index(self, index_id: int, spec: "CollectionSpec") -> None:
+        super().create_index(index_id, spec)
+        if not self.fsm_enabled:
+            return
+        raw = getattr(spec, "params", {}) or {}
+        p: Dict[str, Any] = {**self._FSM_DEFAULTS, **raw}
+        self._fsm_params[index_id] = p
+        self._fsm_tables[index_id] = self._make_fsm_table(p)
+        centroids = raw.get("centroids")
+        if centroids is not None:
+            self._centroids[index_id] = np.ascontiguousarray(centroids, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    def rebuild_index_from_faiss(self, index_id: int, *, path: str, normalized: Optional[bool] = None) -> None:
+        super().rebuild_index_from_faiss(index_id, path=path, normalized=normalized)
+        if not self.fsm_enabled:
+            return
+        try:
+            import faiss
+        except ImportError:
+            return
+        from pathlib import Path as _Path
+        fi  = faiss.read_index(str(_Path(path)))
+        ivf = faiss.extract_index_ivf(fi)
+        if ivf is None:
+            return
+        ivf = faiss.downcast_index(ivf)
+        q   = faiss.downcast_index(ivf.quantizer)
+        if hasattr(q, "xb") and q.ntotal == ivf.nlist:
+            centroids = faiss.vector_to_array(q.xb).astype(np.float32).reshape(ivf.nlist, ivf.d)
+        else:
+            centroids = np.vstack([q.reconstruct(i) for i in range(ivf.nlist)]).astype(np.float32)
+        self._centroids[index_id] = np.ascontiguousarray(centroids)
+        if index_id not in self._fsm_tables:
+            p = self._fsm_params.get(index_id, self._FSM_DEFAULTS)
+            self._fsm_tables[index_id] = self._make_fsm_table(p)
+
+    # ------------------------------------------------------------------
+    def commit_request(self, request_id: str) -> None:
+        """
+        Finalise and learn from a completed request's trajectory.
+        Call after the last search step for request_id.
+        Safe to call even if request_id was never searched (no-op).
+        """
+        traj   = self._active_trajs.pop(request_id, None)
+        idx_id = self._traj_index.pop(request_id, None)
+        if traj is None or idx_id is None:
+            return
+        fsm = self._fsm_tables.get(idx_id)
+        if fsm is None:
+            return
+        min_len = self._fsm_params.get(idx_id, self._FSM_DEFAULTS).get("fsm_min_traj_len", 2)
+        if traj.length() < min_len:
+            return
+        centroids = self._centroids.get(idx_id)
+        if centroids is not None:
+            fsm.update_from_trajectory(traj, centroids)
+
+    # ------------------------------------------------------------------
+    def fsm_stats(self, index_id: int) -> Dict[str, Any]:
+        fsm = self._fsm_tables.get(index_id)
+        if fsm is None:
+            return {}
+        p = self._fsm_params.get(index_id, self._FSM_DEFAULTS)
+        return {
+            "num_patterns":  fsm.num_patterns(),
+            "total_hits":    fsm.total_hits(),
+            "max_patterns":  p.get("fsm_max_patterns", 500),
+            "ns_max_states": p.get("fsm_ns_max_states", 8),
+            "d_merge":       p.get("fsm_d_merge", 0.3),
+        }
+
+    # ------------------------------------------------------------------
+    def execute(self, ops: List[BackendRequest]) -> RunResult:
+        if not self.fsm_enabled:
+            return super().execute(ops)
+
+        insert_cnt = update_cnt = delete_cnt = 0
+        search_payload: Dict[str, List[List[SearchHit]]] = {}
+
+        for op in ops:
+            if op.op != BackendOpType.SEARCH:
+                sub = super().execute([op])
+                insert_cnt += sub.upserted
+                update_cnt += sub.updated
+                delete_cnt += sub.deleted
+                continue
+
+            # ---- SEARCH with FSM ----
+            idx_id = int(op.index_id)
+            if idx_id not in self._indices:
+                raise KeyError(f"M3MultiGpuFSMBackend: index_id {idx_id} not found.")
+
+            queries = _as_f32_2d(op.vectors, "SEARCH requires 2D 'vectors'")
+            k       = int(op.k or 1)
+            nprobe  = int(op.nprobe or 32)
+            rid     = op.request_id or f"req-{len(search_payload)}"
+
+            # Get or create trajectory for this request.
+            if rid not in self._active_trajs:
+                self._active_trajs[rid] = m3.RequestTrajectory(rid)
+                self._traj_index[rid]   = idx_id
+            traj = self._active_trajs[rid]
+
+            fsm   = self._fsm_tables.get(idx_id)
+            coord = self._coordinators.get(idx_id)
+            idx   = self._indices[idx_id]
+
+            # FSM prediction before search → predictive GPU prefetch.
+            predicted_cids: List[int] = []
+            if fsm is not None and traj.length() > 0:
+                predicted_cids = fsm.match_and_predict(traj)
+            if coord is not None and predicted_cids:
+                for cid in predicted_cids[:8]:
+                    try:
+                        coord.enqueue_promote(cid)
+                    except Exception:
+                        pass
+
+            # C++ search_fsm: runs search and appends winning cluster to traj.
+            out_ids, out_scores = idx.search_fsm(queries, k, nprobe, fsm, traj)
+
+            # Build SearchHit results.
+            hits_per_query: List[List[SearchHit]] = []
+            for ids_list, scores_list in zip(out_ids, out_scores):
+                hits: List[SearchHit] = []
+                for doc_id, score in zip(ids_list, scores_list):
+                    int_id = int(doc_id)
+                    if int_id < 0:
+                        break
+                    ext_id    = self._int2ext.get(idx_id, {}).get(int_id, str(int_id))
+                    base_meta = self._meta.get(idx_id, {}).get(int_id) or {}
+                    meta      = dict(base_meta) if base_meta else {}
+                    if idx_id in self._data and int_id in self._data[idx_id]:
+                        meta["_data"] = self._data[idx_id][int_id]
+                    if predicted_cids:
+                        meta["_fsm_predicted_cids"] = predicted_cids
+                    hits.append(SearchHit(
+                        id=str(ext_id) if ext_id is not None else str(int_id),
+                        score=float(score),
+                        metadata=meta if meta else None,
+                    ))
+                hits_per_query.append(hits)
+            search_payload[rid] = hits_per_query
+
+        return RunResult(
+            upserted=insert_cnt,
+            updated=update_cnt,
+            deleted=delete_cnt,
+            searches=search_payload,
+        )
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _make_fsm_table(p: Dict[str, Any]):
+        cfg = m3.FSMConfig()
+        cfg.max_patterns        = int(p["fsm_max_patterns"])
+        cfg.ns_max_states       = int(p["fsm_ns_max_states"])
+        cfg.d_merge             = float(p["fsm_d_merge"])
+        cfg.reinforce_threshold = float(p["fsm_reinforce_threshold"])
+        cfg.min_hits_to_predict = int(p["fsm_min_hits_to_predict"])
+        cfg.min_traj_len        = int(p["fsm_min_traj_len"])
+        return m3.FSMTable(cfg)
