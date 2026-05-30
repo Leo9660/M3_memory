@@ -223,6 +223,15 @@ public:
                         double gpu_dispatch_ms,
                         double total_ms);
 
+    // ---- Cluster metrics event log (CSV) ----
+    // One row per (batch × unique L2 cluster) for each cluster touched by
+    // search results or targeted by inserts.  Enables time-series analysis
+    // of per-cluster access/insert distribution to identify cold clusters.
+    //   event : "SEARCH" or "INSERT"
+    //   cid   : L2 cluster ID
+    //   count : vectors hitting this cluster in this batch
+    void log_cluster_metrics(const char* event, int cid, size_t count);
+
     // ---- Recall diagnostics (CSV) ----
     // Written to recall_diag.csv. Three event types track the three known
     // causes of recall degradation:
@@ -260,6 +269,7 @@ private:
     void write_search_stats_(const char* line);
     void write_insert_(const char* line);
     void write_recall_diag_(const char* line);
+    void write_cluster_metrics_(const char* line);
     static void timestamp_(char* buf, size_t buf_sz);
 
     mutable std::mutex mu_;
@@ -267,6 +277,7 @@ private:
     FILE*              fp_search_stats_   = nullptr;
     FILE*              fp_insert_         = nullptr;
     FILE*              fp_recall_diag_    = nullptr;
+    FILE*              fp_cluster_metrics_ = nullptr;
     bool               enabled_           = false;
 
     // Accumulators for end-of-run summary lines.

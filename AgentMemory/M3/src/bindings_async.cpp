@@ -839,6 +839,123 @@ PYBIND11_MODULE(_m3_async, m) {
              },
              py::arg("index_id"), py::arg("queries"), py::arg("k"), py::arg("nprobe"))
 
+        // ---- search_on_batch(index_id, queries, k, cluster_ids) ----
+        // Vector scan only — skip M3 centroid scoring entirely.
+        // cluster_ids: int32 [Q, nprobe] of original cluster IDs (e.g. from faiss quantizer.search).
+        // Returns (ids [Q,k] int64, scores [Q,k] float32).
+        .def("search_on_batch",
+             [](AsyncEngine& e,
+                int index_id,
+                py::array_t<float,   py::array::c_style> queries,
+                int k,
+                py::array_t<int32_t, py::array::c_style> cluster_ids) {
+                 auto qbuf = queries.request();
+                 auto cbuf = cluster_ids.request();
+                 if (qbuf.ndim != 2)
+                     throw std::runtime_error("search_on_batch: queries must be 2D [Q, D]");
+                 if (cbuf.ndim != 2)
+                     throw std::runtime_error("search_on_batch: cluster_ids must be 2D [Q, nprobe]");
+                 const size_t q_rows = (size_t)qbuf.shape[0];
+                 const int    nprobe = (int)cbuf.shape[1];
+                 if ((size_t)cbuf.shape[0] != q_rows)
+                     throw std::runtime_error("search_on_batch: cluster_ids row count != queries row count");
+
+                 std::vector<std::vector<DocId>> out_ids;
+                 std::vector<std::vector<float>> out_scores;
+                 {
+                     py::gil_scoped_release _g;
+                     e.search_on_batch(index_id,
+                                       (const float*)qbuf.ptr, q_rows, k,
+                                       (const int*)cbuf.ptr,   nprobe,
+                                       out_ids, out_scores);
+                 }
+                 const py::ssize_t Q = (py::ssize_t)out_ids.size();
+                 auto ids_arr    = py::array_t<int64_t>({Q, (py::ssize_t)k});
+                 auto scores_arr = py::array_t<float>  ({Q, (py::ssize_t)k});
+                 auto ids_p    = ids_arr.mutable_unchecked<2>();
+                 auto scores_p = scores_arr.mutable_unchecked<2>();
+                 for (py::ssize_t qi = 0; qi < Q; ++qi) {
+                     const auto& ri = out_ids[(size_t)qi];
+                     const auto& rs = out_scores[(size_t)qi];
+                     for (int j = 0; j < k; ++j) {
+                         ids_p(qi,j)    = j < (int)ri.size() ? ri[j]   : -1;
+                         scores_p(qi,j) = j < (int)rs.size() ? rs[j]
+                                          : std::numeric_limits<float>::infinity();
+                     }
+                 }
+                 return py::make_tuple(ids_arr, scores_arr);
+             },
+             py::arg("index_id"), py::arg("queries"), py::arg("k"), py::arg("cluster_ids"))
+
+        // ---- score_centroids(index_id, q) -> (scores [Q, NL], orig_ids [NL]) ----
+        // Returns raw centroid distances before any top-nprobe selection.
+        // scores[qi, ci] = M3's distance from query qi to compact centroid ci.
+        // orig_ids[ci]   = the original FAISS cluster ID for compact centroid ci.
+        // Reindex in Python: m3_by_orig[qi, orig_ids[ci]] = scores[qi, ci]
+        .def("score_centroids",
+             [](AsyncEngine& e,
+                int index_id,
+                py::array_t<float, py::array::c_style> queries) {
+                 auto buf = queries.request();
+                 if (buf.ndim != 2)
+                     throw std::runtime_error("score_centroids: queries must be 2D [Q, D]");
+                 const size_t q_rows = (size_t)buf.shape[0];
+
+                 std::vector<float> out_scores;
+                 std::vector<int>   out_orig_ids;
+                 {
+                     py::gil_scoped_release _g;
+                     e.score_centroids(index_id, (const float*)buf.ptr,
+                                       q_rows, out_scores, out_orig_ids);
+                 }
+
+                 const py::ssize_t NL = (py::ssize_t)out_orig_ids.size();
+
+                 auto scores_arr = py::array_t<float>(
+                     {(py::ssize_t)q_rows, NL},
+                     out_scores.data());
+                 auto ids_arr = py::array_t<int32_t>(
+                     {NL},
+                     out_orig_ids.data());
+
+                 return py::make_tuple(scores_arr, ids_arr);
+             },
+             py::arg("index_id"), py::arg("queries"))
+
+        // ---- select_clusters(index_id, q, nprobe) -> int32 array [Q, nprobe] ----
+        // Returns the exact cluster IDs M3's C++ centroid scoring picks — no vector scan.
+        // Compare against faiss_index.quantizer.search(q, nprobe)[1] to see whether
+        // the recall gap comes from cluster selection or from within-cluster vector scan.
+        .def("select_clusters",
+             [](AsyncEngine& e,
+                int index_id,
+                py::array_t<float, py::array::c_style> queries,
+                int nprobe) {
+                 auto buf = queries.request();
+                 if (buf.ndim != 2)
+                     throw std::runtime_error("select_clusters: queries must be 2D [Q, D]");
+                 const size_t q_rows = (size_t)buf.shape[0];
+
+                 std::vector<std::vector<int>> out;
+                 {
+                     py::gil_scoped_release _g;
+                     e.select_clusters(index_id, (const float*)buf.ptr,
+                                       q_rows, nprobe, out);
+                 }
+
+                 // Pack into [Q, nprobe] int32 array; -1 for any unfilled slot.
+                 auto result = py::array_t<int32_t>({(py::ssize_t)q_rows,
+                                                     (py::ssize_t)nprobe});
+                 auto r = result.mutable_unchecked<2>();
+                 for (py::ssize_t qi = 0; qi < (py::ssize_t)q_rows; ++qi) {
+                     for (int j = 0; j < nprobe; ++j)
+                         r(qi, j) = (j < (int)out[(size_t)qi].size())
+                                    ? out[(size_t)qi][j] : -1;
+                 }
+                 return result;
+             },
+             py::arg("index_id"), py::arg("queries"), py::arg("nprobe"))
+
         // ---- search_profiled(index_id, q, k, nprobe) -> (ids, scores, profile_dict) ----
         // profile_dict keys (all in milliseconds, cumulative across OMP threads):
         //   snapshot_ms, c_norms_ms, sgemm_ms, select_ms, lock_ms, scan_ms, output_ms

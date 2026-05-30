@@ -292,14 +292,23 @@ void Cluster::search_into(const float* query, float q_norm_sq, int k,
         }
     };
 
-    // For L2 with precomputed q_norm and cached v_norms:
-    //   ||q-v||² = q_norm + norms_[row] - 2·dot(q,v)
-    // The inner loop becomes one ip_score (FMA only, no subtract) + 2 scalar ops,
-    // vs l2_dist (subtract+FMA per element) — roughly 2x faster for the distance.
-    // q_norm is computed once per query across all nprobe clusters (not per-cluster).
-    const bool use_decomposed = (metric_ == Metric::L2)
-                                && (q_norm_sq >= 0.0f)
-                                && (norms_.size() == N);
+    // Switched to direct l2_dist (via score_()) to match FAISS's fvec_L2sqr
+    // subtraction form and improve recall vs FAISS ground truth.
+    // To restore the faster decomposed form, uncomment the block below and
+    // replace `score_(query, v)` with the if/else:
+    //
+    // const bool use_decomposed = (metric_ == Metric::L2)
+    //                             && (q_norm_sq >= 0.0f)
+    //                             && (norms_.size() == N);
+    //   if (use_decomposed)
+    //       s = q_norm_sq + norms_[row] - 2.0f * ip_score(query, v, dim_);
+    //   else
+    //       s = score_(query, v);
+    static bool logged_build = false;
+    if (!logged_build) {
+        logged_build = true;
+        fprintf(stderr, "[m3 build] cluster scan: direct l2_dist path (FAISS-compatible)\n");
+    }
     const size_t D = static_cast<size_t>(dim_);
 
     float worst_score = top_scores[0];  // O(1): always at heap root
@@ -308,12 +317,7 @@ void Cluster::search_into(const float* query, float q_norm_sq, int k,
         if (!skip_alive_check && !alive_[row]) continue;
         const float* v = mat_.data() + row * D;
 
-        float s;
-        if (use_decomposed) {
-            s = q_norm_sq + norms_[row] - 2.0f * ip_score(query, v, dim_);
-        } else {
-            s = score_(query, v);
-        }
+        const float s = score_(query, v);
 
         if (s < worst_score) {
             top_scores[0] = s;
@@ -360,21 +364,14 @@ void Cluster::search_into_timed(const float* query, float q_norm_sq, int k,
         }
     };
 
-    const bool use_decomposed = (metric_ == Metric::L2)
-                                && (q_norm_sq >= 0.0f)
-                                && (norms_.size() == N);
+    // See search_into() for decomposed-form restore instructions.
     const size_t D = static_cast<size_t>(dim_);
     float worst_score = top_scores[0];
 
     for (size_t row = 0; row < N; ++row) {
         if (!skip_alive_check && !alive_[row]) continue;
         const float* v = mat_.data() + row * D;
-        float s;
-        if (use_decomposed) {
-            s = q_norm_sq + norms_[row] - 2.0f * ip_score(query, v, dim_);
-        } else {
-            s = score_(query, v);
-        }
+        const float s = score_(query, v);
         if (s < worst_score) {
             top_scores[0] = s;
             top_ids[0]    = ids_[row];

@@ -13,6 +13,7 @@
 #include <mutex>
 #include <cblas.h>
 #include <omp.h>
+#include <immintrin.h>
 
 // OpenBLAS-specific thread control (linked as libopenblas).
 // On large machines OpenBLAS defaults to using all available cores; for small
@@ -27,6 +28,52 @@ namespace {
 using idx_clock = std::chrono::steady_clock;
 inline double idx_fms(idx_clock::duration d) {
     return std::chrono::duration<double, std::milli>(d).count();
+}
+
+// Matches FAISS fvec_norm_L2sqr<SL> exactly:
+// - single SIMD accumulator (not unrolled multi-accumulator like ip_score)
+// - separate mul then add (NOT fmadd) — same two-rounding pattern as FAISS
+// This gives bit-identical norms to FAISS's pairwise_L2sqr pre-fill step.
+static float faiss_norm_L2sqr(const float* x, int d) {
+#ifdef __AVX512F__
+    __m512 acc = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= d; i += 16) {
+        __m512 xi = _mm512_loadu_ps(x + i);
+        acc = _mm512_add_ps(acc, _mm512_mul_ps(xi, xi));  // NOT fmadd
+    }
+    // reduce 512->256->128->scalar
+    __m256 lo256 = _mm512_castps512_ps256(acc);
+    __m256 hi256 = _mm512_extractf32x8_ps(acc, 1);
+    __m256 s256  = _mm256_add_ps(lo256, hi256);
+    __m128 lo128 = _mm256_castps256_ps128(s256);
+    __m128 hi128 = _mm256_extractf128_ps(s256, 1);
+    __m128 s128  = _mm_add_ps(lo128, hi128);
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    float res = _mm_cvtss_f32(s128);
+    for (; i < d; i++) res += x[i] * x[i];
+    return res;
+#elif defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= d; i += 8) {
+        __m256 xi = _mm256_loadu_ps(x + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(xi, xi));  // NOT fmadd
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float res = _mm_cvtss_f32(lo);
+    for (; i < d; i++) res += x[i] * x[i];
+    return res;
+#else
+    float res = 0.0f;
+    for (int i = 0; i < d; i++) res += x[i] * x[i];
+    return res;
+#endif
 }
 } // anonymous namespace
 
@@ -723,6 +770,54 @@ void IVFIndex::search_on(const std::vector<int>& cluster_ids,
     }
 }
 
+void IVFIndex::search_on_batch(const float* queries, size_t q_rows, int k,
+                               const int* cluster_ids, int nprobe,
+                               std::vector<std::vector<DocId>>& out_ids,
+                               std::vector<std::vector<float>>& out_scores) const {
+    std::vector<std::shared_ptr<Cluster>> clusters_snap;
+    {
+        std::shared_lock lk(topo_mu_);
+        clusters_snap = clusters_;
+    }
+
+    out_ids.assign(q_rows, {});
+    out_scores.assign(q_rows, {});
+    if (!queries || q_rows == 0 || k <= 0 || nprobe <= 0 || !cluster_ids) return;
+
+    for (size_t qi = 0; qi < q_rows; ++qi) {
+        const float* qptr = queries + qi * (size_t)dim_;
+        const int*   cids = cluster_ids + qi * (size_t)nprobe;
+
+        std::vector<DocId>  top_ids(k, (DocId)-1);
+        std::vector<float>  top_scores(k, std::numeric_limits<float>::infinity());
+        const float q_norm_sq = (metric_ == Metric::L2) ? ip_score(qptr, qptr, dim_) : -1.0f;
+
+        for (int p = 0; p < nprobe; ++p) {
+            int cid = cids[p];
+            if (cid < 0 || cid >= (int)clusters_snap.size()) continue;
+            auto c = clusters_snap[cid];
+            if (!c) continue;
+            c->search_into(qptr, q_norm_sq, k, top_ids, top_scores, /*skip_alive_check=*/true);
+        }
+
+        std::vector<int> idx;
+        idx.reserve(k);
+        for (int i = 0; i < k; ++i)
+            if (top_ids[i] != (DocId)-1) idx.push_back(i);
+        std::sort(idx.begin(), idx.end(),
+                  [&](int a, int b){ return top_scores[a] < top_scores[b]; });
+
+        auto& oi = out_ids[qi];
+        auto& os = out_scores[qi];
+        oi.resize(idx.size());
+        os.resize(idx.size());
+        for (size_t i = 0; i < idx.size(); ++i) {
+            oi[i] = top_ids[idx[i]];
+            os[i] = top_scores[idx[i]];
+        }
+    }
+}
+
 void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int nprobe,
                              std::vector<std::vector<DocId>>& out_ids,
                              std::vector<std::vector<float>>& out_scores,
@@ -761,8 +856,7 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
     if (metric_ == Metric::L2) {
         c_norms.resize(NL);
         for (size_t ci = 0; ci < NL; ++ci)
-            c_norms[ci] = cblas_sdot(dim_, compact_centroids.data() + ci * D, 1,
-                                           compact_centroids.data() + ci * D, 1);
+            c_norms[ci] = faiss_norm_L2sqr(compact_centroids.data() + ci * D, dim_);
     }
 
     // ---------------------------------------------------------------
@@ -807,25 +901,33 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
     } else {
         // Large-matrix path: one sgemm, thread count capped to avoid overhead.
         const int blas_saved = openblas_get_num_threads();
-        const int blas_cap   = std::max(1, std::min(blas_saved, 8));
+        const int blas_cap   = std::max(1, blas_saved);
         if (blas_saved != blas_cap) openblas_set_num_threads(blas_cap);
 
+        // One-time thread-count diagnostic so we can compare against FAISS's thread count.
+        static std::once_flag _blas_thread_log;
+        std::call_once(_blas_thread_log, [&]() {
+            fprintf(stderr, "[m3 centroid sgemm] openblas threads = %d (cap=%d)\n",
+                    blas_saved, blas_cap);
+        });
+
         if (metric_ == Metric::L2) {
+            // FAISS-style: pre-fill scores with q_norm+c_norm, then sgemm beta=1.0
+            // adds -2*dot into the pre-stored norms. Accumulation order matches
+            // pairwise_L2sqr in faiss/utils/distances.cpp.
+            for (size_t qi = 0; qi < q_rows; ++qi) {
+                const float q_norm = faiss_norm_L2sqr(queries + qi * D, dim_);
+                float* row = scores.data() + qi * NL;
+                for (size_t ci = 0; ci < NL; ++ci)
+                    row[ci] = q_norm + c_norms[ci];
+            }
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         (int)q_rows, live_nlist, dim_,
                         -2.0f,
                         queries,                    dim_,
                         compact_centroids.data(),   dim_,
-                        0.0f,
+                        1.0f,
                         scores.data(),              live_nlist);
-
-            for (size_t qi = 0; qi < q_rows; ++qi) {
-                const float* q     = queries + qi * D;
-                const float q_norm = cblas_sdot(dim_, q, 1, q, 1);
-                float* row = scores.data() + qi * NL;
-                for (size_t ci = 0; ci < NL; ++ci)
-                    row[ci] += q_norm + c_norms[ci];
-            }
         } else {
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         (int)q_rows, live_nlist, dim_,
@@ -1086,6 +1188,206 @@ void IVFIndex::search_nprobe(const float* queries, size_t q_rows, int k, int npr
     if (out_scan_ms)     *out_scan_ms     = do_timing ? idx_fms(idx_clock::now() - t_scan0) : 0.0;
 }
 
+void IVFIndex::select_clusters(const float* queries, size_t q_rows, int nprobe,
+                                std::vector<std::vector<int>>& out_cluster_ids) const {
+    out_cluster_ids.assign(q_rows, {});
+    if (!queries || q_rows == 0) return;
+
+    // Snapshot compact view — identical to search_nprobe.
+    std::vector<float> compact_centroids;
+    std::vector<int>   compact_to_orig;
+    {
+        std::shared_lock lk(topo_mu_);
+        compact_centroids = compact_centroids_;
+        compact_to_orig   = compact_to_orig_;
+    }
+    const int live_nlist = (int)compact_to_orig.size();
+    if (live_nlist == 0) return;
+
+    if (nprobe <= 0) nprobe = live_nlist;
+    const int    real_nprobe = std::min(nprobe, live_nlist);
+    const size_t NL          = (size_t)live_nlist;
+    const size_t D           = (size_t)dim_;
+
+    // Centroid norms (L2 only) — identical to search_nprobe.
+    std::vector<float> c_norms;
+    if (metric_ == Metric::L2) {
+        c_norms.resize(NL);
+        for (size_t ci = 0; ci < NL; ++ci)
+            c_norms[ci] = faiss_norm_L2sqr(compact_centroids.data() + ci * D, dim_);
+    }
+
+    // Centroid distance matrix [q_rows × NL] — identical path to search_nprobe.
+    std::vector<float> scores(q_rows * NL);
+    const bool use_direct = ((size_t)q_rows * (size_t)dim_ < 128000UL);
+
+    if (use_direct) {
+        for (int qi_int = 0; qi_int < (int)q_rows; ++qi_int) {
+            const size_t qi  = (size_t)qi_int;
+            const float* q   = queries + qi * D;
+            float*       row = scores.data() + qi * NL;
+            if (metric_ == Metric::L2) {
+                const float q_norm = ip_score(q, q, dim_);
+                for (size_t ci = 0; ci < NL; ++ci) {
+                    const float* c = compact_centroids.data() + ci * D;
+                    row[ci] = q_norm + c_norms[ci] - 2.0f * ip_score(q, c, dim_);
+                }
+            } else {
+                for (size_t ci = 0; ci < NL; ++ci) {
+                    const float* c = compact_centroids.data() + ci * D;
+                    row[ci] = unified_score(q, c, dim_, metric_, normalized_);
+                }
+            }
+        }
+    } else {
+        const int blas_saved = openblas_get_num_threads();
+        const int blas_cap   = std::max(1, blas_saved);
+        if (blas_saved != blas_cap) openblas_set_num_threads(blas_cap);
+
+        if (metric_ == Metric::L2) {
+            for (size_t qi = 0; qi < q_rows; ++qi) {
+                const float q_norm = faiss_norm_L2sqr(queries + qi * D, dim_);
+                float* row = scores.data() + qi * NL;
+                for (size_t ci = 0; ci < NL; ++ci)
+                    row[ci] = q_norm + c_norms[ci];
+            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)q_rows, live_nlist, dim_,
+                        -2.0f,
+                        queries,                  dim_,
+                        compact_centroids.data(), dim_,
+                        1.0f,
+                        scores.data(),            live_nlist);
+        } else {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)q_rows, live_nlist, dim_,
+                        -1.0f,
+                        queries,                  dim_,
+                        compact_centroids.data(), dim_,
+                        0.0f,
+                        scores.data(),            live_nlist);
+            if (metric_ == Metric::COSINE && normalized_)
+                for (float& s : scores) s += 1.0f;
+        }
+
+        if (blas_saved != blas_cap) openblas_set_num_threads(blas_saved);
+    }
+
+    // Top-nprobe selection — identical to search_nprobe Path A.
+    for (int qi_int = 0; qi_int < (int)q_rows; ++qi_int) {
+        const size_t qi        = (size_t)qi_int;
+        const float* score_row = scores.data() + qi * NL;
+
+        std::vector<std::pair<float, int>> row_tmp;
+        row_tmp.reserve(NL);
+        for (size_t ci = 0; ci < NL; ++ci)
+            row_tmp.emplace_back(score_row[ci], (int)ci);
+
+        if (real_nprobe >= (int)row_tmp.size()) {
+            std::sort(row_tmp.begin(), row_tmp.end(),
+                      [](const auto& a, const auto& b){ return a.first < b.first; });
+        } else {
+            std::nth_element(row_tmp.begin(), row_tmp.begin() + real_nprobe, row_tmp.end(),
+                             [](const auto& a, const auto& b){ return a.first < b.first; });
+            row_tmp.resize(real_nprobe);
+            std::sort(row_tmp.begin(), row_tmp.end(),
+                      [](const auto& a, const auto& b){ return a.first < b.first; });
+        }
+
+        out_cluster_ids[qi].reserve(real_nprobe);
+        for (auto& p : row_tmp)
+            out_cluster_ids[qi].push_back(compact_to_orig[static_cast<size_t>(p.second)]);
+    }
+}
+
+void IVFIndex::score_centroids(const float* queries, size_t q_rows,
+                               std::vector<float>& out_scores,
+                               std::vector<int>&   out_orig_ids) const {
+    out_scores.clear();
+    out_orig_ids.clear();
+    if (!queries || q_rows == 0) return;
+
+    // Snapshot compact view — identical to search_nprobe / select_clusters.
+    std::vector<float> compact_centroids;
+    std::vector<int>   compact_to_orig;
+    {
+        std::shared_lock lk(topo_mu_);
+        compact_centroids = compact_centroids_;
+        compact_to_orig   = compact_to_orig_;
+    }
+    const int live_nlist = (int)compact_to_orig.size();
+    if (live_nlist == 0) return;
+
+    const size_t NL = (size_t)live_nlist;
+    const size_t D  = (size_t)dim_;
+
+    // Centroid norms (L2 only) — identical to search_nprobe.
+    std::vector<float> c_norms;
+    if (metric_ == Metric::L2) {
+        c_norms.resize(NL);
+        for (size_t ci = 0; ci < NL; ++ci)
+            c_norms[ci] = faiss_norm_L2sqr(compact_centroids.data() + ci * D, dim_);
+    }
+
+    // Centroid distance matrix [q_rows × NL] — identical path to search_nprobe.
+    out_scores.resize(q_rows * NL);
+    const bool use_direct = ((size_t)q_rows * (size_t)dim_ < 128000UL);
+
+    if (use_direct) {
+        for (int qi_int = 0; qi_int < (int)q_rows; ++qi_int) {
+            const size_t qi  = (size_t)qi_int;
+            const float* q   = queries + qi * D;
+            float*       row = out_scores.data() + qi * NL;
+            if (metric_ == Metric::L2) {
+                const float q_norm = ip_score(q, q, dim_);
+                for (size_t ci = 0; ci < NL; ++ci) {
+                    const float* c = compact_centroids.data() + ci * D;
+                    row[ci] = q_norm + c_norms[ci] - 2.0f * ip_score(q, c, dim_);
+                }
+            } else {
+                for (size_t ci = 0; ci < NL; ++ci) {
+                    const float* c = compact_centroids.data() + ci * D;
+                    row[ci] = unified_score(q, c, dim_, metric_, normalized_);
+                }
+            }
+        }
+    } else {
+        const int blas_saved = openblas_get_num_threads();
+        const int blas_cap   = std::max(1, blas_saved);
+        if (blas_saved != blas_cap) openblas_set_num_threads(blas_cap);
+
+        if (metric_ == Metric::L2) {
+            for (size_t qi = 0; qi < q_rows; ++qi) {
+                const float q_norm = faiss_norm_L2sqr(queries + qi * D, dim_);
+                float* row = out_scores.data() + qi * NL;
+                for (size_t ci = 0; ci < NL; ++ci)
+                    row[ci] = q_norm + c_norms[ci];
+            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)q_rows, live_nlist, dim_,
+                        -2.0f,
+                        queries,                  dim_,
+                        compact_centroids.data(), dim_,
+                        1.0f,
+                        out_scores.data(),        live_nlist);
+        } else {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)q_rows, live_nlist, dim_,
+                        -1.0f,
+                        queries,                  dim_,
+                        compact_centroids.data(), dim_,
+                        0.0f,
+                        out_scores.data(),        live_nlist);
+            if (metric_ == Metric::COSINE && normalized_)
+                for (float& s : out_scores) s += 1.0f;
+        }
+
+        if (blas_saved != blas_cap) openblas_set_num_threads(blas_saved);
+    }
+
+    out_orig_ids = compact_to_orig;  // [NL] compact_ci -> original cluster ID
+}
+
 void IVFIndex::search_nprobe_profiled(const float* queries, size_t q_rows, int k, int nprobe,
                                       std::vector<std::vector<DocId>>& out_ids,
                                       std::vector<std::vector<float>>& out_scores,
@@ -1128,8 +1430,7 @@ void IVFIndex::search_nprobe_profiled(const float* queries, size_t q_rows, int k
         const auto t0 = clk::now();
         c_norms.resize(NL);
         for (size_t ci = 0; ci < NL; ++ci)
-            c_norms[ci] = cblas_sdot(dim_, compact_centroids.data() + ci * D, 1,
-                                          compact_centroids.data() + ci * D, 1);
+            c_norms[ci] = faiss_norm_L2sqr(compact_centroids.data() + ci * D, dim_);
         prof.c_norms_ms += ns(clk::now() - t0);
     }
 
@@ -1163,18 +1464,17 @@ void IVFIndex::search_nprobe_profiled(const float* queries, size_t q_rows, int k
             if (blas_saved != blas_cap) openblas_set_num_threads(blas_cap);
 
             if (metric_ == Metric::L2) {
+                for (size_t qi = 0; qi < q_rows; ++qi) {
+                    const float q_norm = faiss_norm_L2sqr(queries + qi * D, dim_);
+                    float* row = scores.data() + qi * NL;
+                    for (size_t ci = 0; ci < NL; ++ci)
+                        row[ci] = q_norm + c_norms[ci];
+                }
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             (int)q_rows, live_nlist, dim_,
                             -2.0f, queries, dim_,
                             compact_centroids.data(), dim_,
-                            0.0f, scores.data(), live_nlist);
-                for (size_t qi = 0; qi < q_rows; ++qi) {
-                    const float* q = queries + qi * D;
-                    const float q_norm = cblas_sdot(dim_, q, 1, q, 1);
-                    float* row = scores.data() + qi * NL;
-                    for (size_t ci = 0; ci < NL; ++ci)
-                        row[ci] += q_norm + c_norms[ci];
-                }
+                            1.0f, scores.data(), live_nlist);
             } else {
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                             (int)q_rows, live_nlist, dim_,
@@ -1337,24 +1637,22 @@ void IVFIndex::batch_get_probe_ids(const float* queries, size_t q_rows, int npro
     const auto t_sgemm_start = (out_sgemm_ms || out_topk_ms) ? idx_clock::now() : idx_clock::time_point{};
 
     if (metric_ == Metric::L2) {
+        std::vector<float> c_norms(NL);
+        for (size_t ci = 0; ci < NL; ++ci)
+            c_norms[ci] = faiss_norm_L2sqr(compact_centroids.data() + ci * D, dim_);
+        for (size_t qi = 0; qi < q_rows; ++qi) {
+            float q_norm = faiss_norm_L2sqr(queries + qi * D, dim_);
+            float* row   = scores_mat.data() + qi * NL;
+            for (size_t ci = 0; ci < NL; ++ci)
+                row[ci] = q_norm + c_norms[ci];
+        }
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     (int)q_rows, live_nlist, dim_,
                     -2.0f,
                     queries,                  dim_,
                     compact_centroids.data(), dim_,
-                    0.0f,
+                    1.0f,
                     scores_mat.data(),        live_nlist);
-
-        std::vector<float> c_norms(NL);
-        for (size_t ci = 0; ci < NL; ++ci)
-            c_norms[ci] = cblas_sdot(dim_, compact_centroids.data() + ci * D, 1,
-                                           compact_centroids.data() + ci * D, 1);
-        for (size_t qi = 0; qi < q_rows; ++qi) {
-            float q_norm = cblas_sdot(dim_, queries + qi * D, 1, queries + qi * D, 1);
-            float* row   = scores_mat.data() + qi * NL;
-            for (size_t ci = 0; ci < NL; ++ci)
-                row[ci] += q_norm + c_norms[ci];
-        }
     } else {
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     (int)q_rows, live_nlist, dim_,

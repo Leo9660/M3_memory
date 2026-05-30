@@ -104,6 +104,29 @@ public:
                 std::vector<std::vector<DocId>>& out_ids,
                 std::vector<std::vector<float>>& out_scores) const;
 
+    // Vector scan only — cluster IDs come from caller (e.g. FAISS quantizer).
+    // cluster_ids: flat [q_rows × nprobe] row-major int32, original cluster IDs.
+    void search_on_batch(int index_id,
+                         const float* queries, size_t q_rows, int k,
+                         const int* cluster_ids, int nprobe,
+                         std::vector<std::vector<DocId>>& out_ids,
+                         std::vector<std::vector<float>>& out_scores) const;
+
+    // Returns the nprobe cluster IDs M3 actually selects per query (no vector scan).
+    // Same centroid scoring path as search() — use this to compare directly against
+    // FAISS's quantizer.search() output with no Python/numpy approximation.
+    void select_clusters(int index_id,
+                         const float* queries, size_t q_rows, int nprobe,
+                         std::vector<std::vector<int>>& out_cluster_ids) const;
+
+    // Returns raw centroid distance matrix [q_rows × live_nlist] before any selection,
+    // plus the compact→original cluster ID mapping.  Use to compare M3's per-centroid
+    // distances against FAISS's quantizer distances at the value level.
+    void score_centroids(int index_id,
+                         const float* queries, size_t q_rows,
+                         std::vector<float>& out_scores,
+                         std::vector<int>&   out_orig_ids) const;
+
     // ---- profiled search ----
     // Same result as search() but fills a SearchProfile with per-phase wall times.
     void search_profiled(int index_id,

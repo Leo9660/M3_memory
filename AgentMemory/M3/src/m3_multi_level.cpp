@@ -181,6 +181,8 @@ void MultiLevelIndex::insert(const DocId* ids, const float* vecs, size_t n_rows)
                 n_rows, gpu_pending.size(),
                 p_assign_ms, p_assign_ms, 0.0,
                 p_l0l2_ms, p_gpu_ms, total_ms);
+            for (const auto& [cid, cnt] : l2_delta)
+                M3Profiler::instance().log_cluster_metrics("INSERT", cid, cnt);
         }
 
         if (strat) strat->on_insert(ids, vecs, n_rows);
@@ -1086,6 +1088,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
         // L0 promotion: per-result-vector (temporal locality — single accessed vector).
         // L1 promotion: per-query (spatial locality — top-k' results form one new cluster).
         const auto t_promo_start = profiling ? clock::now() : clock::time_point{};
+        std::unordered_map<int, size_t> search_cluster_hits;
         {
             std::shared_lock promo_lk(topo_mu_);
             for (size_t qi = 0; qi < q_rows; ++qi) {
@@ -1099,6 +1102,7 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     if (it == doc_id_to_cid_.end()) continue;
                     // Always update cluster-level access time so demotion logic works.
                     record_access_(it->second);
+                    if (profiling) ++search_cluster_hits[it->second];
                 }
                 // L1: per-query promotion — top-k' results form one new query-centric cluster.
                 // Stage 3 (L2-reaching): promote with the wider k_promo L2 results so
@@ -1114,6 +1118,11 @@ void MultiLevelIndex::search(const float* queries, size_t q_rows, int k, int npr
                     promote_query_to_l1_(qptr_qi, out_ids[qi], out_scores[qi], k);
                 }
             }
+        }
+
+        if (profiling && !search_cluster_hits.empty()) {
+            for (const auto& [cid, cnt] : search_cluster_hits)
+                M3Profiler::instance().log_cluster_metrics("SEARCH", cid, cnt);
         }
 
         // Compute true_kth_avg: mean k-th distance from queries that reached L2.

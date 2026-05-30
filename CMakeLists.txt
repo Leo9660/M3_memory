@@ -24,7 +24,10 @@ message(STATUS "M3: CUDA enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
 find_package(pybind11 CONFIG REQUIRED)
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
-find_library(OPENBLAS_LIB NAMES openblas HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu REQUIRED)
+# Use FAISS's bundled OpenBLAS so M3's cblas_sgemm calls the identical kernel
+# as FAISS's quantizer — this gives bitwise-equal centroid distances and recall=1.0.
+# cblas.h is still taken from the system (headers don't need to match the .so).
+set(OPENBLAS_LIB /workspace/.local/lib/python3.11/site-packages/faiss_cpu.libs/libopenblas-r0-11edc3fa.3.15.so)
 find_path(CBLAS_INCLUDE_DIR cblas.h HINTS /usr/include/x86_64-linux-gnu /usr/include REQUIRED)
 message(STATUS "OpenBLAS: ${OPENBLAS_LIB}  cblas.h: ${CBLAS_INCLUDE_DIR}")
 
@@ -83,6 +86,7 @@ target_include_directories(_m3_async PRIVATE ${M3_INCLUDE} ${CBLAS_INCLUDE_DIR})
 target_compile_features(_m3_async PRIVATE cxx_std_17)
 target_compile_options(_m3_async PRIVATE -O3 -pthread -mavx2 -mfma -mavx512f -mavx512dq -mavx512bw -mavx512vl ${OpenMP_CXX_FLAGS})
 target_link_libraries(_m3_async PRIVATE CUDA::cudart CUDA::cublas ${OPENBLAS_LIB} OpenMP::OpenMP_CXX)
+target_link_options(_m3_async PRIVATE -Wl,-rpath,/workspace/.local/lib/python3.11/site-packages/faiss_cpu.libs)
 if(M3_WITH_FSM)
     target_compile_definitions(_m3_async PRIVATE M3_WITH_FSM)
 endif()

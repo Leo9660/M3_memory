@@ -1,11 +1,14 @@
 #!/usr/bin/env python
 """
-Recall@k benchmark: test backend (M3MultiGpu or other) + test Faiss vs GT Faiss ground truth.
+Recall@k benchmark: test backend (M3MultiGpu or other) + optional test Faiss vs GT Faiss ground truth.
 
-Three backends run in lockstep:
+Backends run in lockstep:
   GT    faiss  @ --gt-nprobe   (default 512) — ground truth, latency not reported
-  test  faiss  @ --faiss-nprobe              — compared against GT
+  test  faiss  @ --faiss-nprobe              — compared against GT  (skipped with --no-test-faiss)
   test  m3/etc @ --nprobe                    — compared against GT
+
+GT results are cached per (dataset, limit, normalized, metric, mode, top_k) so subsequent runs
+skip the GT faiss backend entirely and load results from disk.  Pass --no-gt-cache to disable.
 
 Outputs (all written to bench/<backend>_<mode>_<DD>_<HHMMSS>/):
   console.csv                       — every log line with elapsed time and tag
@@ -22,6 +25,9 @@ Usage:
       --top-k 10 --nprobe 64 --faiss-nprobe 64 --gt-nprobe 512 \\
       --search-batch 128 --insert-batch 512 \\
       --mode item_search_insert
+
+  # M3 vs GT only, no test-faiss, use cached GT if available:
+  python recall_vs_faiss.py --no-test-faiss --dataset agentgym --limit 4096 ...
 """
 
 from __future__ import annotations
@@ -98,6 +104,8 @@ else:
     _run_dir = Path(__file__).parent / "bench" / _run_tag
 
 _run_dir.mkdir(parents=True, exist_ok=True)
+
+_EMBED_CACHE_DIR = Path(__file__).parent / "embeddings_cache"
 
 # Always enable M3 profiler; direct all its CSVs into the run dir.
 os.environ["M3_PROFILE"]        = "1"
@@ -208,6 +216,94 @@ def _extract_text(entry: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def encode_texts_cached(texts: List[str], dataset_name: str, limit, normalized: bool) -> np.ndarray:
+    """Encode texts to float32 vectors, caching under test_perf/embeddings_cache/."""
+    norm_tag = "_norm" if normalized else ""
+    suffix   = f"_n{limit}" if limit else "_all"
+    cache_path = _EMBED_CACHE_DIR / f"{dataset_name}{suffix}{norm_tag}.npy"
+    if cache_path.exists():
+        print(f"[encode] loading cached vectors from {cache_path}")
+        return np.load(str(cache_path))
+    from AgentMemory.encoder import TransformerEncoder
+    from AgentMemory.types import MemoryItem as _MI
+    enc   = TransformerEncoder(normalize=normalized)
+    items = [_MI(id=str(i), data=t) for i, t in enumerate(texts)]
+    vecs  = np.asarray(enc.encode_items(items), dtype=np.float32)
+    _EMBED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    np.save(str(cache_path), vecs)
+    print(f"[encode] saved {len(vecs)} vectors to {cache_path}")
+    return vecs
+
+
+_GT_CACHE_DIR = Path(__file__).parent / "gt_cache"
+
+
+def _gt_cache_path(dataset: str, limit, normalized: bool, metric: str, mode: str, top_k: int) -> Path:
+    norm_tag   = "_norm" if normalized else ""
+    limit_tag  = f"_n{limit}" if limit else "_all"
+    return _GT_CACHE_DIR / f"{dataset}{limit_tag}{norm_tag}_{metric}_{mode}_top{top_k}.npz"
+
+
+def load_gt_cache(dataset: str, limit, normalized: bool, metric: str, mode: str, top_k: int):
+    """
+    Return dict[request_id -> list[list[str]]] (per-query ordered doc-id lists), or None if absent.
+    """
+    path = _gt_cache_path(dataset, limit, normalized, metric, mode, top_k)
+    if not path.exists():
+        return None
+    data = np.load(str(path), allow_pickle=True)
+    return {k: data[k].tolist() for k in data.files}
+
+
+def save_gt_cache(
+    dataset: str, limit, normalized: bool, metric: str, mode: str, top_k: int,
+    gt_results: Dict[str, List[List[str]]],
+) -> None:
+    """
+    Persist GT results (dict[request_id -> list[list[str]]]) to disk as a .npz.
+    Each value is a 2-D object array of shape (n_queries, top_k) holding doc-id strings.
+    """
+    path = _gt_cache_path(dataset, limit, normalized, metric, mode, top_k)
+    _GT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    arrays = {rid: np.array(rows, dtype=object) for rid, rows in gt_results.items()}
+    np.savez(str(path), **arrays)
+
+
+def rebuild_with_flat_quantizer(faiss_index):
+    """
+    Return a new IndexIVFFlat backed by IndexFlatL2, keeping the same centroids
+    and inverted-list assignments as the source index.  Exact centroid L2 search
+    (same as M3's exhaustive sgemm) — required for a fair recall comparison.
+    """
+    import faiss
+    from faiss.contrib.inspect_tools import get_invlist
+
+    ivf  = faiss.extract_index_ivf(faiss_index)
+    ivf  = faiss.downcast_index(ivf)
+    nlist, dim = ivf.nlist, ivf.d
+    quantizer  = faiss.downcast_index(ivf.quantizer)
+    if hasattr(quantizer, "xb") and quantizer.ntotal == nlist:
+        centroids = faiss.vector_to_array(quantizer.xb).astype(np.float32).reshape(nlist, dim)
+    else:
+        centroids = np.vstack([quantizer.reconstruct(i) for i in range(nlist)]).astype(np.float32)
+
+    invlists = faiss.downcast_InvertedLists(ivf.invlists)
+    flat_q   = faiss.IndexFlatL2(dim)
+    flat_q.add(centroids)
+    new_idx  = faiss.IndexIVFFlat(flat_q, dim, nlist, faiss.METRIC_L2)
+    new_idx.is_trained = True
+    for list_id in range(nlist):
+        ids, codes = get_invlist(invlists, list_id)
+        if ids.size == 0:
+            continue
+        ids64 = np.ascontiguousarray(ids, dtype=np.int64)
+        new_idx.invlists.add_entries(list_id, len(ids64),
+                                     faiss.swig_ptr(ids64),
+                                     faiss.swig_ptr(codes))
+    new_idx.ntotal = faiss_index.ntotal
+    return new_idx
+
+
 def flatten_dataset(name: str, split: Optional[str], limit: Optional[int]) -> List[str]:
     cls = DATASET_LOADERS[name]
     kw: Dict[str, Any] = {}
@@ -253,31 +349,38 @@ def recall_at_k(
 
 
 # ---------------------------------------------------------------------------
-# TripleRunner: GT faiss + test faiss + test m3/other backend
+# TripleRunner: GT faiss (live or cached) + optional test faiss + test m3
 # ---------------------------------------------------------------------------
 
 class TripleRunner:
     """
-    Keeps three MemoryManagement instances in lockstep.
-      mm_gt    — FaissBackend @ gt_nprobe  (ground truth, latency not reported)
-      mm_faiss — FaissBackend @ faiss_nprobe (test, recall vs GT reported)
-      mm_m3    — M3/other     @ m3_nprobe   (test, recall vs GT reported)
+    Keeps up to three MemoryManagement instances in lockstep.
+      mm_gt    — FaissBackend @ gt_nprobe  (ground truth, latency not reported).
+                 May be None when gt_cache is provided — GT results come from cache.
+      mm_faiss — FaissBackend @ faiss_nprobe (optional, skipped when None).
+      mm_m3    — M3/other     @ m3_nprobe   (always present).
+
+    gt_cache: dict[request_id -> list[list[str]]] pre-loaded doc-id lists.
+              When provided and a rid is present in the cache, the live GT backend
+              is not queried for that rid.  New GT results are accumulated in
+              _gt_new so the caller can persist them after the run.
     """
 
     def __init__(
         self,
-        mm_gt:       MemoryManagement,
-        mm_faiss:    MemoryManagement,
-        mm_m3:       MemoryManagement,
-        idx_gt:      int,
-        idx_faiss:   int,
-        idx_m3:      int,
-        k:           int,
-        gt_nprobe:   int,
+        mm_gt:        Optional[MemoryManagement],
+        mm_faiss:     Optional[MemoryManagement],
+        mm_m3:        MemoryManagement,
+        idx_gt:       Optional[int],
+        idx_faiss:    Optional[int],
+        idx_m3:       int,
+        k:            int,
+        gt_nprobe:    int,
         faiss_nprobe: int,
-        m3_nprobe:   int,
-        ops_per_run: int,
-        logger:      Optional[BenchLogger] = None,
+        m3_nprobe:    int,
+        ops_per_run:  int,
+        logger:       Optional[BenchLogger] = None,
+        gt_cache:     Optional[Dict[str, List[List[str]]]] = None,
     ) -> None:
         self.mm_gt     = mm_gt
         self.mm_faiss  = mm_faiss
@@ -291,6 +394,9 @@ class TripleRunner:
         self.m3_nprobe    = m3_nprobe
         self.ops_per_run  = ops_per_run
         self.logger       = logger
+        self._gt_cache    = gt_cache or {}
+        # GT results collected this run (rids not in cache); caller may persist these.
+        self._gt_new: Dict[str, List[List[str]]] = {}
 
         self._queued    = 0
         self._batch_idx = 0
@@ -301,19 +407,18 @@ class TripleRunner:
         self.recall_m3_sum    = 0.0
 
         # timing accumulators (GT not tracked)
-        self._faiss_time:   float = 0.0
-        self._m3_time:      float = 0.0
-        self._total_inserts: int  = 0
+        self._faiss_time:    float = 0.0
+        self._m3_time:       float = 0.0
+        self._total_inserts: int   = 0
 
         # CSV writer (set by caller)
         self.csv_writer: Optional[csv.writer] = None  # type: ignore[type-arg]
 
-        # recall_diag appender — appends RECALL_BATCH rows into the C++ profiler CSV
+        # recall_diag appender
         self._recall_diag_f = None
         self._recall_diag_w = None
         import glob as _glob
-        prof_dir = str(_run_dir)
-        matches = sorted(_glob.glob(os.path.join(prof_dir, "*_recall_diag.csv")))
+        matches = sorted(_glob.glob(os.path.join(str(_run_dir), "*_recall_diag.csv")))
         if matches:
             self._recall_diag_f = open(matches[-1], "a", newline="", encoding="utf-8")
             self._recall_diag_w = csv.writer(self._recall_diag_f)
@@ -322,16 +427,20 @@ class TripleRunner:
 
     def add_search(self, items: List[MemoryItem], rid_prefix: str = "s") -> None:
         rid = f"{rid_prefix}-{self._batch_idx}"
-        self.mm_gt.add_search(   self.idx_gt,    items, self.k, nprobe=self.gt_nprobe,    request_id=rid)
-        self.mm_faiss.add_search(self.idx_faiss,  items, self.k, nprobe=self.faiss_nprobe, request_id=rid)
-        self.mm_m3.add_search(   self.idx_m3,     items, self.k, nprobe=self.m3_nprobe,    request_id=rid)
+        if self.mm_gt is not None:
+            self.mm_gt.add_search(self.idx_gt, items, self.k, nprobe=self.gt_nprobe, request_id=rid)
+        if self.mm_faiss is not None:
+            self.mm_faiss.add_search(self.idx_faiss, items, self.k, nprobe=self.faiss_nprobe, request_id=rid)
+        self.mm_m3.add_search(self.idx_m3, items, self.k, nprobe=self.m3_nprobe, request_id=rid)
         self._queued += 1
         self._maybe_flush()
 
     def add_insert(self, items: List[MemoryItem]) -> None:
-        self.mm_gt.add_insert(   self.idx_gt,    items)
-        self.mm_faiss.add_insert(self.idx_faiss,  items)
-        self.mm_m3.add_insert(   self.idx_m3,     items)
+        if self.mm_gt is not None:
+            self.mm_gt.add_insert(self.idx_gt, items)
+        if self.mm_faiss is not None:
+            self.mm_faiss.add_insert(self.idx_faiss, items)
+        self.mm_m3.add_insert(self.idx_m3, items)
         self._total_inserts += len(items)
         self._queued += 1
         self._maybe_flush()
@@ -358,41 +467,63 @@ class TripleRunner:
     def _flush(self) -> None:
         self._batch_idx += 1
 
-        # GT — run first, not timed for reporting
-        res_gt    = self.mm_gt.run()
+        # GT — run live if backend present, else rely purely on cache
+        if self.mm_gt is not None:
+            res_gt_run = self.mm_gt.run()
+            # Merge live results into cache and _gt_new
+            for rid, hits in res_gt_run.searches.items():
+                id_lists = [[h.id for h in q_hits] for q_hits in hits]
+                self._gt_cache[rid] = id_lists
+                self._gt_new[rid]   = id_lists
+
+        if self.mm_faiss is not None:
+            t0 = time.perf_counter()
+            res_faiss = self.mm_faiss.run()
+            t_faiss   = time.perf_counter() - t0
+            self._faiss_time += t_faiss
+        else:
+            res_faiss = None
+            t_faiss   = 0.0
 
         t0 = time.perf_counter()
-        res_faiss = self.mm_faiss.run()
-        t_faiss   = time.perf_counter() - t0
-        self._faiss_time += t_faiss
-
-        t0 = time.perf_counter()
-        res_m3    = self.mm_m3.run()
-        t_m3      = time.perf_counter() - t0
+        res_m3 = self.mm_m3.run()
+        t_m3   = time.perf_counter() - t0
         self._m3_time += t_m3
 
         self._queued = 0
 
-        for rid in res_gt.searches:
-            gt = res_gt.searches[rid]
-            if not gt:
+        # Determine which rids to score — from live GT or from cache
+        rids_to_score = set(self._gt_cache.keys())
+        if res_faiss is not None:
+            rids_to_score |= set(res_faiss.searches.keys())
+        rids_to_score &= set(res_m3.searches.keys())
+
+        for rid in rids_to_score:
+            gt_id_lists = self._gt_cache.get(rid)
+            if not gt_id_lists:
                 continue
 
-            faiss_res = res_faiss.searches.get(rid)
+            faiss_res = res_faiss.searches.get(rid) if res_faiss else None
             m3_res    = res_m3.searches.get(rid)
 
-            if not faiss_res and not m3_res:
+            if not m3_res and not faiss_res:
                 continue
 
-            n_q = len(gt)
+            n_q = len(gt_id_lists)
+
+            # Build SearchHit-compatible objects from cached id lists for recall_at_k
+            class _FakeHit:
+                __slots__ = ("id",)
+                def __init__(self, i): self.id = i
+            gt_hits = [[_FakeHit(i) for i in row[:self.k]] for row in gt_id_lists]
 
             recall_faiss = 0.0
             if faiss_res:
-                recall_faiss, _ = recall_at_k(faiss_res, gt, self.k)
+                recall_faiss, _ = recall_at_k(faiss_res, gt_hits, self.k)
 
             recall_m3 = 0.0
             if m3_res:
-                recall_m3, _ = recall_at_k(m3_res, gt, self.k)
+                recall_m3, _ = recall_at_k(m3_res, gt_hits, self.k)
 
             self.total_queries    += n_q
             self.recall_faiss_sum += recall_faiss * n_q
@@ -404,13 +535,20 @@ class TripleRunner:
             faiss_lat_ms = t_faiss / n_q * 1e3
             m3_lat_ms    = t_m3    / n_q * 1e3
 
-            self._log(
-                f"  [batch {self._batch_idx:04d}] rid={rid!r}  nq={n_q}  "
-                f"recall_faiss@{self.k}={recall_faiss:.4f}(cum={cum_faiss:.4f})  "
-                f"recall_m3@{self.k}={recall_m3:.4f}(cum={cum_m3:.4f})  "
-                f"faiss={t_faiss*1e3:.1f}ms({faiss_lat_ms:.2f}ms/q)  "
-                f"m3={t_m3*1e3:.1f}ms({m3_lat_ms:.2f}ms/q)"
-            )
+            if self.mm_faiss is not None:
+                self._log(
+                    f"  [batch {self._batch_idx:04d}] rid={rid!r}  nq={n_q}  "
+                    f"recall_faiss@{self.k}={recall_faiss:.4f}(cum={cum_faiss:.4f})  "
+                    f"recall_m3@{self.k}={recall_m3:.4f}(cum={cum_m3:.4f})  "
+                    f"faiss={t_faiss*1e3:.1f}ms({faiss_lat_ms:.2f}ms/q)  "
+                    f"m3={t_m3*1e3:.1f}ms({m3_lat_ms:.2f}ms/q)"
+                )
+            else:
+                self._log(
+                    f"  [batch {self._batch_idx:04d}] rid={rid!r}  nq={n_q}  "
+                    f"recall_m3@{self.k}={recall_m3:.4f}(cum={cum_m3:.4f})  "
+                    f"m3={t_m3*1e3:.1f}ms({m3_lat_ms:.2f}ms/q)"
+                )
 
             if self.csv_writer is not None:
                 self.csv_writer.writerow([
@@ -516,6 +654,10 @@ def main() -> None:
                         help="Override M3MultiGpuBackend alpha_et.")
     parser.add_argument("--alpha-et-adapt-rate", type=float, default=None,
                         help="Override M3MultiGpuBackend alpha_et_adapt_rate.")
+    parser.add_argument("--no-test-faiss", action="store_true", default=False,
+                        help="Skip the test-faiss backend; only run M3 vs GT.")
+    parser.add_argument("--no-gt-cache", action="store_true", default=False,
+                        help="Disable GT result caching (always run GT faiss live).")
     args = parser.parse_args()
 
     # Patch M3MultiGpuBackend class defaults before the backend is instantiated.
@@ -570,6 +712,16 @@ def main() -> None:
         f"on-disk metric={_disk_metric}"
     )
     logger.log(f"[sanity] using metric={args.metric}  faiss_normalized={args.faiss_normalized}")
+
+    # GT must scan every cluster so it is truly exhaustive regardless of quantizer type.
+    # With nprobe=nlist the IVF search enumerates all clusters; nprobe > nlist is clamped by FAISS.
+    if _disk_nlist > 0 and args.gt_nprobe < _disk_nlist:
+        logger.log(
+            f"[init] overriding gt_nprobe {args.gt_nprobe} → {_disk_nlist} "
+            f"(exhaustive scan over all {_disk_nlist} clusters)"
+        )
+        args.gt_nprobe = _disk_nlist
+
     if _disk_metric != "unknown" and _disk_metric != args.metric:
         logger.log(
             f"[warn] on-disk metric ({_disk_metric}) != --metric ({args.metric}). "
@@ -586,71 +738,115 @@ def main() -> None:
         texts = flatten_dataset(args.dataset, args.split, limit)
         if not texts:
             raise RuntimeError("No texts loaded from dataset.")
-        logger.log(f"[init] encoding {len(texts)} texts ...")
-        from AgentMemory.encoder import TransformerEncoder
-        enc        = TransformerEncoder(normalize=args.faiss_normalized)
-        raw_items  = [MemoryItem(id=f"q-{i}", data=t) for i, t in enumerate(texts)]
-        vecs       = enc.encode_items(raw_items)
-        dim        = vecs.shape[1]
+        logger.log(f"[init] encoding {len(texts)} texts (cache: {_EMBED_CACHE_DIR}) ...")
+        vecs = encode_texts_cached(texts, args.dataset, limit, normalized=args.faiss_normalized)
+        dim  = vecs.shape[1]
         logger.log(f"[init] encoded dim={dim}")
-        _mid = len(vecs) // 2
-        insert_items = [MemoryItem(id=f"ins-{i}", data=vecs[i])        for i in range(_mid)]
-        query_items  = [MemoryItem(id=f"q-{i}",   data=vecs[_mid + i]) for i in range(len(vecs) - _mid)]
+        insert_items = [MemoryItem(id=f"{args.dataset}-{i}", data=vecs[i]) for i in range(len(vecs))]
+        query_items  = [MemoryItem(id=f"q-{i}", data=vecs[i])              for i in range(len(vecs))]
         encoder      = VectorPassthroughEncoder(dim=dim, normalize=False)
-        logger.log(f"[init] split: {len(insert_items)} insert items, {len(query_items)} query items (non-overlapping)")
+        logger.log(f"[init] {len(insert_items)} insert items, {len(query_items)} query items (same vectors)")
     else:
         rng = np.random.default_rng(args.seed)
         dim = args.dim
         n   = args.limit if args.limit > 0 else 8192
-        vecs = rng.standard_normal((n, dim)).astype(np.float32)
+        insert_count = n
+        search_count = n
+        insert_mat = rng.standard_normal((insert_count, dim)).astype(np.float32)
+        search_mat = rng.standard_normal((search_count, dim)).astype(np.float32)
         if args.faiss_normalized:
-            norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8
-            vecs /= norms
-        _mid = n // 2
-        insert_items = [MemoryItem(id=f"ins-{i}", data=vecs[i])        for i in range(_mid)]
-        query_items  = [MemoryItem(id=f"q-{i}",   data=vecs[_mid + i]) for i in range(n - _mid)]
+            insert_mat /= np.linalg.norm(insert_mat, axis=1, keepdims=True) + 1e-8
+            search_mat /= np.linalg.norm(search_mat, axis=1, keepdims=True) + 1e-8
+        insert_items = [MemoryItem(id=f"ins-{i}", data=insert_mat[i]) for i in range(insert_count)]
+        query_items  = [MemoryItem(id=f"q-{i}",   data=search_mat[i]) for i in range(search_count)]
         encoder      = VectorPassthroughEncoder(dim=dim, normalize=False)
-        logger.log(f"[init] synthetic vectors: n={n}, dim={dim}, split at {_mid}")
+        logger.log(f"[init] synthetic vectors: insert_count={insert_count}, search_count={search_count}, dim={dim}")
 
-    # Instantiate all three backends
-    logger.log(f"[init] creating GT faiss backend (nprobe={args.gt_nprobe}) ...")
-    mm_gt = MemoryManagement(backend="faiss", encoder=encoder,
-                             default_nprobe=args.gt_nprobe)
+    # --- GT cache -----------------------------------------------------------
+    use_gt_cache = (not args.no_gt_cache) and bool(args.dataset)
+    gt_cache: Optional[Dict[str, List[List[str]]]] = None
+    if use_gt_cache:
+        gt_cache = load_gt_cache(
+            args.dataset, args.limit if args.limit > 0 else None,
+            args.faiss_normalized, args.metric, args.mode, args.top_k,
+        )
+        if gt_cache is not None:
+            logger.log(f"[gt-cache] loaded {len(gt_cache)} cached request-ids from disk")
+        else:
+            logger.log("[gt-cache] no cache found — GT faiss will run live and results will be saved")
 
-    logger.log(f"[init] creating test faiss backend (nprobe={args.faiss_nprobe}) ...")
-    mm_faiss = MemoryManagement(backend="faiss", encoder=encoder,
-                                default_nprobe=args.faiss_nprobe)
+    # Decide whether we need a live GT backend.
+    # We need it if: cache is disabled, or cache is absent/incomplete (we treat absent as needing full run).
+    need_live_gt = (not use_gt_cache) or (gt_cache is None)
+
+    # --- Instantiate backends -----------------------------------------------
+    mm_gt    = None
+    idx_gt   = None
+    mm_faiss = None
+    idx_faiss = None
+
+    if need_live_gt:
+        logger.log(f"[init] creating GT faiss backend (nprobe={args.gt_nprobe}) ...")
+        mm_gt  = MemoryManagement(backend="faiss", encoder=encoder, default_nprobe=args.gt_nprobe)
+        idx_gt = mm_gt.create_index("recall-bench-gt", metric=metric)
+        logger.log("[init] loading Faiss checkpoint into GT faiss ...")
+        t0 = time.perf_counter()
+        mm_gt.rebuild_index_from_faiss(idx_gt, path=str(faiss_path), normalized=args.faiss_normalized)
+        logger.log(f"[init]   GT faiss load: {time.perf_counter()-t0:.2f}s")
+    else:
+        logger.log(f"[gt-cache] using cached GT — skipping live GT faiss backend")
+
+    if not args.no_test_faiss:
+        logger.log(f"[init] creating test faiss backend (nprobe={args.faiss_nprobe}) ...")
+        mm_faiss  = MemoryManagement(backend="faiss", encoder=encoder, default_nprobe=args.faiss_nprobe)
+        idx_faiss = mm_faiss.create_index("recall-bench-faiss", metric=metric)
+        logger.log("[init] loading Faiss checkpoint into test faiss ...")
+        t0 = time.perf_counter()
+        mm_faiss.rebuild_index_from_faiss(idx_faiss, path=str(faiss_path), normalized=args.faiss_normalized)
+        logger.log(f"[init]   test faiss load: {time.perf_counter()-t0:.2f}s")
+
+        # If the on-disk index uses an approximate quantizer (e.g. HNSW), rebuild with
+        # IndexFlatL2 so it uses exact centroid search matching M3.
+        try:
+            import faiss as _f_chk
+            _loaded  = mm_faiss.backend._indices[idx_faiss]
+            _ivf_chk = _f_chk.extract_index_ivf(_loaded)
+            _q_chk   = _f_chk.downcast_index(_ivf_chk.quantizer)
+            _q_exact = hasattr(_q_chk, "xb") and _q_chk.ntotal == _ivf_chk.nlist
+        except Exception:
+            _q_exact = True
+        if not _q_exact:
+            logger.log("[init] test-faiss quantizer is approximate (HNSW) — rebuilding with IndexFlatL2 ...")
+            t0 = time.perf_counter()
+            _flat_idx = rebuild_with_flat_quantizer(mm_faiss.backend._indices[idx_faiss])
+            _flat_idx.nprobe = args.faiss_nprobe
+            mm_faiss.backend._indices[idx_faiss] = _flat_idx
+            logger.log(f"[init] test-faiss flat-quantizer index ready  ntotal={_flat_idx.ntotal}"
+                       f"  ({time.perf_counter()-t0:.2f}s)")
+        else:
+            logger.log("[init] test-faiss quantizer is exact (IndexFlatL2) — no rebuild needed")
+    else:
+        logger.log("[init] --no-test-faiss: skipping test faiss backend")
 
     logger.log(f"[init] creating {args.m3_backend} backend (nprobe={args.nprobe}) ...")
-    mm_m3 = MemoryManagement(backend=args.m3_backend, encoder=encoder,
-                             default_nprobe=args.nprobe)
+    mm_m3  = MemoryManagement(backend=args.m3_backend, encoder=encoder, default_nprobe=args.nprobe)
+    idx_m3 = mm_m3.create_index("recall-bench", metric=metric)
+    logger.log("[init] loading Faiss checkpoint into M3 ...")
+    t0 = time.perf_counter()
+    mm_m3.rebuild_index_from_faiss(idx_m3, path=str(faiss_path), normalized=args.faiss_normalized)
+    logger.log(f"[init]   {args.m3_backend} load: {time.perf_counter()-t0:.2f}s")
 
-    idx_gt    = mm_gt.create_index("recall-bench-gt",    metric=metric)
-    idx_faiss = mm_faiss.create_index("recall-bench-faiss", metric=metric)
-    idx_m3    = mm_m3.create_index("recall-bench",          metric=metric)
-
-    # Hydrate all three from the same Faiss checkpoint
-    for label, mm, idx in [
-        ("GT faiss",       mm_gt,    idx_gt),
-        ("test faiss",     mm_faiss, idx_faiss),
-        (args.m3_backend,  mm_m3,    idx_m3),
-    ]:
-        logger.log(f"[init] loading Faiss checkpoint into {label} ...")
-        t0 = time.perf_counter()
-        mm.rebuild_index_from_faiss(idx, path=str(faiss_path),
-                                    normalized=args.faiss_normalized)
-        logger.log(f"[init]   {label} load: {time.perf_counter()-t0:.2f}s")
-
-    # Triple runner
+    # Runner
     runner = TripleRunner(
-        mm_gt=mm_gt,       mm_faiss=mm_faiss,       mm_m3=mm_m3,
-        idx_gt=idx_gt,     idx_faiss=idx_faiss,      idx_m3=idx_m3,
+        mm_gt=mm_gt,       mm_faiss=mm_faiss,        mm_m3=mm_m3,
+        idx_gt=idx_gt,     idx_faiss=idx_faiss,       idx_m3=idx_m3,
         k=args.top_k,
         gt_nprobe=args.gt_nprobe,
         faiss_nprobe=args.faiss_nprobe,
         m3_nprobe=args.nprobe,
         ops_per_run=args.ops_per_run,
         logger=logger,
+        gt_cache=gt_cache,
     )
     runner.csv_writer = csv_w
 
@@ -682,16 +878,31 @@ def main() -> None:
     runner.flush_remaining()
     batches_f.close()
 
+    # Persist new GT results to cache
+    if use_gt_cache and runner._gt_new and args.dataset:
+        save_gt_cache(
+            args.dataset, args.limit if args.limit > 0 else None,
+            args.faiss_normalized, args.metric, args.mode, args.top_k,
+            runner._gt_new,
+        )
+        logger.log(f"[gt-cache] saved {len(runner._gt_new)} new request-ids to cache")
+
     # Summary
     logger.log(
         f"\n[summary] total_queries={runner.total_queries}  "
         f"total_inserts={runner._total_inserts}"
     )
-    logger.log(
-        f"[summary] final recall@{args.top_k}:  "
-        f"faiss={runner.cumulative_recall_faiss:.4f}  "
-        f"m3={runner.cumulative_recall_m3:.4f}"
-    )
+    if mm_faiss is not None:
+        logger.log(
+            f"[summary] final recall@{args.top_k}:  "
+            f"faiss={runner.cumulative_recall_faiss:.4f}  "
+            f"m3={runner.cumulative_recall_m3:.4f}"
+        )
+    else:
+        logger.log(
+            f"[summary] final recall@{args.top_k}:  "
+            f"m3={runner.cumulative_recall_m3:.4f}"
+        )
 
     col = 22
     logger.log(
@@ -701,16 +912,18 @@ def main() -> None:
     )
     logger.log(f"  {'─'*106}")
 
-    faiss_label = f"faiss(np={args.faiss_nprobe})"
-    m3_label    = f"{args.m3_backend}(np={args.nprobe})"
-    logger.log(
-        f"  {faiss_label:>{col}}  "
-        f"{runner.cumulative_recall_faiss:>10.4f}  "
-        f"{runner.faiss_search_throughput:>19,.1f} q/s  "
-        f"{runner.faiss_search_latency_ms:>14.3f} ms/q  "
-        f"{runner.faiss_insert_throughput:>19,.1f} vec/s  "
-        f"{runner._faiss_time*1e3:>10.1f} ms"
-    )
+    if mm_faiss is not None:
+        faiss_label = f"faiss(np={args.faiss_nprobe})"
+        logger.log(
+            f"  {faiss_label:>{col}}  "
+            f"{runner.cumulative_recall_faiss:>10.4f}  "
+            f"{runner.faiss_search_throughput:>19,.1f} q/s  "
+            f"{runner.faiss_search_latency_ms:>14.3f} ms/q  "
+            f"{runner.faiss_insert_throughput:>19,.1f} vec/s  "
+            f"{runner._faiss_time*1e3:>10.1f} ms"
+        )
+
+    m3_label = f"{args.m3_backend}(np={args.nprobe})"
     logger.log(
         f"  {m3_label:>{col}}  "
         f"{runner.cumulative_recall_m3:>10.4f}  "
@@ -719,7 +932,7 @@ def main() -> None:
         f"{runner.m3_insert_throughput:>19,.1f} vec/s  "
         f"{runner._m3_time*1e3:>10.1f} ms"
     )
-    if runner.faiss_search_throughput > 0:
+    if mm_faiss is not None and runner.faiss_search_throughput > 0:
         ratio = runner.m3_search_throughput / runner.faiss_search_throughput
         logger.log(f"\n  [summary] m3 speedup vs test-faiss: {ratio:.2f}x  (search throughput)")
 

@@ -86,6 +86,13 @@ public:
                    std::vector<std::vector<DocId>>& out_ids,
                    std::vector<std::vector<float>>& out_scores) const;
 
+    // Per-query cluster IDs (e.g. from FAISS quantizer). cluster_ids is flat
+    // [q_rows × nprobe] row-major; each row lists original cluster IDs for that query.
+    void search_on_batch(const float* queries, size_t q_rows, int k,
+                         const int* cluster_ids, int nprobe,
+                         std::vector<std::vector<DocId>>& out_ids,
+                         std::vector<std::vector<float>>& out_scores) const;
+
     // Select top-nprobe clusters per query by centroid distance, then search on them.
     // Selection strategy: for each query, compute unified_score(query, centroid)
     // and take the nprobe smallest centroids.
@@ -116,6 +123,26 @@ public:
                                 std::vector<std::vector<DocId>>& out_ids,
                                 std::vector<std::vector<float>>& out_scores,
                                 SearchProfile& prof) const;
+
+    // Returns the nprobe cluster IDs selected per query by centroid scoring only —
+    // no vector scan.  Uses the identical centroid distance path as search_nprobe
+    // so the returned IDs are exactly what search_nprobe would probe.
+    // out_cluster_ids[qi] holds real_nprobe original cluster IDs in score order.
+    void select_clusters(const float* queries, size_t q_rows, int nprobe,
+                         std::vector<std::vector<int>>& out_cluster_ids) const;
+
+    // Returns the raw centroid distance matrix — every (query, centroid) pair,
+    // before any top-nprobe selection.  Use this to compare M3's computed distances
+    // against FAISS's quantizer distances to isolate whether divergence is in the
+    // distance values themselves or in the selection algorithm.
+    //
+    // out_scores: flat [q_rows × live_nlist] row-major, out_scores[qi*NL + ci] is
+    //             the distance from query qi to compact centroid ci.
+    // out_orig_ids: [live_nlist] mapping compact index ci → original cluster ID,
+    //               so Python can reindex by FAISS's original cluster numbering.
+    void score_centroids(const float* queries, size_t q_rows,
+                         std::vector<float>& out_scores,
+                         std::vector<int>&   out_orig_ids) const;
 
     // For one query, return the top-nprobe cluster ids by centroid distance (for cache probe set).
     void get_probe_ids(const float* query, int nprobe, std::vector<int>& out_ids) const;

@@ -333,6 +333,20 @@ M3Profiler::M3Profiler() {
         "timestamp,event,cid,gpu_n,buf_n,l2_n,invisible_n,cumul_overflows\n");
     fflush(fp_recall_diag_);
 
+    // ---- cluster_metrics.csv ----
+    snprintf(path, sizeof(path), "%s_cluster_metrics.csv", base);
+    fp_cluster_metrics_ = fopen(path, "w");
+    if (!fp_cluster_metrics_) {
+        fprintf(stderr, "[M3Profiler] WARN: could not open '%s'\n", path);
+        fclose(fp_search_profile_); fp_search_profile_ = nullptr;
+        fclose(fp_search_stats_);   fp_search_stats_   = nullptr;
+        fclose(fp_insert_);         fp_insert_         = nullptr;
+        fclose(fp_recall_diag_);    fp_recall_diag_    = nullptr;
+        return;
+    }
+    fprintf(fp_cluster_metrics_, "timestamp,event,cid,count\n");
+    fflush(fp_cluster_metrics_);
+
     enabled_ = true;
 }
 
@@ -370,6 +384,9 @@ M3Profiler::~M3Profiler() {
     }
     if (fp_recall_diag_) {
         fflush(fp_recall_diag_); fclose(fp_recall_diag_); fp_recall_diag_ = nullptr;
+    }
+    if (fp_cluster_metrics_) {
+        fflush(fp_cluster_metrics_); fclose(fp_cluster_metrics_); fp_cluster_metrics_ = nullptr;
     }
 }
 
@@ -516,6 +533,21 @@ void M3Profiler::log_recall_diag(const char* event, int cid,
         static_cast<long long>(invisible < 0 ? 0 : invisible),
         static_cast<unsigned long long>(cumul_overflows));
     write_recall_diag_(buf);
+}
+
+void M3Profiler::write_cluster_metrics_(const char* line) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!enabled_ || !fp_cluster_metrics_) return;
+    fprintf(fp_cluster_metrics_, "%s\n", line);
+    fflush(fp_cluster_metrics_);
+}
+
+void M3Profiler::log_cluster_metrics(const char* event, int cid, size_t count) {
+    if (!enabled_) return;
+    char ts[32]; timestamp_(ts, sizeof(ts));
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s,%s,%d,%zu", ts, event, cid, count);
+    write_cluster_metrics_(buf);
 }
 
 void M3Profiler::log_insert_row(size_t n_rows,

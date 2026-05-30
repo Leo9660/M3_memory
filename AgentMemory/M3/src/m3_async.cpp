@@ -235,6 +235,50 @@ void AsyncEngine::search(int index_id,
     search(index_id, queries, q_rows, k, /*nprobe=*/-1, out_ids, out_scores);
 }
 
+void AsyncEngine::search_on_batch(int index_id,
+                                  const float* queries, size_t q_rows, int k,
+                                  const int* cluster_ids, int nprobe,
+                                  std::vector<std::vector<DocId>>& out_ids,
+                                  std::vector<std::vector<float>>& out_scores) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) throw std::runtime_error("search_on_batch: unknown index_id");
+    idx->search_on_batch(queries, q_rows, k, cluster_ids, nprobe, out_ids, out_scores);
+}
+
+void AsyncEngine::score_centroids(int index_id,
+                                   const float* queries, size_t q_rows,
+                                   std::vector<float>& out_scores,
+                                   std::vector<int>&   out_orig_ids) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+
+    if (!idx) { out_scores.clear(); out_orig_ids.clear(); return; }
+    idx->score_centroids(queries, q_rows, out_scores, out_orig_ids);
+}
+
+void AsyncEngine::select_clusters(int index_id,
+                                   const float* queries, size_t q_rows, int nprobe,
+                                   std::vector<std::vector<int>>& out_cluster_ids) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+
+    if (!idx) {
+        out_cluster_ids.assign(q_rows, {});
+        return;
+    }
+    idx->select_clusters(queries, q_rows, nprobe, out_cluster_ids);
+}
+
 void AsyncEngine::search_profiled(int index_id,
                                   const float* queries, size_t q_rows, int k, int nprobe,
                                   std::vector<std::vector<DocId>>& out_ids,

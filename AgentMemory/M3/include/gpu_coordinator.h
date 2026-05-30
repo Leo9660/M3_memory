@@ -255,11 +255,11 @@ public:
     // and triggers split_sweep_() every split_every_ops inserts.  The sweep calls
     // split_gpu_cluster() for GPU-resident clusters and idx_.l2_split_cluster()
     // for non-resident ones — both paths use the same threshold.
-    void start_background(int      flush_ms        =    500,
-                          int      maintenance_ms  =  50,
-                          int      rebalance_ms    =   500,
-                          uint64_t split_every_ops =   20000,
-                          size_t   split_threshold = 200000);
+    void start_background(int      flush_ms            =    500,
+                          int      maintenance_ms      =  50,
+                          int      rebalance_ms        =   500,
+                          uint64_t split_every_ops     =   20000,
+                          size_t   split_threshold     = 200000);
 
     // Stop the background thread (blocks until exit; final flush pass performed).
     void stop_background();
