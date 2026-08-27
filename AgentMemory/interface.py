@@ -42,9 +42,15 @@ class MemoryManagement:
         hash_mode: str = "none",          # "none" | "blake2b64" | "sha1_64" | "python"
         hash_prefix: str = "",
         auto_id_strategy: str = "sequential",   # "uuid" | "sequential"
+        # Milvus-specific config
+        milvus_uri: str = "./milvus.db",
+        milvus_token: str = "",
     ) -> None:
-        # Backend (default to placeholder)
-        if backend.lower() == "placeholder":
+        # Backend: accept a pre-built instance or a string name
+        from .backend.base import MemoryBackend as _MemoryBackend
+        if isinstance(backend, _MemoryBackend):
+            self.backend: MemoryBackend = backend
+        elif backend.lower() == "placeholder":
             from .backend.placeholder import PlaceholderBackend
             self.backend: MemoryBackend = PlaceholderBackend()
         elif backend.lower() == "quake":
@@ -53,6 +59,27 @@ class MemoryManagement:
         elif backend.lower() == "m3":
             from .backend.m3 import M3Backend
             self.backend: MemoryBackend = M3Backend()
+        elif backend.lower() == "m3multi":
+            from .backend.m3 import M3MultiLevelBackend
+            self.backend: MemoryBackend = M3MultiLevelBackend()
+        elif backend.lower() == "m3multigpu":
+            from .backend.m3 import M3MultiGpuBackend
+            self.backend: MemoryBackend = M3MultiGpuBackend()
+        elif backend.lower() == "m3multigpufsm":
+            from .backend.m3 import M3MultiGpuFSMBackend
+            self.backend: MemoryBackend = M3MultiGpuFSMBackend(fsm_enabled=True)
+        elif backend.lower() == "amem":
+            from .backend.amem import AMemBackend
+            self.backend: MemoryBackend = AMemBackend()
+        elif backend.lower() in ("diskann_cpp", "diskann"):
+            from .backend.diskann import DiskANNCppBackend
+            self.backend: MemoryBackend = DiskANNCppBackend()
+        elif backend.lower() == "faiss":
+            from .backend.faiss_backend import FaissBackend
+            self.backend: MemoryBackend = FaissBackend()
+        elif backend.lower() == "milvus":
+            from .backend.milvus import MilvusBackend
+            self.backend: MemoryBackend = MilvusBackend()
         else:
             raise ValueError(f"Unknown backend: {backend}")
 
@@ -379,22 +406,26 @@ class MemoryManagement:
 
             elif kind == "delete_knn":
                 _, idx, queries, k = op
+                payloads = [q.data for q in queries]
                 backend_reqs.append(
                     BackendRequest(
                         op=BackendOpType.DELETE_KNN,
                         index_id=idx,
                         vectors=V,
+                        payloads=payloads,
                         k=k,
                     )
                 )
 
             elif kind == "search":
                 _, idx, queries, k, rid, nprobe = op
+                payloads = [q.data for q in queries]
                 backend_reqs.append(
                     BackendRequest(
                         op=BackendOpType.SEARCH,
                         index_id=idx,
                         vectors=V,
+                        payloads=payloads,
                         k=k,
                         request_id=rid,
                         nprobe=nprobe or self._default_nprobe,

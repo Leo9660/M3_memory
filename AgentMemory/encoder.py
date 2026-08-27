@@ -1,5 +1,6 @@
 # AgentMemory/encoder.py
 from __future__ import annotations
+import time
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional
 import json
@@ -8,6 +9,7 @@ import torch
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 from .types import MemoryItem
+from .profiler import is_enabled as _prof_enabled, log_encode_batch as _prof_encode
 
 DEFAULT_MODEL = "intfloat/e5-large-v2"
 
@@ -124,14 +126,21 @@ class MemoryEncoder(ABC):
         return str(data)
 
     @torch.no_grad()
-    def _encode_texts(self, texts: List[str]) -> np.ndarray:
+    def _encode_texts(self, texts: List[str], _mode: str = "items") -> np.ndarray:
         """
         Tokenize, forward through the model, mean-pool with attention mask,
         resize (truncate/pad) to self.dim, and L2-normalize if requested.
         """
+        profiling = _prof_enabled()
+        t_total = time.perf_counter() if profiling else 0.0
+        t_tok_total = t_fwd_total = t_post_total = 0.0
+
         all_vecs: List[np.ndarray] = []
         for i in range(0, len(texts), self.batch_size):
             batch_texts = texts[i : i + self.batch_size]
+
+            # --- tokenize ---
+            t0 = time.perf_counter() if profiling else 0.0
             toks = self.tokenizer(
                 batch_texts,
                 padding=True,
@@ -140,19 +149,32 @@ class MemoryEncoder(ABC):
                 return_tensors="pt",
             )
             toks = {k: v.to(self.device) for k, v in toks.items()}
+            if profiling: t_tok_total += time.perf_counter() - t0
 
+            # --- model forward ---
+            t0 = time.perf_counter() if profiling else 0.0
             out = self.model(**toks)  # last_hidden_state: [B, T, H]
             last = out.last_hidden_state
+            if profiling:
+                # Synchronize before stopping the timer so GPU work is actually
+                # complete — otherwise lazy CUDA kernels flush inside .cpu() and
+                # inflate postprocess_ms instead.
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                t_fwd_total += time.perf_counter() - t0
 
-            # Mean pooling with attention mask
+            # --- mean pooling + to numpy ---
+            t0 = time.perf_counter() if profiling else 0.0
             mask = toks["attention_mask"].unsqueeze(-1).type_as(last)  # [B, T, 1]
             summed = (last * mask).sum(dim=1)                           # [B, H]
             counts = mask.sum(dim=1).clamp(min=1e-6)                    # [B, 1]
             emb = summed / counts                                       # [B, H]
-
             emb = emb.detach().cpu().to(torch.float32).numpy()          # -> np.float32
             all_vecs.append(emb)
+            if profiling: t_post_total += time.perf_counter() - t0
 
+        # --- dim resize + L2 normalize (postprocess) ---
+        t0 = time.perf_counter() if profiling else 0.0
         X = (
             np.vstack(all_vecs)
             if all_vecs
@@ -171,6 +193,18 @@ class MemoryEncoder(ABC):
         if self.normalize and X.size > 0:
             n = np.linalg.norm(X, axis=1, keepdims=True) + 1e-8
             X = X / n
+        if profiling: t_post_total += time.perf_counter() - t0
+
+        if profiling:
+            total_ms = (time.perf_counter() - t_total) * 1000
+            _prof_encode(
+                batch=len(texts),
+                tokenize_ms=t_tok_total * 1000,
+                forward_ms=t_fwd_total * 1000,
+                postprocess_ms=t_post_total * 1000,
+                total_ms=total_ms,
+                mode=_mode,
+            )
 
         return X.astype("float32")
 
@@ -183,8 +217,8 @@ class TransformerEncoder(MemoryEncoder):
 
     def encode_items(self, items: List[MemoryItem]) -> np.ndarray:
         texts = [self._coerce_to_str(it.data) for it in items]
-        return self._encode_texts(texts)
+        return self._encode_texts(texts, _mode="items")
 
     def encode_queries(self, items: List[MemoryItem]) -> np.ndarray:
         texts = [self._coerce_to_str(it.data) for it in items]
-        return self._encode_texts(texts)
+        return self._encode_texts(texts, _mode="queries")

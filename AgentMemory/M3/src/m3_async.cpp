@@ -1,4 +1,5 @@
 #include "m3_async.h"
+#include "m3_multi_level.h"
 
 #include <stdexcept>
 #include <algorithm>
@@ -234,6 +235,71 @@ void AsyncEngine::search(int index_id,
     search(index_id, queries, q_rows, k, /*nprobe=*/-1, out_ids, out_scores);
 }
 
+void AsyncEngine::search_on_batch(int index_id,
+                                  const float* queries, size_t q_rows, int k,
+                                  const int* cluster_ids, int nprobe,
+                                  std::vector<std::vector<DocId>>& out_ids,
+                                  std::vector<std::vector<float>>& out_scores) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) throw std::runtime_error("search_on_batch: unknown index_id");
+    idx->search_on_batch(queries, q_rows, k, cluster_ids, nprobe, out_ids, out_scores);
+}
+
+void AsyncEngine::score_centroids(int index_id,
+                                   const float* queries, size_t q_rows,
+                                   std::vector<float>& out_scores,
+                                   std::vector<int>&   out_orig_ids) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+
+    if (!idx) { out_scores.clear(); out_orig_ids.clear(); return; }
+    idx->score_centroids(queries, q_rows, out_scores, out_orig_ids);
+}
+
+void AsyncEngine::select_clusters(int index_id,
+                                   const float* queries, size_t q_rows, int nprobe,
+                                   std::vector<std::vector<int>>& out_cluster_ids) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+
+    if (!idx) {
+        out_cluster_ids.assign(q_rows, {});
+        return;
+    }
+    idx->select_clusters(queries, q_rows, nprobe, out_cluster_ids);
+}
+
+void AsyncEngine::search_profiled(int index_id,
+                                  const float* queries, size_t q_rows, int k, int nprobe,
+                                  std::vector<std::vector<DocId>>& out_ids,
+                                  std::vector<std::vector<float>>& out_scores,
+                                  IVFIndex::SearchProfile& prof) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+
+    if (!idx) {
+        out_ids.assign(q_rows, {});
+        out_scores.assign(q_rows, {});
+        return;
+    }
+
+    int use_nprobe = (nprobe > 0) ? nprobe : search_policy_.default_nprobe;
+    idx->search_nprobe_profiled(queries, q_rows, k, use_nprobe, out_ids, out_scores, prof);
+}
+
 void AsyncEngine::load_cluster(int index_id,
                                int cluster_id,
                                const std::vector<DocId>& ids,
@@ -348,6 +414,50 @@ int AsyncEngine::nlist_of(int index_id) const {
     if (it != indices_.end()) idx = it->second;
     pthread_rwlock_unlock(&indices_rwlock_);
     return idx ? idx->nlist() : 0;
+}
+
+int AsyncEngine::split_cluster(int index_id, int cluster_id, size_t max_vectors_before_split) {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) throw std::out_of_range("AsyncEngine::split_cluster: index not found");
+    return idx->split_cluster(cluster_id, max_vectors_before_split);
+}
+
+void AsyncEngine::merge_clusters(int index_id, int cluster_id_a, int cluster_id_b) {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) throw std::out_of_range("AsyncEngine::merge_clusters: index not found");
+    idx->merge_clusters(cluster_id_a, cluster_id_b);
+}
+
+size_t AsyncEngine::cluster_live_size(int index_id, int cluster_id) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) return 0;
+    return idx->cluster_live_size(cluster_id);
+}
+
+bool AsyncEngine::cluster_valid(int index_id, int cluster_id) const {
+    std::shared_ptr<IVFIndex> idx;
+    pthread_rwlock_rdlock(&indices_rwlock_);
+    auto it = indices_.find(index_id);
+    if (it != indices_.end()) idx = it->second;
+    pthread_rwlock_unlock(&indices_rwlock_);
+    if (!idx) return false;
+    return idx->centroid_ptr(cluster_id) != nullptr;
+}
+
+void AsyncEngine::set_multilevel_index(MultiLevelIndex* idx) {
+    multi_index_ = idx;
 }
 
 // ==================== apply batch (no async-layer lock) ====================
@@ -469,7 +579,16 @@ bool AsyncEngine::pop_batch(std::vector<WriteOp>& batch, size_t max_n) {
 // ==================== maintenance helper ====================
 
 void AsyncEngine::run_maintenance_once() {
-    // snapshot all indices
+    if (multi_index_) {
+        // Drive cache-aware, cross-level maintenance for the attached
+        // MultiLevelIndex (L0/L1/L2 eviction + demotion).
+        multi_index_->maintenance_pass();
+        return;
+    }
+
+    // Legacy IVF-only maintenance. Kept for reference; currently unused when
+    // a MultiLevelIndex is attached.
+    /*
     std::unordered_map<int, std::shared_ptr<IVFIndex>> indices_snap;
     pthread_rwlock_rdlock(&indices_rwlock_);
     indices_snap = indices_;
@@ -480,6 +599,7 @@ void AsyncEngine::run_maintenance_once() {
             kv.second->maintenance_pass();
         }
     }
+    */
 }
 
 } // namespace m3

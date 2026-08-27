@@ -104,6 +104,37 @@ public:
                 std::vector<std::vector<DocId>>& out_ids,
                 std::vector<std::vector<float>>& out_scores) const;
 
+    // Vector scan only — cluster IDs come from caller (e.g. FAISS quantizer).
+    // cluster_ids: flat [q_rows × nprobe] row-major int32, original cluster IDs.
+    void search_on_batch(int index_id,
+                         const float* queries, size_t q_rows, int k,
+                         const int* cluster_ids, int nprobe,
+                         std::vector<std::vector<DocId>>& out_ids,
+                         std::vector<std::vector<float>>& out_scores) const;
+
+    // Returns the nprobe cluster IDs M3 actually selects per query (no vector scan).
+    // Same centroid scoring path as search() — use this to compare directly against
+    // FAISS's quantizer.search() output with no Python/numpy approximation.
+    void select_clusters(int index_id,
+                         const float* queries, size_t q_rows, int nprobe,
+                         std::vector<std::vector<int>>& out_cluster_ids) const;
+
+    // Returns raw centroid distance matrix [q_rows × live_nlist] before any selection,
+    // plus the compact→original cluster ID mapping.  Use to compare M3's per-centroid
+    // distances against FAISS's quantizer distances at the value level.
+    void score_centroids(int index_id,
+                         const float* queries, size_t q_rows,
+                         std::vector<float>& out_scores,
+                         std::vector<int>&   out_orig_ids) const;
+
+    // ---- profiled search ----
+    // Same result as search() but fills a SearchProfile with per-phase wall times.
+    void search_profiled(int index_id,
+                         const float* queries, size_t q_rows, int k, int nprobe,
+                         std::vector<std::vector<DocId>>& out_ids,
+                         std::vector<std::vector<float>>& out_scores,
+                         IVFIndex::SearchProfile& prof) const;
+
     // ---- direct cluster rebuild (sync, bypasses async queue) ----
     void load_cluster(int index_id,
                       int cluster_id,
@@ -120,9 +151,27 @@ public:
     bool   normalized_of(int index_id) const;
     int    nlist_of(int index_id) const;
 
+    // ---- cluster topology maintenance (sync) ----
+    // These operate on a single IVFIndex (treat as L2 for now).
+    // split_cluster returns the newly created cluster_id or -1 if no split performed.
+    int split_cluster(int index_id, int cluster_id, size_t max_vectors_before_split);
+    // merge cluster_id_b into cluster_id_a (cluster_id_b becomes invalid/removed)
+    void merge_clusters(int index_id, int cluster_id_a, int cluster_id_b);
+    // inspection helpers for tests/debugging
+    size_t cluster_live_size(int index_id, int cluster_id) const;
+    bool   cluster_valid(int index_id, int cluster_id) const;
+
+    // Attach a MultiLevelIndex whose maintenance_pass will be driven by
+    // this engine's maintenance threads.
+    void set_multilevel_index(class MultiLevelIndex* idx);
+
 private:
     // index_id -> IVFIndex
     std::unordered_map<int, std::shared_ptr<IVFIndex>> indices_;
+
+    // Optional attached MultiLevelIndex for cache-aware maintenance.
+    // Lifetime is owned by the caller; AsyncEngine only borrows the pointer.
+    class MultiLevelIndex* multi_index_{nullptr};
 
     // protects indices_ map and index pointers
     mutable pthread_rwlock_t indices_rwlock_;
